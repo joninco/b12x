@@ -808,7 +808,7 @@ class MoEMicroKernelBackend:
             # chunks), so FC1 wrote only 128 of 144 logical values.
             num_fc1_chunks = max(
                 num_fc1_chunks,
-                (n + (_BLOCK_SIZE * 2) - 1) // (_BLOCK_SIZE * 2),
+                (n + _BLOCK_SIZE - 1) // _BLOCK_SIZE,
             )
             while n % num_fc1_chunks != 0 or (n // num_fc1_chunks) % _BLOCK_SIZE != 0:
                 num_fc1_chunks += 1
