@@ -37,7 +37,9 @@ from b12x._lib.intrinsics import (
     ld_global_acquire_i32,
     ld_global_cg_f32,
     ld_global_nc_u32,
+    ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    ld_global_v2_u32,
     mx_scale_from_amax32,
     nvfp4_scale_from_amax,
     quant_dequant_e4m3_2,
@@ -480,6 +482,7 @@ class MoEMicroKernelBackend:
         self.fc1_sf_stage = False
         self.fc1_sf_row_words = 0
         self.fc1_sf_words = 0
+        self.fc2_wide8 = False
         self.m_const = 0
         self.m1_fc2_onepass = False
         self.m1_fc2_rows_per_cta = _K_PER_CTA * 2
@@ -908,6 +911,15 @@ class MoEMicroKernelBackend:
         self.fc1_sf_row_words = cfg.k_blocks // 4 + 1
         self.fc1_sf_words = 2 * cfg.i_chunk * self.fc1_sf_row_words
         self.m_const = m if m in (1, 9) else 0
+        self.fc2_wide8 = bool(
+            self.compile_time_phase == 0
+            and m not in (1, 9)
+            and self.w4a16_mode
+            and not self.scale_format_e8m0_k32
+            and self.is_gated
+            and cfg.fc2_n_chunks == 1
+            and cfg.n == 256
+        )
         self.m1_fc2_onepass = m1_fc2_onepass
         self.m1_fc2_rows_per_cta = m1_fc2_rows
         self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
@@ -2038,6 +2050,94 @@ class MoEMicroKernelBackend:
             out_base = t * Int32(cfg.k_dim)
             scatter_output[out_base + k_row0] = BFloat16(sum_warp0)
             scatter_output[out_base + k_row1] = BFloat16(sum_warp1)
+
+    @cute.jit
+    def _m2_fc2_rowpair_wide8(
+        self,
+        fc2_task: Int32,
+        warp_id: Int32,
+        lane: Int32,
+        w2_base_addr: Int64,
+        w2s_base_addr: Int64,
+        intermediate: cute.Tensor,
+        w2_alphas: cute.Tensor,
+        topk_ids: cute.Tensor,
+        topk_weights: cute.Tensor,
+        scatter_output: cute.Tensor,
+    ):
+        """Compute two hidden rows per warp with 8-byte weight loads per lane.
+
+        Each 16-lane half-warp owns one output row. Its lanes cover consecutive
+        groups of 16 intermediate values, matching one packed K16 scale per
+        lane. This worker requires the fused 256-value intermediate layout and
+        packed E4M3 scales.
+        """
+        cfg = self._cfg
+        rows_per_cta = Int32(_K_PER_CTA * 2)
+        linear_row_base = fc2_task * rows_per_cta
+        t = linear_row_base // Int32(cfg.k_dim)
+        k_chunk_off = linear_row_base - t * Int32(cfg.k_dim)
+        half = lane >> Int32(4)
+        sub = lane & Int32(15)
+        k_row = k_chunk_off + warp_id * Int32(2) + half
+        lane_byte_off = Int64(sub) * Int64(8)
+        token_inter_base = t * Int32(cfg.inter_u32)
+        k_col = self._packed_e4m3_scale_col(k_row)
+        act_lane = Int32(2) * sub
+        out_acc = Float32(0.0)
+
+        for topk_idx in cutlass.range_constexpr(cfg.num_topk):
+            eid_addr = t * Int32(cfg.num_topk) + Int32(topk_idx)
+            eid = Int32(topk_ids[eid_addr])
+            scale_lane = w2_alphas[eid] * topk_weights[eid_addr]
+            expert_weight_base = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
+            expert_scale_base = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
+
+            inter_offset = (
+                token_inter_base + Int32(topk_idx) * Int32(128) + act_lane
+            )
+            a0, b0 = ld_global_v2_u32(
+                get_ptr_as_int64(intermediate, inter_offset + Int32(0 * 32))
+            )
+            a1, b1 = ld_global_v2_u32(
+                get_ptr_as_int64(intermediate, inter_offset + Int32(1 * 32))
+            )
+            a2, b2 = ld_global_v2_u32(
+                get_ptr_as_int64(intermediate, inter_offset + Int32(2 * 32))
+            )
+            a3, b3 = ld_global_v2_u32(
+                get_ptr_as_int64(intermediate, inter_offset + Int32(3 * 32))
+            )
+
+            weight0, weight1 = ld_global_nc_v2_u32(
+                w2_base_addr
+                + expert_weight_base
+                + Int64(k_row) * Int64(cfg.n_half)
+                + lane_byte_off
+            )
+            block_scale = self._ld_e4m3_packed_scale_col(
+                w2s_base_addr,
+                expert_scale_base,
+                sub,
+                k_col,
+                Int32(cfg.k_dim),
+            )
+            out_acc += (
+                block_scale
+                * (
+                    self._fp4_dot4_for_math(weight0, a0, a1, a2, a3)
+                    + self._fp4_dot4_for_math(weight1, b0, b1, b2, b3)
+                )
+                * scale_lane
+            )
+
+        for offset_log2 in cutlass.range_constexpr(4):
+            out_acc += cute.arch.shuffle_sync_bfly(
+                out_acc,
+                offset=1 << offset_log2,
+            )
+        if sub == Int32(0):
+            scatter_output[t * Int32(cfg.k_dim) + k_row] = BFloat16(out_acc)
 
     @cute.jit
     def _m2_fc2_rowquad_wide(
@@ -5949,7 +6049,22 @@ class MoEMicroKernelBackend:
                 fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 4)
             fc2_task = Int32(bidx_x)
             while fc2_task < fc2_task_count:
-                if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
+                if cutlass.const_expr(self.fc2_wide8):
+                    self._m2_fc2_rowpair_wide8(
+                        fc2_task,
+                        warp_id,
+                        lane,
+                        w2_base_addr,
+                        w2s_base_addr,
+                        intermediate,
+                        w2_alphas,
+                        topk_ids,
+                        topk_weights,
+                        scatter_output,
+                    )
+                elif cutlass.const_expr(
+                    self.w4a16_mode and cfg.fc2_n_chunks == 1
+                ):
                     self._m2_fc2_rowpair_narrow(
                         fc2_task,
                         warp_id,

@@ -62,6 +62,34 @@ def test_w4a16_small_m_host_barrier_reset_kill_switch(
     assert not _small_m_direct_host_barrier_reset_enabled()
 
 
+@pytest.mark.parametrize(
+    ("m", "uses_wide_fc2"),
+    ((1, False), (2, True), (8, True), (9, False), (12, True), (16, True)),
+)
+def test_w4a16_direct_fc2_uses_wide_loads_for_supported_glm_shape(
+    m: int,
+    uses_wide_fc2: bool,
+) -> None:
+    kernel = MoEMicroKernelW4A16SmallMDirect(
+        activation="silu",
+        fast_math=True,
+        share_input_across_experts=m == 1,
+        share_expert_scales=True,
+        single_token=m == 1,
+    )
+
+    kernel.configure(
+        m,
+        6144,
+        256,
+        8,
+        256,
+        max_active_ctas=188,
+    )
+
+    assert kernel.fc2_wide8 is uses_wide_fc2
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("host_barrier_reset", [False, True])
 def test_w4a16_small_m_direct_barrier_modes_eager_and_graph(
