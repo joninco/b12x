@@ -9,7 +9,7 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float32, Uint32
+from cutlass import BFloat16, Float32, Uint8, Uint32
 
 from cutlass.cutlass_dsl import Int32, Int64
 
@@ -45,10 +45,12 @@ from b12x._lib.intrinsics import (
     prefetch_global_l2,
     quant_dequant_2,
     red_add_global_f32,
+    shared_ptr_to_u32,
     spin_wait_global_eq_i32,
     st_global_f32,
     st_global_i32,
     st_global_release_i32,
+    st_shared_u8,
     threadfence,
     warp_reduce,
 )
@@ -475,6 +477,9 @@ class MoEMicroKernelBackend:
         self.trellis_ksplit = 1
         self.trellis_scratch_u32 = 0
         self._cfg = None
+        self.fc1_sf_stage = False
+        self.fc1_sf_row_words = 0
+        self.fc1_sf_words = 0
         self.m_const = 0
         self.m1_fc2_onepass = False
         self.m1_fc2_rows_per_cta = _K_PER_CTA * 2
@@ -888,6 +893,21 @@ class MoEMicroKernelBackend:
             # intermediate chunk must hold whole 32-blocks.
             raise ValueError("a8_mx micro mode requires i_chunk % 32 == 0")
         self._cfg = cfg
+        # Packed E4M3 FC1 scales are K16-major. The K-segments-12 worker
+        # otherwise issues one widely strided global scale load per lane and
+        # K16 block, so stage the chunk's unchanged bytes row-major in shared
+        # memory for the production W4A16 geometry.
+        self.fc1_sf_stage = bool(
+            self.w4a16_mode
+            and not self.scale_format_e8m0_k32
+            and self.is_gated
+            and cfg.k_segments_aligned
+            and cfg.k_segments == 12
+            and cfg.i_chunk in (16, 32)
+            and cfg.n % cfg.i_chunk == 0
+        )
+        self.fc1_sf_row_words = cfg.k_blocks // 4 + 1
+        self.fc1_sf_words = 2 * cfg.i_chunk * self.fc1_sf_row_words
         self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
         self.m1_fc2_rows_per_cta = m1_fc2_rows
@@ -897,6 +917,109 @@ class MoEMicroKernelBackend:
         # the trellis K-split scratch tail. Callers must zero-initialize; the
         # kernel restores the tail to zero after each use.
         self.inter_alloc_u32 = m * cfg.inter_u32 + self.trellis_scratch_u32
+
+    @cute.jit
+    def _stage_fc1_scales(
+        self,
+        smem_sf_addr: Int32,
+        tidx: Int32,
+        w1s_base_addr: Int64,
+        eid: Int32,
+        i_chunk_off: Int32,
+    ):
+        """Stage one FC1 task's packed E4M3 scales row-major in shared memory.
+
+        ModelOpt stores each expert's scale grid K16-major. Within every
+        64-row output tile, four-byte words cover the row permutation used by
+        `_packed_e4m3_scale_col`. Threads cooperatively read those words for
+        both gated projections, invert the row permutation, and store bytes as
+        `[projection][chunk row][K16]`. The padded row stride makes each
+        worker lane's three consecutive word reads conflict-free.
+        """
+        cfg = self._cfg
+        packed_n_cols = _align_up(cfg.two_n, 64)
+        sf_ebase = Int64(eid) * Int64((cfg.k_dim // 16) * packed_n_cols)
+        loads = 2 * cfg.k_blocks * 8
+        row_words = Int32(self.fc1_sf_row_words)
+        for iteration in cutlass.range_constexpr(
+            (loads + _BLOCK_DIM - 1) // _BLOCK_DIM
+        ):
+            index = Int32(iteration * _BLOCK_DIM) + tidx
+            if index < Int32(loads):
+                word_in_span = index & Int32(7)
+                span = index >> Int32(3)
+                projection = Int32(0)
+                if span >= Int32(cfg.k_blocks):
+                    projection = Int32(1)
+                k16 = span - projection * Int32(cfg.k_blocks)
+                row_base = projection * Int32(cfg.n) + i_chunk_off
+                tile_row = row_base & Int32(63)
+                address = (
+                    w1s_base_addr
+                    + sf_ebase
+                    + Int64(k16) * Int64(packed_n_cols)
+                    + Int64(row_base - tile_row)
+                    + Int64(
+                        word_in_span * Int32(8)
+                        + (tile_row >> Int32(5)) * Int32(4)
+                    )
+                )
+                word = ld_global_nc_u32(address)
+                smem_row_base = projection * Int32(cfg.i_chunk) * row_words
+                relative_row_base = word_in_span - (tile_row & Int32(31))
+                for byte_index in cutlass.range_constexpr(4):
+                    permuted = ((byte_index & 1) << 1) | (byte_index >> 1)
+                    relative_row = relative_row_base + Int32(8 * permuted)
+                    if Uint32(relative_row) < Uint32(cfg.i_chunk):
+                        byte = (word >> Uint32(8 * byte_index)) & Uint32(0xFF)
+                        st_shared_u8(
+                            smem_sf_addr
+                            + (
+                                smem_row_base + relative_row * row_words
+                            )
+                            * Int32(4)
+                            + k16,
+                            Uint8(byte),
+                        )
+
+    @cute.jit
+    def _fc1_staged_scales(
+        self,
+        smem_sf: cute.Tensor,
+        scale_row: Int32,
+        lane: Int32,
+    ):
+        """Load one lane's 12 staged K16 scales for an FC1 output row."""
+        base = scale_row * Int32(self.fc1_sf_row_words) + lane * Int32(3)
+        word0 = Uint32(smem_sf[base])
+        word1 = Uint32(smem_sf[base + Int32(1)])
+        word2 = Uint32(smem_sf[base + Int32(2)])
+        return (
+            cvt_w4a16_packed_e4m3_scale_to_f32(word0 & Uint32(0xFF)),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word0 >> Uint32(8)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word0 >> Uint32(16)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(word0 >> Uint32(24)),
+            cvt_w4a16_packed_e4m3_scale_to_f32(word1 & Uint32(0xFF)),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word1 >> Uint32(8)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word1 >> Uint32(16)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(word1 >> Uint32(24)),
+            cvt_w4a16_packed_e4m3_scale_to_f32(word2 & Uint32(0xFF)),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word2 >> Uint32(8)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(
+                (word2 >> Uint32(16)) & Uint32(0xFF)
+            ),
+            cvt_w4a16_packed_e4m3_scale_to_f32(word2 >> Uint32(24)),
+        )
 
     @cute.jit
     def _resident_grid_barrier(
@@ -2494,6 +2617,13 @@ class MoEMicroKernelBackend:
         reduce_scratch = cute.make_tensor(
             reduce_scratch_ptr, cute.make_layout(_NUM_WARPS)
         )
+        if cutlass.const_expr(self.fc1_sf_stage):
+            smem_sf_ptr = cute.arch.alloc_smem(Uint32, self.fc1_sf_words)
+            smem_sf = cute.make_tensor(
+                smem_sf_ptr,
+                cute.make_layout(self.fc1_sf_words),
+            )
+            smem_sf_addr = shared_ptr_to_u32(smem_sf_ptr)
         if cutlass.const_expr(self.weight_layout_trellis256):
             # Raw gate/up staging for the trellis activation boundary:
             # [0:i_chunk) gate, [i_chunk:2*i_chunk) up.
@@ -2712,6 +2842,14 @@ class MoEMicroKernelBackend:
                         in_blk += Int32(_BLOCK_DIM)
                     if cutlass.const_expr(self.share_input_across_experts):
                         prev_t = t
+                if cutlass.const_expr(self.fc1_sf_stage):
+                    self._stage_fc1_scales(
+                        smem_sf_addr,
+                        tidx,
+                        w1s_base_addr,
+                        eid,
+                        i_chunk_off,
+                    )
                 cute.arch.sync_threads()
 
             if cutlass.const_expr(self.weight_layout_trellis256):
@@ -4137,7 +4275,9 @@ class MoEMicroKernelBackend:
                                 sf_u9 = u_k4
                                 sf_u10 = u_k5
                                 sf_u11 = u_k5
-                            elif cutlass.const_expr(self.w4a16_mode):
+                            elif cutlass.const_expr(
+                                self.w4a16_mode and not self.fc1_sf_stage
+                            ):
                                 k16_u = lane * Int32(cfg.k_segments)
                                 sf_u0 = self._ld_e4m3_packed_scale_col(
                                     w1s_base_addr,
@@ -4222,6 +4362,25 @@ class MoEMicroKernelBackend:
                                     k16_u + Int32(11),
                                     scale_col_u,
                                     Int32(cfg.two_n),
+                                )
+                            elif cutlass.const_expr(self.w4a16_mode):
+                                (
+                                    sf_u0,
+                                    sf_u1,
+                                    sf_u2,
+                                    sf_u3,
+                                    sf_u4,
+                                    sf_u5,
+                                    sf_u6,
+                                    sf_u7,
+                                    sf_u8,
+                                    sf_u9,
+                                    sf_u10,
+                                    sf_u11,
+                                ) = self._fc1_staged_scales(
+                                    smem_sf,
+                                    Int32(cfg.i_chunk) + i_local,
+                                    lane,
                                 )
                             else:
                                 bsf_addr_u_a = (
@@ -4321,7 +4480,9 @@ class MoEMicroKernelBackend:
                             sf_g9 = g_k4
                             sf_g10 = g_k5
                             sf_g11 = g_k5
-                        elif cutlass.const_expr(self.w4a16_mode):
+                        elif cutlass.const_expr(
+                            self.w4a16_mode and not self.fc1_sf_stage
+                        ):
                             k16_g = lane * Int32(cfg.k_segments)
                             sf_g0 = self._ld_e4m3_packed_scale_col(
                                 w1s_base_addr,
@@ -4406,6 +4567,25 @@ class MoEMicroKernelBackend:
                                 k16_g + Int32(11),
                                 scale_col_g,
                                 Int32(cfg.two_n),
+                            )
+                        elif cutlass.const_expr(self.w4a16_mode):
+                            (
+                                sf_g0,
+                                sf_g1,
+                                sf_g2,
+                                sf_g3,
+                                sf_g4,
+                                sf_g5,
+                                sf_g6,
+                                sf_g7,
+                                sf_g8,
+                                sf_g9,
+                                sf_g10,
+                                sf_g11,
+                            ) = self._fc1_staged_scales(
+                                smem_sf,
+                                i_local,
+                                lane,
                             )
                         else:
                             bsf_addr_g_a = (
