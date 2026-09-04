@@ -53,10 +53,12 @@ from tests._reference.helpers import (
 from tests._reference.w4a16_reference import compare_to_reference, moe_reference_w4a16
 
 
-def test_w4a16_small_m_host_barrier_reset_kill_switch(
+def test_w4a16_small_m_host_barrier_reset_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", raising=False)
+    assert not _small_m_direct_host_barrier_reset_enabled()
+    monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "1")
     assert _small_m_direct_host_barrier_reset_enabled()
     monkeypatch.setenv("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0")
     assert not _small_m_direct_host_barrier_reset_enabled()
