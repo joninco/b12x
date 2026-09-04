@@ -23,6 +23,13 @@ _GB10_IDENTITY = DeviceIdentity(
     product_name="NVIDIA GB10",
 )
 
+_RTX_PRO_6000_IDENTITY = DeviceIdentity(
+    vendor="nvidia",
+    compute_capability=(12, 0),
+    sm_count=188,
+    product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+)
+
 
 def _policy_context(device: DeviceIdentity) -> PolicyContext:
     return PolicyContext.for_identity(device)
@@ -1056,6 +1063,30 @@ def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
         activation="silu",
         quant_mode="w4a16",
         context=_policy_context(_GB10_IDENTITY),
+    )
+
+    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.config.backend == "w4a16"
+    assert resolution.config.w4a16_route_mode == route_mode
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "route_mode"),
+    ((8, "direct"), (9, "direct"), (16, "direct"), (17, "packed")),
+)
+def test_rtx_pro_6000_glm53_w4a16_profile_caps_direct_micro_at_16_tokens(
+    num_tokens: int,
+    route_mode: str,
+) -> None:
+    resolution = fused_moe_impl._resolve_moe_decode_policy(
+        num_tokens=num_tokens,
+        num_topk=8,
+        num_experts=256,
+        k=6144,
+        n=256,
+        activation="silu",
+        quant_mode="w4a16",
+        context=_policy_context(_RTX_PRO_6000_IDENTITY),
     )
 
     assert resolution.source is PolicySource.PREPLANNED

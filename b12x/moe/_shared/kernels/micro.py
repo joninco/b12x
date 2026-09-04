@@ -721,10 +721,9 @@ class MoEMicroKernelBackend:
         num_topk: int,
         weight_E: int,
     ) -> bool:
-        # Micro keeps the m tokens' activations resident; 8 is the register
-        # budget ceiling. The FC1 task decode and FC2 are generic in m, so any
-        # 1<=m<=8 is correct (not just powers of two).
-        if not (1 <= m <= 8):
+        # FC1 stages one token's activations per task and FC2 tasks are
+        # token-major, so the launch does not retain every token in registers.
+        if not (1 <= m <= 16):
             return False
         if k <= 0 or k % _BLOCK_SIZE != 0 or k % 128 != 0:
             return False
