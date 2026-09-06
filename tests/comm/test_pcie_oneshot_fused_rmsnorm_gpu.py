@@ -67,6 +67,33 @@ def _make_inputs(
     return inp, residual, weight
 
 
+def _make_split_view_inputs(
+    rows: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    rank: int,
+    iteration: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    inp, contiguous_residual, weight = _make_inputs(
+        rows,
+        hidden_size,
+        dtype,
+        device,
+        rank,
+        iteration,
+    )
+    combined = torch.full(
+        (rows, hidden_size * 2),
+        -7.0,
+        dtype=dtype,
+        device=device,
+    )
+    padding, residual = combined.split(hidden_size, dim=-1)
+    residual.copy_(contiguous_residual)
+    return inp, residual, weight, padding
+
+
 def _assert_close(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -387,6 +414,83 @@ def _run_tp8_graph_mode_transition(
             _assert_close(residual, expected_residual, dtype)
 
 
+def _run_tp8_split_view_graph(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+) -> None:
+    if dist.get_world_size() != 8:
+        return
+
+    hidden_size = 6144
+    epsilon = 1e-6
+    dtype = torch.bfloat16
+    stream = torch.cuda.Stream(device=device)
+    channel_id = "graph:split-residual"
+    channel = pool.for_stream(stream, channel_id=channel_id)
+    calls = []
+    for rows in (4, 8, 16):
+        inp, residual, weight, padding = _make_split_view_inputs(
+            rows,
+            hidden_size,
+            dtype,
+            device,
+            rank,
+        )
+        assert residual.stride() == (hidden_size * 2, 1)
+        out = torch.empty_like(inp)
+        calls.append((inp, residual, weight, padding, out))
+        with torch.cuda.stream(stream):
+            channel.prepare_graph_fused_add_rms_norm(inp)
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pool.capture(stream=stream, channel_id=channel_id),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        for inp, residual, weight, _padding, out in calls:
+            pool.all_reduce_fused_add_rms_norm(
+                inp,
+                residual,
+                weight,
+                epsilon,
+                out=out,
+                residual_out=residual,
+                stream=stream,
+                channel_id=channel_id,
+            )
+
+    for replay in range(3):
+        expected = []
+        for rows, (inp, residual, weight, padding, _out) in zip(
+            (4, 8, 16), calls, strict=True
+        ):
+            next_inp, next_residual, _, _ = _make_split_view_inputs(
+                rows,
+                hidden_size,
+                dtype,
+                device,
+                rank,
+                iteration=101 + replay,
+            )
+            inp.copy_(next_inp)
+            residual.copy_(next_residual)
+            padding.fill_(-7.0)
+            expected.append(_reference(inp, residual, weight, epsilon))
+
+        allocated_bytes = torch.cuda.memory_allocated(device)
+        graph.replay()
+        stream.synchronize()
+        assert torch.cuda.memory_allocated(device) == allocated_bytes
+        for (_inp, residual, _weight, padding, out), (
+            expected_out,
+            expected_residual,
+        ) in zip(calls, expected, strict=True):
+            _assert_close(out, expected_out, dtype)
+            _assert_close(residual, expected_residual, dtype)
+            assert torch.all(padding == -7.0)
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -400,9 +504,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
-        max_input_bytes=128 * 1024,
-        max_size=128 * 1024,
-        max_concurrent_channels=2,
+        max_input_bytes=192 * 1024,
+        max_size=192 * 1024,
+        max_concurrent_channels=4,
     )
     try:
         pool.prepare_channels(
@@ -410,6 +514,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 "eager:fused-rmsnorm",
                 "graph:fused-rmsnorm",
                 "graph:fused-transition",
+                "graph:split-residual",
             )
         )
         pool.for_stream(channel_id="eager:fused-rmsnorm")
@@ -418,6 +523,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _run_graph(pool, device, rank)
         dist.barrier()
         _run_tp8_graph_mode_transition(pool, device, rank)
+        dist.barrier()
+        _run_tp8_split_view_graph(pool, device, rank)
         torch.cuda.synchronize(device)
     finally:
         pool.close()

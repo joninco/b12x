@@ -525,6 +525,47 @@ def test_fused_add_rms_norm_supports_inplace_residual_output():
     torch.testing.assert_close(residual_out, inp + 1)
 
 
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_fused_add_rms_norm_supports_split_view_residual(rows):
+    runtime = _make_runtime(eager=True)
+    hidden_size = 8
+    combined = torch.arange(rows * hidden_size * 2, dtype=torch.bfloat16).reshape(
+        rows, hidden_size * 2
+    )
+    _, residual = combined.split(hidden_size, dim=-1)
+    inp = torch.full_like(residual, 0.25).contiguous()
+    original = residual.clone()
+
+    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp,
+        residual,
+        torch.ones(hidden_size, dtype=torch.bfloat16),
+        1e-6,
+        residual_out=residual,
+    )
+
+    assert residual.stride() == (hidden_size * 2, 1)
+    assert residual_out.data_ptr() == residual.data_ptr()
+    torch.testing.assert_close(residual_out, inp + original)
+    variance = residual_out.float().square().mean(dim=-1, keepdim=True)
+    expected = residual_out.float() * torch.rsqrt(variance + 1e-6)
+    torch.testing.assert_close(out, expected.to(torch.bfloat16))
+
+
+def test_fused_add_rms_norm_rejects_noncontiguous_rows():
+    runtime = _make_runtime(eager=True)
+    inp = torch.ones((4, 8), dtype=torch.bfloat16)
+    residual = torch.ones((4, 16), dtype=torch.bfloat16)[:, ::2]
+
+    with pytest.raises(ValueError, match="pack-aligned contiguous rows"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp,
+            residual,
+            torch.ones(8, dtype=torch.bfloat16),
+            1e-6,
+        )
+
+
 def test_fused_add_rms_norm_requires_pack_aligned_rows():
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)

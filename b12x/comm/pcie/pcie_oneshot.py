@@ -169,6 +169,32 @@ def _is_weak_contiguous(inp: torch.Tensor) -> bool:
     )
 
 
+def _fused_row_stride_packs(inp: torch.Tensor) -> Optional[int]:
+    """Return the regular row stride for a pack-aligned fused operand."""
+
+    if inp.ndim == 0 or int(inp.shape[-1]) <= 0 or int(inp.stride(-1)) != 1:
+        return None
+    element_size = inp.element_size()
+    hidden_size = int(inp.shape[-1])
+    if inp.is_contiguous() or inp.ndim == 1:
+        row_stride = hidden_size
+    else:
+        row_stride = int(inp.stride(-2))
+        expected_stride = row_stride
+        for axis in range(inp.ndim - 3, -1, -1):
+            expected_stride *= int(inp.shape[axis + 1])
+            if int(inp.stride(axis)) != expected_stride:
+                return None
+    row_stride_bytes = row_stride * element_size
+    if (
+        row_stride < hidden_size
+        or row_stride_bytes % 16 != 0
+        or inp.data_ptr() % 16 != 0
+    ):
+        return None
+    return row_stride_bytes // 16
+
+
 def _align_up(value: int, alignment: int) -> int:
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
 
@@ -1689,6 +1715,10 @@ class _CuTeOneshotBackend:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
+        residual_row_stride_packs = _fused_row_stride_packs(residual)
+        residual_output_row_stride_packs = _fused_row_stride_packs(residual_out)
+        assert residual_row_stride_packs is not None
+        assert residual_output_row_stride_packs is not None
         if rows > _MAX_BLOCKS:
             raise ValueError(
                 f"fused allreduce RMSNorm supports at most {_MAX_BLOCKS} rows"
@@ -1748,6 +1778,8 @@ class _CuTeOneshotBackend:
                 hidden_packs,
                 rows,
                 ctas_per_row,
+                residual_row_stride_packs,
+                residual_output_row_stride_packs,
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon),
                 blocks,
@@ -2826,8 +2858,8 @@ class PCIeOneshotAllReduce:
             raise ValueError("residual tensor must be on the same device as the input")
         if residual.shape != inp.shape or residual.dtype != inp.dtype:
             raise ValueError("residual tensor must match input shape and dtype")
-        if not _is_weak_contiguous(residual):
-            raise ValueError("residual tensor must be weak-contiguous")
+        if _fused_row_stride_packs(residual) is None:
+            raise ValueError("residual tensor must have pack-aligned contiguous rows")
         if weight.device != inp.device:
             raise ValueError("weight tensor must be on the same device as the input")
         if weight.shape != (hidden_size,) or weight.dtype != inp.dtype:
@@ -2850,8 +2882,12 @@ class PCIeOneshotAllReduce:
                 )
             if tensor.shape != inp.shape or tensor.dtype != inp.dtype:
                 raise ValueError(f"{name} tensor must match input shape and dtype")
-            if not _is_weak_contiguous(tensor):
-                raise ValueError(f"{name} tensor must be weak-contiguous")
+        if not _is_weak_contiguous(out):
+            raise ValueError("output tensor must be weak-contiguous")
+        if _fused_row_stride_packs(residual_out) is None:
+            raise ValueError(
+                "residual output tensor must have pack-aligned contiguous rows"
+            )
         if out.data_ptr() == residual_out.data_ptr():
             raise ValueError("output and residual output must not alias")
 
