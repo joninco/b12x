@@ -25,6 +25,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     _CuTeOneshotState,
     _enable_device_slot_selection,
     _transport_policy_contract,
+    _uses_scatter_gather_storage,
     _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
@@ -274,6 +275,10 @@ def _make_cute_state(world_size: int, *, eager: bool = True) -> _CuTeOneshotStat
             world_size,
             transport_policy,
         ),
+        scatter_gather_storage=_uses_scatter_gather_storage(
+            world_size,
+            transport_policy,
+        ),
     )
 
 
@@ -313,26 +318,66 @@ def test_tp8_owner_reduce_default_has_a_bounded_shape_contract(
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.delenv("B12X_PCIE_TP8_OWNER_REDUCE", raising=False)
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(8), torch.empty((rows, hidden), dtype=dtype)
-    )
+    ).variant.mode
     assert mode == expected
 
 
 def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(8), torch.empty((4, 6144), dtype=torch.bfloat16)
+    ).variant.mode
+    assert mode == "stage_scatter_gather"
+
+
+def test_fused_launch_plan_groups_live_rows_by_capacity_variant(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    state = _make_cute_state(8)
+
+    plans = {
+        rows: _CuTeOneshotBackend._fused_launch_plan(
+            state,
+            torch.empty((rows, 6144), dtype=torch.bfloat16),
+        )
+        for rows in (1, 2, 3, 4, 5, 6, 8, 12, 16)
+    }
+
+    assert plans[1].variant == plans[2].variant
+    assert plans[3].variant == plans[4].variant == plans[5].variant
+    assert (
+        plans[6].variant == plans[8].variant == plans[12].variant == plans[16].variant
     )
-    assert mode == "stage_pull"
+    assert {plan.rows for plan in plans.values()} == set(plans)
+    assert {plan.ctas_per_row for plan in plans.values()} == {1}
 
 
 @pytest.mark.parametrize(
-    ("world_size", "env_name", "shape", "expected_when_enabled"),
     (
-        (2, "B12X_PCIE_TP2_REMOTE_PUSH", (4, 4096), "stage_remote_push"),
-        (4, "B12X_PCIE_TP4_REMOTE_PUSH", (32, 6144), "stage_remote_push"),
+        "world_size",
+        "env_name",
+        "shape",
+        "expected_when_disabled",
+        "expected_when_enabled",
+    ),
+    (
+        (
+            2,
+            "B12X_PCIE_TP2_REMOTE_PUSH",
+            (4, 4096),
+            "stage_scatter_gather",
+            "stage_remote_push",
+        ),
+        (
+            4,
+            "B12X_PCIE_TP4_REMOTE_PUSH",
+            (32, 6144),
+            "stage_pull",
+            "stage_remote_push",
+        ),
     ),
 )
 def test_tp2_tp4_remote_push_is_opt_in(
@@ -340,20 +385,21 @@ def test_tp2_tp4_remote_push_is_opt_in(
     world_size: int,
     env_name: str,
     shape: tuple[int, int],
+    expected_when_disabled: str,
     expected_when_enabled: str,
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     inp = torch.empty(shape, dtype=torch.bfloat16)
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size), inp
-    )
-    assert mode == "stage_pull"
+    ).variant.mode
+    assert mode == expected_when_disabled
 
     monkeypatch.setenv(env_name, "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size), inp
-    )
+    ).variant.mode
     assert mode == expected_when_enabled
 
 
@@ -363,10 +409,10 @@ def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
     state = _make_cute_state(4)
 
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         state,
         torch.empty((4, 6144), dtype=torch.bfloat16),
-    )
+    ).variant.mode
 
     assert mode == "stage_remote_push"
 
@@ -388,10 +434,10 @@ def test_tp2_tp4_remote_push_falls_back_outside_qualified_shapes(
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv(env_name, "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size),
         torch.empty(shape, dtype=torch.bfloat16),
-    )
+    ).variant.mode
     assert mode == "stage_pull"
 
 
@@ -399,10 +445,10 @@ def test_registered_fused_input_never_selects_topology_transport(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(4, eager=False),
         torch.empty((4, 6144), dtype=torch.bfloat16),
-    )
+    ).variant.mode
     assert mode == "registered"
 
 
@@ -1592,9 +1638,7 @@ def test_register_graph_buffers_uses_exchange_group_broadcast(monkeypatch):
 
 def test_object_broadcast_uses_cpu_for_gloo(monkeypatch):
     group = object()
-    monkeypatch.setattr(
-        "torch.distributed.get_backend", lambda group=None: "gloo"
-    )
+    monkeypatch.setattr("torch.distributed.get_backend", lambda group=None: "gloo")
 
     assert _object_broadcast_device(group) == torch.device("cpu")
 

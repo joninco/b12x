@@ -367,7 +367,7 @@ def _run_tp8_graph_mode_transition(
         )
         out = torch.empty_like(inp)
         calls.append((inp, residual, weight, out))
-        modes.append(_CuTeOneshotBackend._fused_launch_config(state, inp)[0])
+        modes.append(_CuTeOneshotBackend._fused_launch_plan(state, inp).variant.mode)
         with torch.cuda.stream(stream):
             channel.prepare_graph_fused_add_rms_norm(inp)
     assert modes == ["stage_pull", "stage_tp8_owner"]

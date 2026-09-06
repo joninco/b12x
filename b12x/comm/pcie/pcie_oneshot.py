@@ -148,6 +148,36 @@ def _uses_sharded_eager_storage(
     )
 
 
+# The scatter-gather transport keeps two remote-write regions per eager slot: the
+# BF16 scatter region (one input's worth) and the fp32 gather region (two inputs'
+# worth), so each slot holds three times the registered eager bytes.
+_SCATTER_GATHER_SLOT_MULTIPLIER = 3
+
+# Below this row count the single pull round of the staged transport is faster than
+# two rounds with two barriers (TP8, hidden 6144, graph replay: 11.5 vs 14.9 us at one
+# row, 15.5 vs 16.4 at two rows, 19.5 vs 17.3 at three rows).
+_SCATTER_GATHER_MIN_ROWS = 3
+
+
+def _scatter_gather_enabled() -> bool:
+    """Return whether staged fused collectives may use scatter-gather transport."""
+
+    return os.getenv("B12X_PCIE_SCATTER_GATHER", "1") not in ("", "0")
+
+
+def _uses_scatter_gather_storage(
+    world_size: int,
+    transport_policy: Optional[tuple[bool, bool, bool, bool]] = None,
+) -> bool:
+    """Return whether eager slots carry the scatter and fp32 gather regions."""
+
+    return (
+        _scatter_gather_enabled()
+        and world_size in (2, 4, 8, 16, 32)
+        and not _uses_sharded_eager_storage(world_size, transport_policy)
+    )
+
+
 def _transport_policy_contract() -> tuple[bool, bool, bool, bool]:
     """Values that must agree across ranks before IPC storage is allocated."""
 
@@ -1248,6 +1278,14 @@ _POINTER_TABLE_BYTES = 16 * 8
 _MAX_BLOCKS = 36
 _MAX_RANKS = 16
 _REG_PACKS = 3
+# Fused kernel geometry for small row counts: one CTA of _WIDE_CTA_THREADS
+# threads per row, one pack per thread (hidden 6144 = 768 packs).
+_WIDE_CTA_THREADS = 768
+_WIDE_CTA_MAX_ROWS = 16
+# From this row count on the reduce-scatter / all-gather transport gathers the
+# reduced rows in the activation dtype (16 bytes per pack) instead of fp32; below
+# it the fp32 gather keeps the RMS-norm input unrounded.
+_PACKED_GATHER_MIN_ROWS = 6
 
 
 def _pointer_as_i64(value: int) -> int:
@@ -1281,9 +1319,39 @@ class _CuTeOneshotState:
     eager_buffer_bytes: Optional[int] = None
     transport_policy: tuple[bool, bool, bool, bool] = (False, False, False, False)
     sharded_eager_storage: bool = False
+    scatter_gather_storage: bool = False
     eager_slot: int = 0
     device_slot_selection: bool = False
     slot_bias: int = 0
+
+
+@dataclass(frozen=True)
+class _FusedOneshotVariant:
+    """Compile-time facts for one fused collective capacity class.
+
+    Live row counts are deliberately absent.  A compiled launcher receives the
+    row count and grid dimensions as runtime scalars, so every shape in one
+    capacity class reuses the same callable.
+    """
+
+    mode: str
+    single_cta: bool
+    register_normalize: bool
+    threads: int
+    reg_packs: int
+
+
+@dataclass(frozen=True)
+class _FusedOneshotLaunchPlan:
+    """Capacity variant plus runtime launch dimensions for one tensor view."""
+
+    variant: _FusedOneshotVariant
+    rows: int
+    ctas_per_row: int
+
+    @property
+    def blocks(self) -> int:
+        return self.rows * self.ctas_per_row
 
 
 def _enable_device_slot_selection(
@@ -1414,6 +1482,10 @@ class _CuTeOneshotBackend:
             state.world_size,
             state.transport_policy,
         )
+        state.scatter_gather_storage = _uses_scatter_gather_storage(
+            state.world_size,
+            state.transport_policy,
+        )
         state.registered_tables[ptrs0[state.rank]] = table0
         state.registered_tables[ptrs1[state.rank]] = table1
         state.eager_slot = 0
@@ -1431,9 +1503,28 @@ class _CuTeOneshotBackend:
         return threads, blocks
 
     @staticmethod
-    def _fused_threads() -> int:
-        threads = int(os.getenv("B12X_PCIE_FUSED_THREADS", "256"))
-        return min(512, max(64, (threads // 32) * 32))
+    def _fused_geometry(row_capacity: int) -> tuple[int, int]:
+        """Threads per CTA and 16-byte packs per thread of the fused kernel.
+
+        Up to _WIDE_CTA_MAX_ROWS rows each row is reduced by one CTA of 768
+        threads holding one pack each: every peer load of a thread is
+        independent, the RMS square sum needs no cross-CTA exchange, and the
+        kernel variant carries no unused pack slots (TP8, hidden 6144:
+        13.5 -> 11.4 us at 1 row, 25.0 -> 23.7 us at 4 rows). With the
+        reduce-scatter / all-gather transport the wide geometry stays ahead
+        of the 256-thread geometry and of NCCL up to 16 rows (22.8 us at 8
+        rows, 31.8 us at 16 against 36.6 / 65.1 us for the pull transport).
+        Above _WIDE_CTA_MAX_ROWS the 256-thread geometry with up to
+        _REG_PACKS packs per thread is used.
+        B12X_PCIE_FUSED_THREADS overrides the thread count for every row
+        count and keeps _REG_PACKS packs per thread.
+        """
+        override = int(os.getenv("B12X_PCIE_FUSED_THREADS", "0"))
+        if override > 0:
+            return min(1024, max(64, (override // 32) * 32)), _REG_PACKS
+        if row_capacity <= _WIDE_CTA_MAX_ROWS:
+            return _WIDE_CTA_THREADS, 1
+        return 256, _REG_PACKS
 
     @staticmethod
     def _fused_topology_mode(
@@ -1473,27 +1564,27 @@ class _CuTeOneshotBackend:
         return None
 
     @classmethod
-    def _fused_launch_config(
+    def _fused_launch_plan(
         cls,
         state: _CuTeOneshotState,
         inp: torch.Tensor,
-    ) -> tuple[str, bool, bool, int]:
+    ) -> _FusedOneshotLaunchPlan:
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
         rows = inp.numel() // int(inp.shape[-1])
-        threads = cls._fused_threads()
+        threads, reg_packs = cls._fused_geometry(rows)
         override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
         if override > 0:
             ctas_per_row = override
         else:
-            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
-                threads * _REG_PACKS
-            )
-            ctas_per_row = max(max(1, 3 // rows), min_ctas)
+            min_ctas = (hidden_packs + threads * reg_packs - 1) // (threads * reg_packs)
+            # At least 768 threads per row across CTAs (3 x 256 at one row
+            # with the narrow geometry, one wide CTA otherwise).
+            ctas_per_row = max(max(1, 768 // (rows * threads)), min_ctas)
         ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
         register_normalize = (hidden_packs + ctas_per_row * threads - 1) // (
             ctas_per_row * threads
-        ) <= _REG_PACKS
+        ) <= reg_packs
         topology_mode = cls._fused_topology_mode(state, inp)
         if topology_mode is not None:
             mode = topology_mode
@@ -1503,7 +1594,31 @@ class _CuTeOneshotBackend:
             mode = "stage_push"
         else:
             mode = "stage_pull"
-        return mode, ctas_per_row == 1, register_normalize, threads
+        if (
+            mode == "stage_pull"
+            and state.scatter_gather_storage
+            and rows >= _SCATTER_GATHER_MIN_ROWS
+            and ctas_per_row == 1
+            and reg_packs == 1
+            and register_normalize
+            and hidden_packs <= threads
+            and hidden_packs % state.world_size == 0
+            and inp.dtype in (torch.float16, torch.bfloat16)
+        ):
+            mode = "stage_scatter_gather"
+            if rows >= _PACKED_GATHER_MIN_ROWS:
+                mode = "stage_scatter_gather_packed"
+        return _FusedOneshotLaunchPlan(
+            variant=_FusedOneshotVariant(
+                mode=mode,
+                single_cta=ctas_per_row == 1,
+                register_normalize=register_normalize,
+                threads=threads,
+                reg_packs=reg_packs,
+            ),
+            rows=rows,
+            ctas_per_row=ctas_per_row,
+        )
 
     @staticmethod
     def _device_index(device: torch.device) -> int:
@@ -1542,9 +1657,8 @@ class _CuTeOneshotBackend:
             and int(inp.data_ptr()) not in state.registered_tables
         ):
             raise RuntimeError("input buffer is not registered")
-        mode, single_cta, register_normalize, threads = self._fused_launch_config(
-            state, inp
-        )
+        launch_plan = self._fused_launch_plan(state, inp)
+        variant = launch_plan.variant
         from ._oneshot_cute import get_fused_oneshot_launcher
 
         device_index = self._device_index(inp.device)
@@ -1556,12 +1670,13 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
-                mode,
-                single_cta,
-                register_normalize,
+                variant.mode,
+                variant.single_cta,
+                variant.register_normalize,
                 device_slot_selection,
                 slot_bias,
-                threads,
+                variant.threads,
+                variant.reg_packs,
                 device_index,
             )
 
@@ -1681,9 +1796,8 @@ class _CuTeOneshotBackend:
         del _reg_buffer, _reg_buffer_sz_bytes
         state = self._state(handle)
         capturing = _is_current_stream_capturing(inp.device)
-        mode, single_cta, register_normalize, threads = self._fused_launch_config(
-            state, inp
-        )
+        launch_plan = self._fused_launch_plan(state, inp)
+        variant = launch_plan.variant
         device_index = self._device_index(inp.device)
         prospective_device_selection = state.device_slot_selection or (
             capturing and state.eager_tables is not None
@@ -1698,12 +1812,13 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
-                mode,
-                single_cta,
-                register_normalize,
+                variant.mode,
+                variant.single_cta,
+                variant.register_normalize,
                 prospective_device_selection,
                 prospective_slot_bias,
-                threads,
+                variant.threads,
+                variant.reg_packs,
                 device_index,
             ):
                 raise RuntimeError(
@@ -1714,7 +1829,7 @@ class _CuTeOneshotBackend:
         table_address, staged = self._select_table(state, inp.data_ptr())
         pack_elems = 16 // inp.element_size()
         hidden_packs = int(inp.shape[-1]) // pack_elems
-        rows = inp.numel() // int(inp.shape[-1])
+        rows = launch_plan.rows
         residual_row_stride_packs = _fused_row_stride_packs(residual)
         residual_output_row_stride_packs = _fused_row_stride_packs(residual_out)
         assert residual_row_stride_packs is not None
@@ -1723,20 +1838,7 @@ class _CuTeOneshotBackend:
             raise ValueError(
                 f"fused allreduce RMSNorm supports at most {_MAX_BLOCKS} rows"
             )
-        _, single_cta_check, _, _ = self._fused_launch_config(state, inp)
-        # Recover the CTA count from the already-derived single-CTA/config
-        # formula without changing the launch contract.
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        if override > 0:
-            ctas_per_row = override
-        else:
-            min_ctas = (hidden_packs + threads * _REG_PACKS - 1) // (
-                threads * _REG_PACKS
-            )
-            ctas_per_row = max(max(1, 3 // rows), min_ctas)
-        ctas_per_row = max(1, min(ctas_per_row, _MAX_BLOCKS // rows))
-        assert single_cta_check == (ctas_per_row == 1)
-        blocks = rows * ctas_per_row
+        ctas_per_row = launch_plan.ctas_per_row
 
         from ._oneshot_cute import get_fused_oneshot_launcher
 
@@ -1745,12 +1847,13 @@ class _CuTeOneshotBackend:
                 _dtype_name(inp.dtype),
                 state.world_size,
                 state.rank,
-                mode,
-                single_cta,
-                register_normalize,
+                variant.mode,
+                variant.single_cta,
+                variant.register_normalize,
                 state.device_slot_selection,
                 state.slot_bias,
-                threads,
+                variant.threads,
+                variant.reg_packs,
                 device_index,
             )
             if not state.device_slot_selection and staged:
@@ -1759,12 +1862,13 @@ class _CuTeOneshotBackend:
                         _dtype_name(inp.dtype),
                         state.world_size,
                         state.rank,
-                        mode,
-                        single_cta,
-                        register_normalize,
+                        variant.mode,
+                        variant.single_cta,
+                        variant.register_normalize,
                         True,
                         slot_bias,
-                        threads,
+                        variant.threads,
+                        variant.reg_packs,
                         device_index,
                     )
             launcher(
@@ -1782,7 +1886,7 @@ class _CuTeOneshotBackend:
                 residual_output_row_stride_packs,
                 int(state.eager_buffer_bytes or inp.numel() * inp.element_size()) // 16,
                 float(epsilon),
-                blocks,
+                launch_plan.blocks,
             )
 
     def get_graph_buffer_ipc_meta(self, handle: int):
@@ -2292,6 +2396,10 @@ class PCIeOneshotAllReduce:
                 transport_policy,
             ),
             ipc=ipc,
+            scatter_gather_storage=_uses_scatter_gather_storage(
+                world_size,
+                transport_policy,
+            ),
         )
         owned_buffers = [channel_buffers.owned_buffer]
         runtime, init_error = cls._from_prepared_factory(
@@ -2578,6 +2686,7 @@ class PCIeOneshotAllReduce:
         eager_buffer_bytes: int,
         sharded_eager_storage: bool,
         ipc: CudaRTLibrary,
+        scatter_gather_storage: bool = False,
     ) -> _ChannelSharedBuffers:
         signal_bytes = int(signal_bytes)
         eager_buffer_bytes = int(eager_buffer_bytes)
@@ -2587,6 +2696,8 @@ class PCIeOneshotAllReduce:
             raise ValueError("eager_buffer_bytes must be positive")
         if sharded_eager_storage:
             eager_buffer_bytes *= dist.get_world_size(group=exchange_group)
+        elif scatter_gather_storage:
+            eager_buffer_bytes *= _SCATTER_GATHER_SLOT_MULTIPLIER
 
         signal_offset = 0
         eager0_offset = _align_up(signal_bytes, IPC_SLAB_ALIGNMENT)
@@ -3416,6 +3527,10 @@ class PCIeOneshotAllReducePool:
             eager_buffer_bytes=self.eager_buffer_bytes,
             sharded_eager_storage=self._sharded_eager_storage,
             ipc=self._ipc,
+            scatter_gather_storage=_uses_scatter_gather_storage(
+                self.world_size,
+                self._transport_policy,
+            ),
         )
         owned_buffers = [channel_buffers.owned_buffer]
         channel, init_error = PCIeOneshotAllReduce._from_prepared_factory(
