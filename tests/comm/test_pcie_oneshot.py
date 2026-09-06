@@ -29,7 +29,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
-from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch
+from b12x.comm.pcie._oneshot_cute import _FusedOneshotLaunch, _OneshotLaunch
 
 
 @pytest.fixture(autouse=True)
@@ -2447,3 +2447,40 @@ def test_pool_rejects_channel_rollback_during_capture():
 
     with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
         pool.rollback_channels(checkpoint)
+
+
+@pytest.mark.parametrize("launch_cls", [_OneshotLaunch, _FusedOneshotLaunch])
+def test_oneshot_kernels_trigger_dependents_first(launch_cls):
+    """Both one-shot kernels execute ``griddepcontrol.launch_dependents``
+    before any other statement, so a dependent launched with the
+    programmatic-stream-serialization attribute (the weight-first projection)
+    can stage its weights while the allreduce waits on the fabric. The
+    trigger must precede the thread-index reads and every peer wait."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(launch_cls.kernel))
+    tree = ast.parse(source)
+    function = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    )
+    body = [
+        node
+        for node in function.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ]
+    first = body[0]
+    assert isinstance(first, ast.Expr)
+    assert isinstance(first.value, ast.Call)
+    assert ast.unparse(first.value.func) == "cute.arch.griddepcontrol_launch_dependents"
+    assert first.value.args == []
+    assert (
+        sum(
+            1
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cute.arch.griddepcontrol_launch_dependents"
+        )
+        == 1
+    )

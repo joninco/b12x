@@ -16,6 +16,7 @@ from b12x.comm.pcie.pcie_oneshot import (
     PCIeOneshotAllReducePool,
     _CuTeOneshotBackend,
 )
+from tests.comm.pdl_dependent import compile_wait_then_copy
 
 
 pytestmark = pytest.mark.skipif(
@@ -491,6 +492,134 @@ def _run_tp8_split_view_graph(
             assert torch.all(padding == -7.0)
 
 
+def _run_pdl_dependent(
+    pool: PCIeOneshotAllReducePool,
+    device: torch.device,
+    rank: int,
+) -> None:
+    """Both one-shot kernels execute ``griddepcontrol.launch_dependents`` as
+    their first statement. A dependent kernel that executes
+    ``griddepcontrol.wait`` before reading the allreduce output must observe
+    the complete output whether or not its launch carries the
+    programmatic-stream-serialization attribute, and the allreduce result
+    itself must not change. Per iteration on fresh inputs, eagerly and under
+    CUDA-graph replay, for the plain and the fused kernel: the one-shot output
+    is compared bitwise with the same one-shot run without a dependent (the
+    kernels sum in a fixed order) and within tolerance with a torch reference,
+    and the dependent's copy is compared bitwise with the one-shot output."""
+    iterations = int(os.getenv("B12X_PCIE_ONESHOT_PDL_ITERATIONS", "40"))
+    rows, hidden_size, dtype, epsilon = 4, 6144, torch.bfloat16, 1e-6
+    copy = compile_wait_then_copy()
+    inp, residual, weight = _make_inputs(rows, hidden_size, dtype, device, rank)
+    out = torch.empty_like(inp)
+    residual_out = torch.empty_like(inp)
+    plain_out = torch.empty_like(inp)
+    dependent_out = torch.empty_like(inp)
+
+    def plain(channel_id="eager:fused-rmsnorm", stream=None):
+        pool.all_reduce(inp, out=plain_out, stream=stream, channel_id=channel_id)
+
+    def fused(channel_id="eager:fused-rmsnorm", stream=None):
+        pool.all_reduce_fused_add_rms_norm(
+            inp,
+            residual,
+            weight,
+            epsilon,
+            out=out,
+            residual_out=residual_out,
+            stream=stream,
+            channel_id=channel_id,
+        )
+
+    def expected(iteration, name, allreduce, produced):
+        """Torch references for fresh inputs, then the one-shot's own output
+        for the same inputs without a dependent behind it."""
+        next_inp, next_residual, _ = _make_inputs(
+            rows, hidden_size, dtype, device, rank, iteration=iteration
+        )
+        inp.copy_(next_inp)
+        residual.copy_(next_residual)
+        reduced = inp.clone()
+        dist.all_reduce(reduced)
+        fused_out, _ = _reference(inp, residual, weight, epsilon)
+        torch.cuda.synchronize(device)
+        allreduce()
+        torch.cuda.synchronize(device)
+        alone = produced.clone()
+        # Restore the inputs so the measured run sees the same values.
+        inp.copy_(next_inp)
+        residual.copy_(next_residual)
+        torch.cuda.synchronize(device)
+        return (reduced if name == "plain" else fused_out), alone
+
+    chains = (
+        ("plain", plain, plain_out),
+        ("fused", fused, out),
+    )
+    for name, allreduce, produced in chains:
+        for use_pdl in (True, False):
+            # Eager: allreduce, then the dependent on the same stream.
+            for iteration in range(iterations):
+                reference, alone = expected(iteration + 1, name, allreduce, produced)
+                dependent_out.zero_()
+                allreduce()
+                copy(produced, dependent_out, use_pdl)
+                torch.cuda.synchronize(device)
+                assert torch.equal(produced, alone), (
+                    name,
+                    use_pdl,
+                    iteration,
+                    "allreduce output changed",
+                )
+                _assert_close(produced, reference, dtype)
+                assert torch.equal(dependent_out, produced), (
+                    name,
+                    use_pdl,
+                    iteration,
+                    "dependent read an incomplete output",
+                )
+            # Graph: the chain captured once, replayed on fresh inputs.
+            # Each independently replayable graph needs its own channel id,
+            # bound to its own stream.
+            graph_channel = f"graph:pdl-{name}-{'attr' if use_pdl else 'noattr'}"
+            stream = torch.cuda.Stream(device)
+            channel = pool.for_stream(stream, channel_id=graph_channel)
+            with torch.cuda.stream(stream):
+                if name == "plain":
+                    channel.prepare_graph_all_reduce(inp)
+                else:
+                    channel.prepare_graph_fused_add_rms_norm(inp)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with (
+                pool.capture(stream=stream, channel_id=graph_channel),
+                torch.cuda.graph(graph, stream=stream),
+            ):
+                allreduce(graph_channel, stream)
+                copy(produced, dependent_out, use_pdl)
+            for iteration in range(iterations):
+                reference, alone = expected(1000 + iteration, name, allreduce, produced)
+                dependent_out.zero_()
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert torch.equal(produced, alone), (
+                    name,
+                    use_pdl,
+                    iteration,
+                    "graph allreduce output changed",
+                )
+                _assert_close(produced, reference, dtype)
+                assert torch.equal(dependent_out, produced), (
+                    name,
+                    use_pdl,
+                    iteration,
+                    "graph dependent read an incomplete output",
+                )
+            del graph
+            torch.cuda.synchronize(device)
+            dist.barrier()
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
@@ -515,6 +644,10 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 "graph:fused-rmsnorm",
                 "graph:fused-transition",
                 "graph:split-residual",
+                "graph:pdl-plain-attr",
+                "graph:pdl-plain-noattr",
+                "graph:pdl-fused-attr",
+                "graph:pdl-fused-noattr",
             )
         )
         pool.for_stream(channel_id="eager:fused-rmsnorm")
@@ -525,6 +658,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         _run_tp8_graph_mode_transition(pool, device, rank)
         dist.barrier()
         _run_tp8_split_view_graph(pool, device, rank)
+        dist.barrier()
+        _run_pdl_dependent(pool, device, rank)
         torch.cuda.synchronize(device)
     finally:
         pool.close()
