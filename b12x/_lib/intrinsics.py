@@ -1781,6 +1781,43 @@ def atomic_cas_global_i32(
 
 
 @dsl_user_op
+def red_or_shared_u32(addr: Int32, val: Uint32, *, loc=None, ip=None) -> None:
+    """Shared-memory 32-bit atomic OR without return (``red.shared.or.b32``)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Uint32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "red.shared.or.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_global_i32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """Plain global int32 load (``ld.global.s32``)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.global.s32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def atomic_add_shared_i32(addr: Int32, val: Int32, *, loc=None, ip=None) -> Int32:
     """Shared-memory int32 atomic add (CTA-scope). Returns old value.
 
