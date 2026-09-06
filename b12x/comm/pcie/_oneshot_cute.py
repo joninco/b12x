@@ -342,6 +342,8 @@ class _FusedOneshotLaunch(_PackedMath):
         hidden_packs: Int32,
         rows: Int32,
         ctas_per_row: Int32,
+        residual_row_stride_packs: Int64,
+        residual_output_row_stride_packs: Int64,
         shard_packs: Int64,
         epsilon: Float32,
         grid_x: Int32,
@@ -358,6 +360,8 @@ class _FusedOneshotLaunch(_PackedMath):
             hidden_packs,
             rows,
             ctas_per_row,
+            residual_row_stride_packs,
+            residual_output_row_stride_packs,
             shard_packs,
             epsilon,
         ).launch(
