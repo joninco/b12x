@@ -23,13 +23,6 @@ _GB10_IDENTITY = DeviceIdentity(
     product_name="NVIDIA GB10",
 )
 
-_RTX_PRO_6000_IDENTITY = DeviceIdentity(
-    vendor="nvidia",
-    compute_capability=(12, 0),
-    sm_count=188,
-    product_name="NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
-)
-
 
 def _policy_context(device: DeviceIdentity) -> PolicyContext:
     return PolicyContext.for_identity(device)
@@ -543,7 +536,7 @@ def test_typed_packed_planning_keeps_representation_axes_independent(
         ("w4a16", "fp4_e8m0_k32", "w31", "mma_packed"),
         ("nvfp4", "modelopt_nvfp4", "w31", "source_native"),
         ("w4a8_nvfp4", "modelopt_nvfp4", "w31", "source_native"),
-        ("w4a16", "modelopt_nvfp4", "w13", "source_native"),
+        ("w4a16", "modelopt_nvfp4", "w13", "mma_packed"),
     ),
 )
 def test_vllm_1_2_6_planning_contract_remains_supported(
@@ -1048,9 +1041,9 @@ def test_gb10_qwen38_flash_next_decode_reports_profile_provenance(
 
 @pytest.mark.parametrize(
     ("num_tokens", "route_mode"),
-    ((1, "packed"), (2, "packed"), (4, "packed"), (8, "packed")),
+    ((1, "direct"), (2, "direct"), (4, "direct"), (8, "packed")),
 )
-def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
+def test_gb10_uniform_nvfp4_a16_uses_packed_layout_heuristic(
     num_tokens: int,
     route_mode: str,
 ) -> None:
@@ -1065,30 +1058,36 @@ def test_gb10_glm53_w4a16_profile_selects_measured_route_kernel(
         context=_policy_context(_GB10_IDENTITY),
     )
 
-    assert resolution.source is PolicySource.PREPLANNED
+    assert resolution.source is PolicySource.HEURISTIC
     assert resolution.config.backend == "w4a16"
     assert resolution.config.w4a16_route_mode == route_mode
 
 
+@pytest.mark.parametrize("quant_mode", ("nvfp4_auto", "w4a16"))
 @pytest.mark.parametrize(
-    ("num_tokens", "route_mode"),
-    ((8, "direct"), (9, "direct"), (16, "direct"), (17, "packed")),
+    ("num_tokens", "supported"),
+    ((8, True), (9, True), (16, True), (17, False)),
 )
-def test_rtx_pro_6000_glm53_w4a16_profile_caps_direct_micro_at_16_tokens(
+def test_glm53_w4a16_direct_routing_supported_through_16_tokens(
+    quant_mode: str,
     num_tokens: int,
-    route_mode: str,
+    supported: bool,
 ) -> None:
-    resolution = fused_moe_impl._resolve_moe_decode_policy(
-        num_tokens=num_tokens,
-        num_topk=8,
-        num_experts=256,
-        k=6144,
-        n=256,
+    """The direct micro kernel serves the GLM-5.3 TP8 shard through 16 tokens.
+
+    Automatic precision reads native ModelOpt scales; uniform W4A16 answers
+    through the tensor-core decode bound. Both share the 16-token boundary.
+    """
+    query = fused_moe_impl.MoeDecodeQuery(
+        quant_mode=quant_mode,
+        source_format="modelopt_nvfp4",
         activation="silu",
-        quant_mode="w4a16",
-        context=_policy_context(_RTX_PRO_6000_IDENTITY),
+        num_experts=256,
+        hidden_size=6144,
+        intermediate_size=256,
+        top_k=8,
+        num_tokens=num_tokens,
+        routed_rows=8 * num_tokens,
     )
 
-    assert resolution.source is PolicySource.PREPLANNED
-    assert resolution.config.backend == "w4a16"
-    assert resolution.config.w4a16_route_mode == route_mode
+    assert fused_moe_impl._w4a16_direct_routing_supported(query) is supported

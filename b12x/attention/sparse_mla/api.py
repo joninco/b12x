@@ -30,6 +30,7 @@ from .._shared.mla.kv_cache import (
     concat_and_cache_glm_next_mla,
     concat_and_cache_glm_next_mla_fp8,
     concat_and_cache_glm_next_mla_nvfp4,
+    concat_and_cache_nvfp4_mla_fp8_rope,
 )
 from .pooled_selection import expand_pooled_topk_to_physical_slots
 from ._scratch import (
@@ -171,6 +172,7 @@ __all__ = [
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
+    "concat_and_cache_nvfp4_mla_fp8_rope",
     "expand_pooled_topk_to_physical_slots",
     "is_supported",
     "clear_caches",

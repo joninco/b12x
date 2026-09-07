@@ -334,7 +334,7 @@ def test_fused_oneshot_capacity_variants_reuse_launchers_for_live_rows(
         registered_tables={},
         eager_tables=(300, 400),
         eager_buffer_bytes=256 * 1024,
-        transport_policy=(False, False, False, False),
+        transport_policy=(False, False, False, False, False),
         scatter_gather_storage=True,
     )
     plans = [

@@ -325,9 +325,20 @@ def _validate_selected_indices(
         raise ValueError(
             f"selected_indices rows {int(selected_indices.shape[0])} do not match q rows {rows}"
         )
-    if int(selected_indices.shape[1]) > int(scratch.topk):
+    selected_width = int(selected_indices.shape[1])
+    planned_width = int(scratch.topk)
+    if selected_width > planned_width:
         raise ValueError(
-            f"selected_indices width {int(selected_indices.shape[1])} exceeds scratch topk {scratch.topk}"
+            f"selected_indices width {selected_width} exceeds scratch topk {planned_width}"
+        )
+    model_type = getattr(scratch, "model_type", None)
+    if model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT) and (
+        selected_width != planned_width
+    ):
+        raise ValueError(
+            "GLM sparse MLA selected_indices width must match the planned "
+            f"top-k width {planned_width}, got {selected_width}; carry the live "
+            "valid count in nsa_cache_seqlens_int32"
         )
     return selected_indices
 

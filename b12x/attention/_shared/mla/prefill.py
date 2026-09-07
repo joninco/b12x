@@ -23,6 +23,7 @@ DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import torch
 
@@ -103,8 +104,18 @@ _TOPK_CONTAINERS = (512, 1024, 2048)
 _TOPK_EXACT = frozenset({128, 512, 1024, 2048, 2051, 2112})
 
 
-def _topk_container(topk: int) -> int:
-    """Smallest MG index container holding ``topk`` valid entries per row."""
+def _topk_container(model_type: int, topk: int) -> int:
+    """Return the DSV4 MG container width for a runtime top-k row.
+
+    GLM sparse-MLA plans require the caller-owned index row to match the planned
+    width. Live valid counts are runtime metadata, so the dispatcher must not
+    replace a bound GLM row with an allocating padded tensor. Unsupported GLM
+    widths remain unchanged here and fail the model-specific dispatch gate.
+    DSV4 accepts the padded fixed-container representation and is the model
+    family that requires sub-container widening.
+    """
+    if model_type != ModelType.DSV4:
+        return topk
     if topk in _TOPK_EXACT:
         return topk
     for container in _TOPK_CONTAINERS:
@@ -252,12 +263,12 @@ def run_unified_prefill(
     else:
         topk_length = topk_length.to(device=device, dtype=torch.int32).contiguous()
 
-    container = _topk_container(topk)
+    container = _topk_container(model_type, topk)
     if container != topk:
-        # A short sequence clamps the runtime top-k below the model's
-        # index_topk (e.g. 192 for a 192-token prefill). The MG kernels take
-        # fixed containers; widen the index rows with the invalid sentinel and
-        # keep the per-token valid length, exactly like GLM_NEXT's 2112/2051.
+        # DSV4 short sequences can clamp runtime top-k below index_topk (for
+        # example, 192 for a 192-token prefill). Its MG kernels take fixed
+        # containers, so widen the row with the invalid sentinel while retaining
+        # the per-token valid length.
         topk_indices = torch.nn.functional.pad(
             topk_indices, (0, container - topk), value=-1
         )
@@ -317,7 +328,7 @@ def run_unified_prefill(
                 scale_format=scale_format,
                 fp8_rope=bool(traits.fp8_rope),
                 latent_scale_per_token=bool(traits.latent_scale_per_token),
-                traits_override=traits,
+                traits_override=replace(traits, compute_mode=compute_mode),
             )
             if extra_kv_cache is not None:
                 kwargs.update(
