@@ -122,6 +122,12 @@ def main(argv=None) -> int:
                     for ev in prof.key_averages()
                     if "TopkSortConvert" in ev.key or "topk_sort" in ev.key
                 ]
+                if not kernel_us:
+                    raise SystemExit(
+                        "no profiler event matched the sort kernel; kernel time "
+                        f"is unavailable for rows={rows} seq_len={seq_len} "
+                        f"max_positions={max_positions}"
+                    )
                 replay_us = sum(times) / len(times)
                 record = {
                     "rows": rows,
@@ -131,12 +137,15 @@ def main(argv=None) -> int:
                     "correctness": "graph replay equals sort_convert_reference",
                     "replay_us_mean": replay_us,
                     "replay_us_samples": times,
-                    "kernel_us_mean": kernel_us[0] if kernel_us else None,
+                    # Mean device time per replay summed over every matching
+                    # kernel event (one event per launch in the captured graph).
+                    "kernel_us_mean": sum(kernel_us),
+                    "kernel_us_events": len(kernel_us),
                 }
                 records.append(record)
                 print(
                     f"rows {rows:2d} seq {seq_len:6d} max_positions {max_positions:6d}: "
-                    f"kernel {record['kernel_us_mean'] or float('nan'):6.2f} us  "
+                    f"kernel {record['kernel_us_mean']:6.2f} us  "
                     f"replay {replay_us:6.2f} us"
                 )
                 del graph

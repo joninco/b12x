@@ -10,15 +10,19 @@ contiguous residual and is the comparison baseline. The ratios reported are
 of the slowest rank's median replay time (lower is better).
 
 Correctness precedes timing: every arm's graph is replayed once from the
-validated inputs and its outputs compared against an NCCL fp32 reference
-and against the ``packed_control`` arm; the residual buffers, which the
-collective updates in place, are restored before the warm-up and timed
-replays, and after the timed replays every arm is replayed once more from
-the restored inputs and must reproduce its validated outputs bitwise. The
-JSON record carries the command, the source revision and worktree state,
-rank 0's physical GPU and its operating mode before and after the timed
-work, every rank's correctness metrics, the raw per-sample timings and the
-ratios.
+validated inputs and its output and residual must be finite, within the
+BF16 tolerance ``|a - ref| <= 2e-2 + 2e-2 * |ref|`` of an NCCL fp32
+reference, and leave the padding around a strided residual untouched, on
+every rank, or all ranks abort before any timed replay (the metrics against
+the reference and against the ``packed_control`` arm are recorded as well).
+The residual buffers, which the collective updates in place, are restored
+before the warm-up replays and again before the timed replays, and after
+the timed replays every arm is replayed once more from the restored inputs
+and must reproduce its validated outputs bitwise. The record's status is
+``qualified`` only when both gates passed. The JSON record carries the
+command, the source revision and worktree state, rank 0's physical GPU and
+its operating mode before and after the timed work, every rank's validation
+and correctness metrics, the raw per-sample timings and the ratios.
 """
 
 from __future__ import annotations
@@ -153,6 +157,44 @@ def _error_metrics(
     }
 
 
+BF16_TOLERANCE = "|a - ref| <= 2e-2 + 2e-2 * |ref|"
+
+
+def _within_bf16_tolerance(actual: torch.Tensor, reference: torch.Tensor) -> bool:
+    error = (actual.float() - reference.float()).abs()
+    return bool((error <= 2e-2 + 2e-2 * reference.float().abs()).all().item())
+
+
+def _validate_arm(
+    name: str,
+    output: torch.Tensor,
+    residual: torch.Tensor,
+    expected_out: torch.Tensor,
+    expected_residual: torch.Tensor,
+    padding_mismatches: int,
+) -> dict[str, Any]:
+    """Acceptance of one arm's checked replay: finite output and residual,
+    both within the BF16 tolerance of the NCCL fp32 reference, and the
+    padding around a strided residual untouched."""
+    finite = bool(torch.isfinite(output.float()).all().item()) and bool(
+        torch.isfinite(residual.float()).all().item()
+    )
+    checks = {
+        "finite": finite,
+        "output_within_tolerance": finite
+        and _within_bf16_tolerance(output, expected_out),
+        "residual_within_tolerance": finite
+        and _within_bf16_tolerance(residual, expected_residual),
+        "padding_untouched": padding_mismatches == 0,
+    }
+    return {
+        "arm": name,
+        "tolerance": BF16_TOLERANCE,
+        "checks": checks,
+        "status": "pass" if all(checks.values()) else "fail",
+    }
+
+
 def _capture_case(
     pool: PCIeOneshotAllReducePool,
     rows: int,
@@ -254,6 +296,23 @@ def _capture_case(
         torch.count_nonzero(boundary_padding != -7.0).item()
     )
 
+    padding_mismatches = {
+        "native_strided": correctness["native_strided"]["padding_mismatch_count"],
+        "boundary_copy": correctness["boundary_copy"]["source_padding_mismatch_count"],
+        "packed_control": 0,
+    }
+    validation = {
+        name: _validate_arm(
+            name,
+            outputs[name],
+            residuals[name],
+            expected_out,
+            expected_residual_bf16,
+            padding_mismatches[name],
+        )
+        for name in ARMS
+    }
+
     validated_outputs = {name: outputs[name].clone() for name in ARMS}
     validated_residuals = {name: residuals[name].clone() for name in ARMS}
 
@@ -287,6 +346,7 @@ def _capture_case(
         "graph_nodes": {name: _graph_nodes(graph) for name, graph in graphs.items()},
         "replay_allocation_delta_bytes": allocation_deltas,
         "correctness": correctness,
+        "validation": validation,
     }
     return graphs, metadata, result
 
@@ -303,13 +363,16 @@ def _measure(
     """Slowest-rank replay times (us per replay) per arm and sample. Every
     replay loop runs on the arm's stream (``CUDAGraph.replay`` launches on
     the current stream) so the stream synchronize bounds the device work.
-    ``reset`` restores the validated inputs before the warm-up replays."""
+    ``reset`` restores the validated inputs before the warm-up replays and
+    again before the timed replays, which the warm-up otherwise leaves
+    started from warm-up-modified residuals."""
     reset()
     for name in ARMS:
         with torch.cuda.stream(streams[name]):
             for _ in range(warmups):
                 graphs[name].replay()
         streams[name].synchronize()
+    reset()
 
     raw = {name: [] for name in ARMS}
     for sample in range(samples):
@@ -353,6 +416,7 @@ def _worker(
     provenance = benchmark_provenance(None, device) if rank == 0 else None
     cases = []
     local_correctness = []
+    local_validation = []
     for row_count in rows:
         maximum_bytes = row_count * hidden_size * torch.bfloat16.itemsize
         channel_ids = tuple(f"graph:layout:{row_count}:{name}" for name in ARMS)
@@ -373,6 +437,24 @@ def _worker(
                 device,
                 1e-6,
             )
+            # Correctness precedes timing: every rank's arms must pass the
+            # checked replay, or all ranks abort before any timed replay.
+            failures = [
+                (rank, name, validation["checks"])
+                for name, validation in case["validation"].items()
+                if validation["status"] != "pass"
+            ]
+            gathered_failures: list[Any] = [None] * world_size
+            dist.all_gather_object(gathered_failures, failures)
+            all_failures = [entry for entries in gathered_failures for entry in entries]
+            if all_failures:
+                raise SystemExit(
+                    f"validation failed before timing at {row_count} rows: "
+                    + "; ".join(
+                        f"rank {failed_rank} {name} {checks}"
+                        for failed_rank, name, checks in all_failures
+                    )
+                )
             # The transport plan, and with it the compiled kernel, depends
             # on the row count, so every case compiles during its capture;
             # resolution is frozen only around the timed replays, which
@@ -413,6 +495,7 @@ def _worker(
                 for name in ARMS
             }
             local_correctness.append(case["correctness"])
+            local_validation.append(case["validation"])
             if rank == 0:
                 case["raw_slowest_rank_us"] = raw
                 case["summary_slowest_rank_us"] = {
@@ -438,21 +521,31 @@ def _worker(
 
     gathered_correctness: list[Any] = [None] * world_size
     dist.all_gather_object(gathered_correctness, local_correctness)
+    gathered_validation: list[Any] = [None] * world_size
+    dist.all_gather_object(gathered_validation, local_validation)
     if rank == 0:
         provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(device)
-        # The pre-timing validation aborts on failure; the post-timing
-        # bitwise reproduction is recorded per arm and rank and decides the
-        # status of the record.
+        # Both gates decide the status: the pre-timing validation of every
+        # arm on every rank (a failure aborts before timing, so a written
+        # record has passed it) and the post-timing bitwise reproduction.
+        pre_timing_validated = all(
+            validation["status"] == "pass"
+            for rank_cases in gathered_validation
+            for case_validation in rank_cases
+            for validation in case_validation.values()
+        )
         after_timing_reproduced = all(
             entry["output_bitwise_equal"] and entry["residual_bitwise_equal"]
             for rank_cases in gathered_correctness
             for correctness in rank_cases
             for entry in correctness["after_timing"].values()
         )
+        qualified = pre_timing_validated and after_timing_reproduced
         record = {
             "schema_version": 2,
             "semantic_role": "TP8 fused all-reduce RMSNorm residual-layout comparison",
-            "status": "qualified" if after_timing_reproduced else "unsupported",
+            "status": "qualified" if qualified else "unsupported",
+            "pre_timing_validation_passed": pre_timing_validated,
             "after_timing_bitwise_reproduced": after_timing_reproduced,
             "provenance": provenance,
             "b12x_commit": provenance["source"]["commit"],
@@ -465,9 +558,12 @@ def _worker(
                 ),
             },
             "correctness_state": (
-                "every arm replayed once from the validated inputs before "
-                "timing (metrics under cases[].correctness); after the timed "
-                "replays every arm on every rank "
+                "every arm's checked replay on every rank "
+                + ("passed" if pre_timing_validated else "did not pass")
+                + " the finite, BF16-tolerance and padding checks before "
+                "timing (cases[].validation, metrics under "
+                "cases[].correctness); after the timed replays every arm on "
+                "every rank "
                 + (
                     "reproduced its validated outputs bitwise"
                     if after_timing_reproduced
@@ -494,6 +590,7 @@ def _worker(
             },
             "cases": cases,
             "rank_correctness": gathered_correctness,
+            "rank_validation": gathered_validation,
         }
         destination = Path(output)
         destination.parent.mkdir(parents=True, exist_ok=True)

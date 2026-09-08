@@ -156,13 +156,15 @@ def _validate_variant(
     return record
 
 
-def _worker(rank: int, world_size: int, port: int, json_path: str) -> None:
+def _worker(
+    rank: int, world_size: int, port: int, json_path: str, argv: list[str]
+) -> None:
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     dist.init_process_group(
         "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
     )
-    provenance = benchmark_provenance(None, device) if rank == 0 else None
+    provenance = benchmark_provenance(argv, device) if rank == 0 else None
     from b12x.gemm import weight_first_gemv as wf
 
     hidden = int(os.getenv("B12X_WF_HIDDEN", "6144"))
@@ -389,7 +391,12 @@ def main(argv=None) -> int:
         )
     mp.spawn(
         _worker,
-        args=(args.world_size, _free_port(), args.json),
+        args=(
+            args.world_size,
+            _free_port(),
+            args.json,
+            list(sys.argv[1:] if argv is None else argv),
+        ),
         nprocs=args.world_size,
         join=True,
     )

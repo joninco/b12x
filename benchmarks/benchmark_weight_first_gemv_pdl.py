@@ -212,7 +212,7 @@ def main(argv=None) -> int:
         print("CUDA is required", file=sys.stderr)
         return 2
     dev = torch.device("cuda")
-    provenance = benchmark_provenance(argv, dev)
+    provenance = benchmark_provenance(sys.argv[1:] if argv is None else argv, dev)
     torch.manual_seed(0)
     spin = compile_spin()
     flush_buf = torch.ones(192 << 20, dtype=torch.uint8, device=dev)
@@ -401,8 +401,19 @@ def main(argv=None) -> int:
                         if baseline is None or baseline["after_spin_us"] <= 0
                         else record["after_spin_us"] / baseline["after_spin_us"]
                     )
-                    if record["variant"] == "wf-pdl" and baseline is not None:
+                    if record["variant"] == "wf-pdl":
                         ratio = record["after_spin_ratio_vs_cublas"]
+                        if ratio is None:
+                            # The after-spin time subtracts a profiler device
+                            # time from an event-timed mean, so a spin-bound
+                            # baseline can leave no positive remainder.
+                            print(
+                                f"  wf-pdl / cublas after-spin ratio at M={m}: "
+                                "unavailable (cublas after_spin_us "
+                                f"{None if baseline is None else baseline['after_spin_us']})",
+                                flush=True,
+                            )
+                            continue
                         print(
                             f"  wf-pdl / cublas after-spin ratio at M={m}: "
                             f"{ratio:.3f} (acceptance for router_shared at 4 rows: "
