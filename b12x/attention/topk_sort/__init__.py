@@ -17,12 +17,18 @@ below ``seq_lens[row]`` (``-1`` unused). One CTA of 256 threads per row marks
 them in a shared-memory bitmap, emits the set bits ascending by warp prefix
 sums over rounds of 1024 words and converts each position to its physical
 slot ``block_table[row, pos >> log2(block_size)] << log2(block_size) | pos &
-(block_size - 1)`` in place, ``-1`` filling the tail. ``max_positions`` (the
+(block_size - 1)`` in place, ``-1`` filling the tail. Slots are int32: a
+position whose block lies beyond the table, whose page is negative, or whose
+page exceeds ``INT32_MAX >> log2(block_size)`` (its slots would not fit the
+signed 32-bit range) is written as ``-1`` instead of a wrapped slot. The
+sorted order of a row depends on the selected set alone; the slots also
+depend on the row's block table and the block size. ``max_positions`` (the
 model length) sizes the bitmap and is the only compile key besides the
 device and toolchain identity; the row count, ``topk`` and the strides are
 runtime launch arguments. The kernel allocates nothing, so it can be launched
 on a side stream inside a CUDA-graph capture; ``precompile`` compiles and
-warm-runs it before capture.
+warm-runs it before capture. Compilation and launches select the stream of
+the tensors' device, whatever the current device.
 
 Example:
     from b12x.attention import topk_sort
@@ -52,13 +58,12 @@ META = OpMeta(
         "MAX_BITMAP_WORDS",
     ),
     dtypes=("int32",),
-    # CuTe DSL port of the CUDA-extension kernel that the GLM-5.3 decode
-    # profiling workspace (not a git repository) runs in its production
-    # overlay; the identifier is the overlay build tag.
+    # First revision of the op (CuTe DSL kernel, opaque custom op and
+    # reference), on the branch that contributed it.
     provenance=Provenance(
-        repo="file:///home/jon/git/vllm-decode-profiling",
-        commit="overlay-a10a15b12b10cm16c8b15e9b18b19b10de10d1dc9c10g1h1s1a2",
-        paths=("overlay/fork/topk_sort.py",),
+        repo="https://github.com/joninco/b12x",
+        commit="4f5ef5b2",
+        paths=("b12x/attention/topk_sort/",),
     ),
     test_path="tests/attention/test_topk_sort.py",
     since="1.3.0",

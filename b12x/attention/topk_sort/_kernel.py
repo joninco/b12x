@@ -14,8 +14,15 @@ offsets, converting each position to its physical slot. Positions at or
 beyond the bitmap limit and negative entries are dropped; the tail of the
 row is filled with ``-1``. Duplicate positions collapse into one.
 
-The output order is a function of the selected set alone, so it is bitwise
-repeatable.
+Slots are int32. A position is written as ``-1`` when its block lies beyond
+the table width, its page is negative, or its page exceeds
+``INT32_MAX >> log2(block_size)``, the largest page whose slots fit the
+signed 32-bit range; the bound is checked per page before the shift, so no
+slot is ever wrapped.
+
+The output order of a row is a function of the selected set alone (bitwise
+repeatable); the slot values also depend on the row's block table and the
+block size.
 """
 
 from __future__ import annotations
@@ -156,6 +163,8 @@ class TopkSortConvertKernel:
             n_words = Int32(self.max_words)
         limit = n_words << Int32(5)
         low_mask = (Int32(1) << bs_log2) - Int32(1)
+        # Largest page whose slots stay within the signed int32 range.
+        max_page = Int32(0x7FFFFFFF) >> bs_log2
 
         # 1. Clear the row's bitmap and mark its positions.
         w = tid
@@ -261,6 +270,7 @@ class TopkSortConvertKernel:
                 bt_width,
                 bs_log2,
                 low_mask,
+                max_page,
                 w0,
                 word0,
                 page0,
@@ -273,6 +283,7 @@ class TopkSortConvertKernel:
                 bt_width,
                 bs_log2,
                 low_mask,
+                max_page,
                 w1,
                 word1,
                 page1,
@@ -285,6 +296,7 @@ class TopkSortConvertKernel:
                 bt_width,
                 bs_log2,
                 low_mask,
+                max_page,
                 w2,
                 word2,
                 page2,
@@ -297,6 +309,7 @@ class TopkSortConvertKernel:
                 bt_width,
                 bs_log2,
                 low_mask,
+                max_page,
                 w3,
                 word3,
                 page3,
@@ -351,6 +364,7 @@ class TopkSortConvertKernel:
         bt_width: Int32,
         bs_log2: Int32,
         low_mask: Int32,
+        max_page: Int32,
         w: Int32,
         word: Uint32,
         page: Int32,
@@ -359,7 +373,9 @@ class TopkSortConvertKernel:
         """Write the set positions of ``word`` (bitmap word ``w``) ascending
         from output offset ``offset``, converted to physical slots. ``page``
         is the word's page from ``_page_for_word`` (used when
-        ``block_size >= 32``)."""
+        ``block_size >= 32``). A page outside ``[0, max_page]`` yields
+        ``-1``: ``max_page`` is ``INT32_MAX >> bs_log2``, so an admitted
+        page's slots never exceed the int32 range."""
         bits = word
         o = offset
         while bits != Uint32(0):
@@ -370,12 +386,15 @@ class TopkSortConvertKernel:
             slot = Int32(-1)
             if bs_log2 >= Int32(5):
                 if page >= Int32(0):
-                    slot = (page << bs_log2) | (pos & low_mask)
+                    if page <= max_page:
+                        slot = (page << bs_log2) | (pos & low_mask)
             else:
                 blk = pos >> bs_log2
                 if blk < bt_width:
                     page_b = ld_global_i32(table + Int64(blk) * bt_stride1 * Int64(4))
-                    slot = (page_b << bs_log2) | (pos & low_mask)
+                    if page_b >= Int32(0):
+                        if page_b <= max_page:
+                            slot = (page_b << bs_log2) | (pos & low_mask)
             st_global_i32(out + Int64(o) * Int64(4), slot)
             o += Int32(1)
 
@@ -506,15 +525,19 @@ def sort_convert(
     if int(indices.shape[0]) == 0:
         return
     max_words = bitmap_words(max_positions)
-    launch = get_cached_sort_convert(max_words)
-    if launch is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "b12x topk_sort was not precompiled for "
-                f"max_positions={max_positions} before CUDA-graph capture"
-            )
-        launch = compile_sort_convert(max_words)
-    launch(indices, seq_lens, block_table, block_size)
+    # The compiled callable and the launch take the current stream of the
+    # current device; select the tensors' device so a launch from another
+    # current device does not submit these pointers to a foreign stream.
+    with torch.cuda.device(indices.device):
+        launch = get_cached_sort_convert(max_words)
+        if launch is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "b12x topk_sort was not precompiled for "
+                    f"max_positions={max_positions} before CUDA-graph capture"
+                )
+            launch = compile_sort_convert(max_words)
+        launch(indices, seq_lens, block_table, block_size)
 
 
 @sort_convert.register_fake

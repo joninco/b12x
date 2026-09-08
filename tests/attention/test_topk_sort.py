@@ -3,9 +3,13 @@
 Contract under test: each row of an int32 ``[rows, topk]`` selection holding
 logical KV positions (``-1`` unused) is rewritten in place ascending by
 position and converted to physical cache slots through the row's block table;
-the tail is ``-1``; duplicates collapse; the result is bitwise repeatable, a
-function of the selected set alone; the kernel allocates nothing and can be
-captured on a side stream inside a CUDA graph after ``precompile``.
+the tail is ``-1``; duplicates collapse; the order of a row is bitwise
+repeatable and a function of the selected set alone, while the slot values
+also depend on the row's block table and the block size; a page whose slots
+would leave the signed int32 range yields ``-1`` rather than a wrapped slot;
+the kernel allocates nothing and can be captured on a side stream inside a
+CUDA graph after ``precompile``; compilation and launches follow the tensors'
+device rather than the current device.
 """
 
 from __future__ import annotations
@@ -85,6 +89,62 @@ def test_reference_semantics_on_cpu():
     # slots 1 and 6.
     assert out[0].tolist() == [5 * 64 + 3, 9 * 64 + 1, 9 * 64 + 6, -1, -1, -1]
     assert out[1].tolist() == [7 * 64 + 0, 7 * 64 + 1, 7 * 64 + 2, -1, -1, -1]
+
+
+def test_reference_zero_width_block_table():
+    """A block table without columns maps every selected position to -1."""
+    api = _api()
+    indices = torch.tensor([[2, 0, 1], [-1, -1, -1]], dtype=torch.int32)
+    seq_lens = torch.tensor([3, 3], dtype=torch.int32)
+    block_table = torch.empty((2, 0), dtype=torch.int32)
+    out = api.sort_convert_reference(indices, seq_lens, block_table, 64, 4096)
+    assert out.tolist() == [[-1, -1, -1], [-1, -1, -1]]
+
+
+def _boundary_case(block_size: int, device):
+    """Rows whose pages sit at the largest page representable in int32
+    slots (``INT32_MAX >> log2(block_size)``), one above it, and below
+    zero; every row selects the first and the last position of two blocks."""
+    log2 = block_size.bit_length() - 1
+    max_page = (2**31 - 1) >> log2
+    tables = [
+        [max_page, max_page - 1],
+        [max_page + 1, max_page],
+        [-1, max_page],
+        [2**31 - 1, 0],
+    ]
+    positions = [
+        block_size - 1,
+        0,
+        block_size,
+        2 * block_size - 1,
+    ]
+    indices = torch.full((len(tables), 8), -1, dtype=torch.int32)
+    for row in range(len(tables)):
+        indices[row, : len(positions)] = torch.tensor(positions, dtype=torch.int32)
+    seq_lens = torch.full((len(tables),), 2 * block_size, dtype=torch.int32)
+    block_table = torch.tensor(tables, dtype=torch.int32)
+    return indices.to(device), seq_lens.to(device), block_table.to(device), max_page
+
+
+@pytest.mark.parametrize("block_size", [64, 16])
+def test_reference_page_ids_at_the_int32_slot_boundary(block_size):
+    api = _api()
+    indices, seq_lens, block_table, max_page = _boundary_case(block_size, "cpu")
+    out = api.sort_convert_reference(indices, seq_lens, block_table, block_size, 4096)
+    log2 = block_size.bit_length() - 1
+    top = max_page << log2
+    assert out[0].tolist()[:4] == [
+        top,
+        top + block_size - 1,
+        (max_page - 1) << log2,
+        ((max_page - 1) << log2) + block_size - 1,
+    ]
+    assert out[0, 1].item() == 2**31 - 1
+    assert out[1].tolist()[:4] == [-1, -1, top, top + block_size - 1]
+    assert out[2].tolist()[:4] == [-1, -1, top, top + block_size - 1]
+    assert out[3].tolist()[:4] == [-1, -1, 0, block_size - 1]
+    assert out[:, 4:].eq(-1).all()
 
 
 @cuda_required
@@ -216,11 +276,60 @@ def test_precompile_then_capture_on_side_stream():
 
 
 @cuda_required
+@pytest.mark.parametrize("block_size", [64, 16])
+def test_page_ids_at_the_int32_slot_boundary(block_size):
+    """Live check of the page bound on both conversion paths (one page
+    lookup per bitmap word at ``block_size >= 32``, per position below):
+    the largest admissible page yields the slot ``INT32_MAX`` exactly, and
+    a page above it or below zero yields ``-1``."""
+    api = _api()
+    device = torch.device("cuda")
+    indices, seq_lens, block_table, max_page = _boundary_case(block_size, device)
+    expected = api.sort_convert_reference(
+        indices.cpu(), seq_lens.cpu(), block_table.cpu(), block_size, 4096
+    )
+    api.sort_convert(indices, seq_lens, block_table, block_size, 4096)
+    torch.cuda.synchronize(device)
+    got = indices.cpu()
+    assert torch.equal(got, expected)
+    assert got[0, 1].item() == 2**31 - 1
+    assert got[1, :2].tolist() == [-1, -1]
+    assert got[2, :2].tolist() == [-1, -1]
+    assert got[3, :2].tolist() == [-1, -1]
+    assert (got >= -1).all()
+
+
+@cuda_required
+def test_precompile_and_sort_follow_the_tensor_device():
+    """With another device current, ``precompile`` and ``sort_convert`` for
+    tensors on a second device run on that device's stream."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    api = _api()
+    other = torch.device("cuda:1")
+    current = torch.cuda.current_device()
+    torch.cuda.set_device(0)
+    try:
+        api.precompile(4096, other)
+        indices, lens, table = _case(3, 256, [200, 150, 256], 64, other)
+        expected = api.sort_convert_reference(
+            indices.cpu(), lens.cpu(), table.cpu(), 64, 4096
+        )
+        assert torch.cuda.current_device() == 0
+        api.sort_convert(indices, lens, table, 64, 4096)
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(other)
+        assert torch.equal(indices.cpu(), expected)
+    finally:
+        torch.cuda.set_device(current)
+
+
+@cuda_required
 def test_rejects_out_of_contract_inputs():
     api = _api()
     device = torch.device("cuda")
     indices, lens, table = _case(2, 512, [100, 100], 64, device)
-    assert api.supports(indices, lens, table, 64, 4096)
+    assert api.supports(indices, lens, table, 64, 4096) == api.is_supported(device)
     assert not api.supports(indices, lens, table, 48, 4096)
     assert not api.supports(indices.to(torch.int64), lens, table, 64, 4096)
     assert not api.supports(indices, lens[:1], table, 64, 4096)
