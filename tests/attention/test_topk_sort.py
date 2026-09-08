@@ -335,6 +335,22 @@ def test_rejects_out_of_contract_inputs():
     assert not api.supports(indices, lens[:1], table, 64, 4096)
     assert not api.supports(indices, lens, table.to(torch.int64), 64, 4096)
     assert not api.supports(indices.t(), lens, table, 64, 4096)
+    # Rows that share storage would be rewritten by several CTAs at once:
+    # an expanded row (stride 0) and an as_strided view whose row stride is
+    # below the row width are refused; a wider row stride is served.
+    expanded_rows = indices[:1].expand(2, -1)
+    assert not api.supports(expanded_rows, lens, table, 64, 4096)
+    overlapping = indices.as_strided((2, 512), (256, 1))
+    assert not api.supports(overlapping, lens, table, 64, 4096)
+    wide = torch.full((2, 1024), -1, dtype=torch.int32, device=device)
+    wide[:, :512] = indices
+    assert api.supports(wide[:, :512], lens, table, 64, 4096) == api.is_supported(
+        device
+    )
+    with pytest.raises(ValueError, match="non-overlapping"):
+        api.sort_convert(expanded_rows, lens, table, 64, 4096)
+    with pytest.raises(ValueError, match="non-overlapping"):
+        api.sort_convert(overlapping, lens, table, 64, 4096)
     with pytest.raises(ValueError):
         api.sort_convert(indices, lens, table, 48, 4096)
     empty = indices[:0]

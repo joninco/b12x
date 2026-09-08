@@ -42,7 +42,8 @@ def supports(
     max_positions: int,
 ) -> bool:
     """Whether the kernel serves these inputs: CUDA int32 ``indices [rows,
-    topk]`` with contiguous rows, contiguous int32 ``seq_lens [>= rows]``,
+    topk]`` with contiguous, non-overlapping rows (each row is rewritten in
+    place by one CTA), contiguous int32 ``seq_lens [>= rows]``,
     int32 ``block_table [>= rows, width]`` on the same device, a power-of-two
     ``block_size`` and ``max_positions`` within the bitmap limit, on a device
     the op supports (``is_supported``)."""

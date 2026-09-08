@@ -489,9 +489,12 @@ def _check_inputs(
 ) -> None:
     if indices.dim() != 2 or indices.dtype != torch.int32 or not indices.is_cuda:
         raise ValueError("indices must be a CUDA int32 [rows, topk] tensor")
-    if indices.stride(1) != 1:
-        raise ValueError("indices rows must be contiguous")
-    rows = int(indices.shape[0])
+    rows, topk = (int(indices.shape[0]), int(indices.shape[1]))
+    # The kernel rewrites each row in place from one CTA; rows that share
+    # storage (an expanded or as_strided view with a row stride below the
+    # row width) would be written by several CTAs at once.
+    if indices.stride(1) != 1 or (rows > 1 and topk > 0 and indices.stride(0) < topk):
+        raise ValueError("indices rows must be contiguous and non-overlapping")
     if (
         seq_lens.dim() != 1
         or seq_lens.dtype != torch.int32
