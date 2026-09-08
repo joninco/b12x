@@ -411,7 +411,7 @@ def main(argv=None) -> int:
                         )
             torch.cuda.empty_cache()
     if args.json:
-        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(dev)
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(
                 {
@@ -419,7 +419,10 @@ def main(argv=None) -> int:
                         "exposed time of a decode projection behind an HBM-idle "
                         "kernel with programmatic dependent launch"
                     ),
-                    "status": "measured",
+                    # Every variant passed the BF16 bound before and after
+                    # its timed replays; a failure aborts the run before this
+                    # record is written.
+                    "status": "qualified",
                     "provenance": provenance,
                     "args": vars(args),
                     "correctness_state": (

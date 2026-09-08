@@ -320,7 +320,7 @@ def _worker(rank: int, world_size: int, port: int, json_path: str) -> None:
                         flush=True,
                     )
         if rank == 0 and json_path:
-            provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
+            provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(device)
             with open(json_path, "w", encoding="utf-8") as fh:
                 json.dump(
                     {
@@ -328,7 +328,10 @@ def _worker(rank: int, world_size: int, port: int, json_path: str) -> None:
                             "fused PCIe one-shot allreduce followed by the "
                             "weight-first projection on every rank"
                         ),
-                        "status": "measured",
+                        # Every variant passed its checks on every rank
+                        # before timing; a failure aborts all ranks before
+                        # this record is written.
+                        "status": "qualified",
                         "provenance": provenance,
                         "hidden": hidden,
                         "n": n_out,

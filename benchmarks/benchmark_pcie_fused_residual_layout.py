@@ -439,11 +439,21 @@ def _worker(
     gathered_correctness: list[Any] = [None] * world_size
     dist.all_gather_object(gathered_correctness, local_correctness)
     if rank == 0:
-        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(device)
+        # The pre-timing validation aborts on failure; the post-timing
+        # bitwise reproduction is recorded per arm and rank and decides the
+        # status of the record.
+        after_timing_reproduced = all(
+            entry["output_bitwise_equal"] and entry["residual_bitwise_equal"]
+            for rank_cases in gathered_correctness
+            for correctness in rank_cases
+            for entry in correctness["after_timing"].values()
+        )
         record = {
             "schema_version": 2,
             "semantic_role": "TP8 fused all-reduce RMSNorm residual-layout comparison",
-            "status": "measured",
+            "status": "qualified" if after_timing_reproduced else "unsupported",
+            "after_timing_bitwise_reproduced": after_timing_reproduced,
             "provenance": provenance,
             "b12x_commit": provenance["source"]["commit"],
             "comparison": {
@@ -456,9 +466,15 @@ def _worker(
             },
             "correctness_state": (
                 "every arm replayed once from the validated inputs before "
-                "timing (metrics under cases[].correctness) and reproduced "
-                "its outputs bitwise after the timed replays "
-                "(cases[].correctness.after_timing)"
+                "timing (metrics under cases[].correctness); after the timed "
+                "replays every arm on every rank "
+                + (
+                    "reproduced its validated outputs bitwise"
+                    if after_timing_reproduced
+                    else "was replayed again and at least one arm did not "
+                    "reproduce its validated outputs bitwise"
+                )
+                + " (per-arm results under cases[].correctness.after_timing)"
             ),
             "world_size": world_size,
             "hidden_size": hidden_size,

@@ -40,9 +40,14 @@ _NVIDIA_SMI_GPU_MODE_FIELDS = (
 )
 
 
-def nvidia_smi_gpu_mode_snapshot() -> dict[str, object]:
-    """Capture the physical GPU's benchmark-relevant operating state."""
-    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+def nvidia_smi_gpu_mode_snapshot(
+    device: torch.device | int | None = None,
+) -> dict[str, object]:
+    """Capture the benchmark-relevant operating state of the physical GPU
+    behind ``device`` (the current device when ``None``)."""
+    if device is None:
+        device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
     torch_uuid = str(getattr(properties, "uuid", ""))
     target_uuid = torch_uuid if torch_uuid.startswith("GPU-") else f"GPU-{torch_uuid}"
     command = [
@@ -167,7 +172,7 @@ def benchmark_provenance(
         "cwd": os.getcwd(),
         "source": source_provenance(),
         "gpu": device_provenance(device),
-        "gpu_mode_before": nvidia_smi_gpu_mode_snapshot(),
+        "gpu_mode_before": nvidia_smi_gpu_mode_snapshot(device),
     }
 
 

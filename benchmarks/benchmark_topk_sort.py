@@ -141,12 +141,15 @@ def main(argv=None) -> int:
                 )
                 del graph
     if args.json:
-        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot(device)
         with open(args.json, "w") as fh:
             json.dump(
                 {
                     "semantic_role": "topk_sort kernel time per launch at decode row counts",
-                    "status": "measured",
+                    # Every case's replay was checked against the reference
+                    # before its timing; a mismatch aborts the run before this
+                    # record is written.
+                    "status": "qualified",
                     "provenance": provenance,
                     "args": vars(args),
                     "correctness_state": (
