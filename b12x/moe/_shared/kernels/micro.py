@@ -2115,6 +2115,7 @@ class MoEMicroKernelBackend:
         w2_alphas: cute.Tensor,
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
+        route_expert_limit: Int32,
         scatter_output: cute.Tensor,
     ):
         """Compute two hidden rows per warp with 8-byte weight loads per lane.
@@ -2122,7 +2123,10 @@ class MoEMicroKernelBackend:
         Each 16-lane half-warp owns one output row. Its lanes cover consecutive
         groups of 16 intermediate values, matching one packed K16 scale per
         lane. This worker requires the fused 256-value intermediate layout and
-        packed E4M3 scales.
+        packed E4M3 scales. Routes are resolved through ``_fc2_route``: an
+        inactive route (id outside the resident expert range) addresses
+        expert 0 and contributes nothing, so no route id forms an address
+        beyond the weight, scale or alpha tensors.
         """
         cfg = self._cfg
         rows_per_cta = Int32(_K_PER_CTA * 2)
@@ -2140,8 +2144,10 @@ class MoEMicroKernelBackend:
 
         for topk_idx in cutlass.range_constexpr(cfg.num_topk):
             eid_addr = t * Int32(cfg.num_topk) + Int32(topk_idx)
-            eid = Int32(topk_ids[eid_addr])
-            scale_lane = w2_alphas[eid] * topk_weights[eid_addr]
+            eid, router_w, route_active = self._fc2_route(
+                topk_ids, topk_weights, eid_addr, route_expert_limit
+            )
+            scale_lane = w2_alphas[eid] * router_w
             expert_weight_base = Int64(eid) * Int64(cfg.k_dim * cfg.n_half)
             expert_scale_base = Int64(eid) * Int64((cfg.n // 16) * cfg.k_dim)
 
@@ -2174,14 +2180,15 @@ class MoEMicroKernelBackend:
                 k_col,
                 Int32(cfg.k_dim),
             )
-            out_acc += (
-                block_scale
-                * (
-                    self._fp4_dot4_for_math(weight0, a0, a1, a2, a3)
-                    + self._fp4_dot4_for_math(weight1, b0, b1, b2, b3)
+            if route_active > Int32(0):
+                out_acc += (
+                    block_scale
+                    * (
+                        self._fp4_dot4_for_math(weight0, a0, a1, a2, a3)
+                        + self._fp4_dot4_for_math(weight1, b0, b1, b2, b3)
+                    )
+                    * scale_lane
                 )
-                * scale_lane
-            )
 
         for offset_log2 in cutlass.range_constexpr(4):
             out_acc += cute.arch.shuffle_sync_bfly(
@@ -6121,6 +6128,7 @@ class MoEMicroKernelBackend:
                         w2_alphas,
                         topk_ids,
                         topk_weights,
+                        route_expert_limit,
                         scatter_output,
                     )
                 elif cutlass.const_expr(
