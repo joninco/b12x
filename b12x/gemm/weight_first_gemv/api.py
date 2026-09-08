@@ -19,7 +19,9 @@ from ._kernel import weight_first_gemv  # noqa: F401  (registers the op; alias)
 #: allreduce.
 DEFAULT_STAGE_DEPTH = 1
 
-_PRECOMPILED: set[tuple[int, int, int, int]] = set()
+#: (n, k, nt, kt, device index) geometries compiled and warm-run in this
+#: process.
+_PRECOMPILED: set[tuple[int, int, int, int, int]] = set()
 
 
 def is_disabled() -> bool:
@@ -44,10 +46,11 @@ def supports(weights: list[torch.Tensor], x: torch.Tensor | None = None) -> bool
     """Whether the kernel serves ``weights`` (and ``x`` when given).
 
     Weights: one or two two-dimensional contiguous BF16 tensors on one CUDA
-    device with a common ``K`` that is a multiple of a brick width (a brick
-    exists for ``K`` a multiple of 256). Activation: two-dimensional BF16
-    ``(M, K)`` with ``1 <= M <= MAX_ROWS``. Bias handling is the caller's
-    responsibility; the op has no bias input.
+    device the op supports (``is_supported``: SM120/SM121 and not disabled)
+    with a common ``K`` that is a multiple of a brick width (a brick exists
+    for ``K`` a multiple of 256). Activation: two-dimensional BF16 ``(M, K)``
+    on the weights' device with ``1 <= M <= MAX_ROWS``. Bias handling is the
+    caller's responsibility; the op has no bias input.
     """
     if not 1 <= len(weights) <= 2:
         return False
@@ -67,6 +70,8 @@ def supports(weights: list[torch.Tensor], x: torch.Tensor | None = None) -> bool
     try:
         brick_for(sum(int(w.shape[0]) for w in weights), k)
     except ValueError:
+        return False
+    if not is_supported(first.device):
         return False
     if x is None:
         return True
@@ -92,21 +97,34 @@ def precompile(n: int, k: int, device: torch.device, log=None) -> tuple[int, int
 
         log = logging.getLogger("b12x.weight_first_gemv")
     nt, kt = brick_for(n, k)
-    key = (int(n), int(k), nt, kt)
-    if key in _PRECOMPILED:
-        return nt, kt
-    log.info("weight-first GEMV precompile: n=%d k=%d brick %dx%d", n, k, nt, kt)
-    launch = compile_weight_first_gemv(n, k, nt, kt)
-    weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
-    partial = torch.zeros(k // kt, 16, n, dtype=torch.float32, device=device)
-    counters = torch.zeros((n + nt - 1) // nt, dtype=torch.int32, device=device)
-    for m in (1, MAX_ROWS):
-        x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
-        y0 = torch.empty(m, n, dtype=torch.bfloat16, device=device)
-        for pdl in (False, True):
-            launch(x, weight, y0, y0, partial, counters, m, n, DEFAULT_STAGE_DEPTH, pdl)
-    torch.cuda.synchronize(device)
-    del weight, partial, counters
+    # Compile, allocate and warm-run on ``device`` whatever the current
+    # device: the compiled callable binds the current stream at each call,
+    # and the module load the warm run triggers is per device.
+    with torch.cuda.device(device):
+        key = (int(n), int(k), nt, kt, torch.cuda.current_device())
+        if key in _PRECOMPILED:
+            return nt, kt
+        log.info(
+            "weight-first GEMV precompile: n=%d k=%d brick %dx%d device=%d",
+            n,
+            k,
+            nt,
+            kt,
+            key[4],
+        )
+        launch = compile_weight_first_gemv(n, k, nt, kt)
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
+        partial = torch.zeros(k // kt, 16, n, dtype=torch.float32, device=device)
+        counters = torch.zeros((n + nt - 1) // nt, dtype=torch.int32, device=device)
+        for m in (1, MAX_ROWS):
+            x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
+            y0 = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+            for pdl in (False, True):
+                launch(
+                    x, weight, y0, y0, partial, counters, m, n, DEFAULT_STAGE_DEPTH, pdl
+                )
+        torch.cuda.synchronize(device)
+        del weight, partial, counters
     _PRECOMPILED.add(key)
     return nt, kt
 
@@ -138,7 +156,8 @@ class WeightFirstProjection:
         if not supports(weights):
             raise ValueError(
                 "weight-first projection needs one or two contiguous BF16 [N, K] "
-                "weights on one CUDA device with K a multiple of 256"
+                "weights on one supported CUDA device (SM120/SM121, op not "
+                "disabled) with K a multiple of 256"
             )
         self.n_parts = [int(w.shape[0]) for w in weights]
         self.n = sum(self.n_parts)

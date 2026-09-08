@@ -16,8 +16,11 @@ is bitwise repeatable.
 ``WeightFirstProjection`` owns the concatenated weight and the workspaces
 and dispatches through the opaque custom op ``b12x::weight_first_gemv``
 (torch.compile- and CUDA-graph-safe; shapes outside the contract fall back to
-cuBLAS inside the op). ``precompile`` compiles and warm-runs the kernel for a
-weight geometry at load time so serving never compiles inside a capture.
+cuBLAS inside the op, and inputs that are not CUDA tensors on the weight's
+device never reach the kernel). ``precompile`` compiles and warm-runs the
+kernel for a weight geometry at load time so serving never compiles inside a
+capture. Compilation and launches select the stream of the weight's device,
+whatever the current device.
 
 Example:
     from b12x.gemm import weight_first_gemv
@@ -48,14 +51,12 @@ META = OpMeta(
         "DEFAULT_STAGE_DEPTH",
     ),
     dtypes=("bf16",),
-    # Port of the production CUDA-extension kernel in the GLM-5.3 decode
-    # profiling workspace (a non-git directory): ledger row H1, deployed
-    # 2026-09-04 in the overlay tagged
-    # a10a15b12b10cm16c8b15e9b18b19b10de10d1dc9c10g1h1s1a2.
+    # First revision of the op (CuTe DSL kernel, opaque custom op and
+    # projection wrapper), on the branch that contributed it.
     provenance=Provenance(
-        repo="file:///home/jon/git/vllm-decode-profiling",
-        commit="overlay-g1h1s1a2-2026-09-04",
-        paths=("overlay/fork/wf_gemv.py", "kernel-bench/pdl_ext.py"),
+        repo="https://github.com/joninco/b12x",
+        commit="508fb122",
+        paths=("b12x/gemm/weight_first_gemv/",),
     ),
     test_path="tests/gemm/test_weight_first_gemv.py",
     since="1.3.0",

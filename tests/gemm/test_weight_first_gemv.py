@@ -6,8 +6,10 @@ BF16 with fp32 accumulation in a reduction order fixed by the geometry alone
 (bitwise repeatable across launches, row counts, staging depths and the
 launch attribute); the compiled callable for a geometry serves every row
 count without a new compile; rows beyond 16 take the cuBLAS fallback inside
-the op; and the op captures into a CUDA graph and replays without host work
-or allocation.
+the op; inputs that are not CUDA tensors on the weight's device never reach
+the kernel; ``supports`` honours the device gate (``is_supported``); the
+kernel runs on the weight's device whatever the current device; and the op
+captures into a CUDA graph and replays without host work or allocation.
 """
 
 from __future__ import annotations
@@ -27,6 +29,14 @@ def _api():
 
     weight_first_gemv.weight_first_gemv  # noqa: B018  (registers the op)
     return weight_first_gemv
+
+
+def _supported_device() -> torch.device:
+    """The CUDA device the op serves, or a skip when there is none."""
+    device = torch.device("cuda")
+    if not _api().is_supported(device):
+        pytest.skip("weight_first_gemv is not supported on this device")
+    return device
 
 
 def _random_weights(n_parts, k, device, seed=0):
@@ -95,8 +105,14 @@ def test_supports_rejects_out_of_contract_inputs():
         return
     device = torch.device("cuda")
     w = torch.zeros(64, 768, dtype=torch.bfloat16, device=device)
-    assert api.supports([w])
-    assert api.supports([w, torch.zeros(32, 768, dtype=torch.bfloat16, device=device)])
+    # Positive answers are conditional on the device gate (SM120/SM121 and
+    # the op not disabled); every rejection below holds on any device.
+    gate = api.is_supported(device)
+    assert api.supports([w]) == gate
+    assert (
+        api.supports([w, torch.zeros(32, 768, dtype=torch.bfloat16, device=device)])
+        == gate
+    )
     assert not api.supports([])
     assert not api.supports([w, w, w])
     assert not api.supports([w.float()])
@@ -106,7 +122,8 @@ def test_supports_rejects_out_of_contract_inputs():
     )
     assert not api.supports([w.t().contiguous().t()])  # non-contiguous
     x = torch.zeros(4, 768, dtype=torch.bfloat16, device=device)
-    assert api.supports([w], x)
+    assert api.supports([w], x) == gate
+    assert not api.supports([w], x.cpu())
     assert not api.supports(
         [w], torch.zeros(17, 768, dtype=torch.bfloat16, device=device)
     )
@@ -121,8 +138,33 @@ def test_disabled_switch(monkeypatch):
     monkeypatch.setenv("B12X_DISABLE_WEIGHT_FIRST_GEMV", "1")
     assert api.is_disabled()
     assert not api.is_supported()
+    if torch.cuda.is_available():
+        w = torch.zeros(64, 768, dtype=torch.bfloat16, device="cuda")
+        assert not api.supports([w])
+        with pytest.raises(ValueError):
+            api.WeightFirstProjection([w])
     monkeypatch.delenv("B12X_DISABLE_WEIGHT_FIRST_GEMV")
     assert not api.is_disabled()
+
+
+def test_kernel_applies_requires_cuda_colocation():
+    """The raw launch is reached only for CUDA ``x`` and ``weight`` on one
+    device; everything else takes the cuBLAS path inside the op."""
+    from b12x.gemm.weight_first_gemv._kernel import _kernel_applies, brick_for
+
+    nt, kt = brick_for(64, 768)
+    x_cpu = torch.zeros(4, 768, dtype=torch.bfloat16)
+    w_cpu = torch.zeros(64, 768, dtype=torch.bfloat16)
+    assert not _kernel_applies(x_cpu, w_cpu, nt, kt)
+    if not torch.cuda.is_available():
+        return
+    x = x_cpu.cuda()
+    w = w_cpu.cuda()
+    assert _kernel_applies(x, w, nt, kt)
+    assert not _kernel_applies(x_cpu, w, nt, kt)
+    assert not _kernel_applies(x, w_cpu, nt, kt)
+    if torch.cuda.device_count() >= 2:
+        assert not _kernel_applies(x.to("cuda:1"), w, nt, kt)
 
 
 # ----------------------------------------------------------------------------
@@ -148,7 +190,7 @@ GEOMETRIES = [
 @pytest.mark.parametrize("m", [1, 2, 4, 8, 16])
 def test_matches_float64_reference(n_parts, k, m):
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights(n_parts, k, device)
     cat = torch.cat(weights, dim=0)
     proj = api.WeightFirstProjection(weights)
@@ -164,7 +206,7 @@ def test_matches_float64_reference(n_parts, k, m):
 @cuda_required
 def test_parameters_become_views_into_concatenated_buffer():
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     originals = [w.clone() for w in weights]
     proj = api.WeightFirstProjection(weights)
@@ -187,7 +229,7 @@ def test_parameters_become_views_into_concatenated_buffer():
 @cuda_required
 def test_bitwise_repeatable_across_launches_depths_and_attribute():
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)
     x = _random_x(8, 6144, device)
@@ -208,7 +250,7 @@ def test_rows_independent_of_batch():
     """Row ``i`` of a 16-row launch equals the single-row launch of that row
     (the reduction order does not depend on M)."""
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)
     x = _random_x(16, 6144, device)
@@ -226,7 +268,7 @@ def test_all_row_counts_under_frozen_resolution():
     import b12x
 
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)  # precompiles
     assert proj.compiled
@@ -245,7 +287,7 @@ def test_all_row_counts_under_frozen_resolution():
 @cuda_required
 def test_rows_beyond_max_fall_back_to_cublas():
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)
     cat = proj.weight.clone()
@@ -264,7 +306,7 @@ def test_graph_capture_replay_without_allocation():
     import b12x
 
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)
     static_x = _random_x(4, 6144, device).clone()
@@ -301,7 +343,7 @@ def test_graph_capture_replay_without_allocation():
 @cuda_required
 def test_direct_op_single_weight_and_zero_second_output():
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     (w,) = _random_weights((320,), 6144, device)
     proj = api.WeightFirstProjection([w])
     x = _random_x(3, 6144, device)
@@ -315,11 +357,54 @@ def test_direct_op_single_weight_and_zero_second_output():
 
 
 @cuda_required
+def test_projection_follows_the_weight_device():
+    """With another device current, a projection whose weights live on a
+    second device runs there and matches the single-device result."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    api = _api()
+    other = torch.device("cuda:1")
+    if not api.is_supported(other):
+        pytest.skip("weight_first_gemv is not supported on cuda:1")
+    current = torch.cuda.current_device()
+    torch.cuda.set_device(0)
+    try:
+        weights = _random_weights((256, 512), 6144, other)
+        cat = torch.cat(weights, dim=0)
+        proj = api.WeightFirstProjection(weights)
+        assert torch.cuda.current_device() == 0
+        x = _random_x(4, 6144, other)
+        y0, y1 = proj(x)
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(other)
+        assert y0.device == other and y1.device == other
+        _assert_within_bf16_rounding(y0, x, cat[:256])
+        _assert_within_bf16_rounding(y1, x, cat[256:])
+        assert torch.count_nonzero(proj.counters) == 0
+    finally:
+        torch.cuda.set_device(current)
+
+
+@cuda_required
+def test_mismatched_devices_never_reach_the_kernel():
+    """A CPU activation against CUDA weights is rejected by the cuBLAS path
+    inside the op (a device-mismatch error), not by the raw launch."""
+    api = _api()
+    device = _supported_device()
+    weights = _random_weights((256, 512), 6144, device)
+    proj = api.WeightFirstProjection(weights)
+    with pytest.raises(RuntimeError):
+        proj(_random_x(4, 6144, "cpu"))
+    torch.cuda.synchronize(device)
+    assert torch.count_nonzero(proj.counters) == 0
+
+
+@cuda_required
 def test_counters_return_to_zero():
     """The last CTA of each n-tile resets its arrival counter, so a launch
     leaves the workspace ready for the next one."""
     api = _api()
-    device = torch.device("cuda")
+    device = _supported_device()
     weights = _random_weights((256, 512), 6144, device)
     proj = api.WeightFirstProjection(weights)
     for m in (1, 16):

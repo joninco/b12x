@@ -528,11 +528,18 @@ def get_cached_weight_first_gemv(n: int, k: int, nt: int, kt: int):
 
 
 def _kernel_applies(x: torch.Tensor, weight: torch.Tensor, nt: int, kt: int) -> bool:
+    """Whether ``x`` and ``weight`` take the kernel: both CUDA tensors on one
+    device (the raw launch dereferences their pointers on that device's
+    stream), a compiled brick, a row count within ``MAX_ROWS`` and the
+    BF16 layout contract."""
     if x.dim() != 2 or weight.dim() != 2:
         return False
     m, k = x.shape
     return (
-        1 <= m <= MAX_ROWS
+        x.is_cuda
+        and weight.is_cuda
+        and x.device == weight.device
+        and 1 <= m <= MAX_ROWS
         and (int(nt), int(kt)) in BRICKS
         and k == weight.shape[1]
         and k % kt == 0
@@ -581,14 +588,21 @@ def weight_first_gemv(
             return _cublas_split(x, weight, n0)
     m, k = x.shape
     n = weight.shape[0]
-    launch = get_cached_weight_first_gemv(n, k, nt, kt)
-    if launch is None:
-        if torch.cuda.is_current_stream_capturing():
-            return _cublas_split(x, weight, n0)
-        launch = compile_weight_first_gemv(n, k, nt, kt)
-    y0 = torch.empty((m, n0), dtype=torch.bfloat16, device=x.device)
-    y1 = torch.empty((m, n - n0), dtype=torch.bfloat16, device=x.device)
-    launch(x, weight, y0, y1 if n > n0 else y0, partial, counters, m, n0, depth, pdl)
+    # The compiled callable and the launch take the current stream of the
+    # current device; select the weight's device so a call made while
+    # another device is current does not submit these pointers to a
+    # foreign stream.
+    with torch.cuda.device(weight.device):
+        launch = get_cached_weight_first_gemv(n, k, nt, kt)
+        if launch is None:
+            if torch.cuda.is_current_stream_capturing():
+                return _cublas_split(x, weight, n0)
+            launch = compile_weight_first_gemv(n, k, nt, kt)
+        y0 = torch.empty((m, n0), dtype=torch.bfloat16, device=x.device)
+        y1 = torch.empty((m, n - n0), dtype=torch.bfloat16, device=x.device)
+        launch(
+            x, weight, y0, y1 if n > n0 else y0, partial, counters, m, n0, depth, pdl
+        )
     return y0, y1
 
 
