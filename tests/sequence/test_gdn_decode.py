@@ -776,6 +776,33 @@ def test_qwen_rejects_non_three_to_one_head_ratio_without_using_triton() -> None
     torch.testing.assert_close(binding.output, output_before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("query_lengths", [(4,), (4, 4)])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_small_softplus_with_large_rate_preserves_decay(query_lengths, state_dtype) -> None:
+    device = require_sm120()
+    binding, _ = _make_case(device=device, query_lengths=query_lengths,
+                           key_heads=2, value_heads=6, state_dtype=state_dtype)
+    binding.a.fill_(-20)
+    binding.A_log.fill_(20)
+    binding.dt_bias.zero_()
+    initial = binding.recurrent_state.clone()
+    state_reference = initial.clone()
+    expected = _reference(binding, state_reference)
+    gdn.run(binding)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gdn.run(binding)
+    binding.recurrent_state.copy_(initial)
+    binding.output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert binding.error_code.item() == 0
+    torch.testing.assert_close(binding.output, expected, rtol=1e-2, atol=2e-2)
+    state_rtol = 1e-2 if state_dtype == torch.bfloat16 else 1e-5
+    state_atol = 8e-3 if state_dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(binding.recurrent_state, state_reference, rtol=state_rtol, atol=state_atol)
+
+
 def test_qwen_bf16_state_uses_cute_recurrence() -> None:
     device = require_sm120()
     binding, _ = _make_case(

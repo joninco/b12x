@@ -1,4 +1,4 @@
-"""Public surface for :mod:`b12x.sequence.kda_prefill`."""
+"""Public surface for :mod:`b12x.sequence.gdn_prefill`."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from ..._lib.gating import default_is_supported
 from . import reference
 from .._shared.delta_prefill._cute_kernels import clear_caches
 from ._impl import Binding, Caps, Plan, bind, plan, prewarm, run
-from ._policy import KdaPrefillConfig, KdaPrefillQuery
+from ._policy import GdnPrefillConfig, GdnPrefillQuery
 
 
 def is_supported(device=None) -> bool:
@@ -18,8 +18,8 @@ def is_supported(device=None) -> bool:
 __all__ = [
     "Binding",
     "Caps",
-    "KdaPrefillConfig",
-    "KdaPrefillQuery",
+    "GdnPrefillConfig",
+    "GdnPrefillQuery",
     "Plan",
     "bind",
     "clear_caches",

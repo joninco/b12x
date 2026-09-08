@@ -616,9 +616,8 @@ class _PackedRecurrentQwenKernel:
                     softplus_input = a_value + dt_bias_value
                     softplus = softplus_input
                     if softplus_input <= Float32(20.0):
-                        softplus = cute.math.log(
-                            Float32(1.0)
-                            + cute.math.exp(softplus_input, fastmath=False),
+                        softplus = cute.math.log1p(
+                            cute.math.exp(softplus_input, fastmath=False),
                             fastmath=False,
                         )
                     shared_params[Int32(0)] = cute.math.exp(
@@ -849,9 +848,8 @@ class _PackedRecurrentQwenKernel:
                         )
                         softplus = softplus_input
                         if softplus_input <= Float32(20.0):
-                            softplus = cute.math.log(
-                                Float32(1.0)
-                                + cute.math.exp(softplus_input, fastmath=False),
+                            softplus = cute.math.log1p(
+                                cute.math.exp(softplus_input, fastmath=False),
                                 fastmath=False,
                             )
                         param_offset = Int32(

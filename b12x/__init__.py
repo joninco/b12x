@@ -72,6 +72,7 @@ _OPS: tuple[str, ...] = (
     "sequence.ple",
     "sequence.gdn_decode",
     "sequence.kda_prefill",
+    "sequence.gdn_prefill",
     "sequence.mtp_feedback",
 )
 

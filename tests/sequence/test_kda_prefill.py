@@ -397,7 +397,7 @@ def _mirror_trace(inputs: dict):
 @pytest.mark.parametrize("lower_bound", [-5.0, -0.5])
 def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
     from ..conftest import require_b12x
-    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
+    from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue, workspace_tiles
 
     device = require_b12x()
     checkpoint = [(0, 0)] * len(lengths)
@@ -478,7 +478,7 @@ def test_prepare_kernel_matches_chunk_mirror(lengths, lower_bound) -> None:
 )
 def test_prologue_reports_malformed_metadata(mutate, bit) -> None:
     from ..conftest import require_b12x
-    from b12x.sequence.kda_prefill._cute_kernels import run_prepare, run_prologue
+    from b12x.sequence._shared.delta_prefill._cute_kernels import run_prepare, run_prologue
 
     device = require_b12x()
     inputs = make_inputs(lengths=[20, 20], heads=2, seed=43, device=device, checkpoint=[(16, 6), (0, 0)])
@@ -597,7 +597,7 @@ def test_op_lower_bounds_and_saturated_gates(lower_bound, gate_profile) -> None:
     binding, tensors = make_binding(inputs, max_tokens=64, max_seqs=2)
     _run(binding, inputs)
     torch.cuda.synchronize(device)
-    from b12x.sequence.kda_prefill._cute_kernels import workspace_tiles
+    from b12x.sequence._shared.delta_prefill._cute_kernels import workspace_tiles
 
     live_tiles = inputs["num_tokens"] // 16
     tiles = workspace_tiles(binding)
@@ -968,7 +968,7 @@ def test_op_trusted_mode_accepts_strided_views() -> None:
 def test_op_capacity_specialization_is_reused_under_frozen_resolution() -> None:
     from ..conftest import require_b12x
     from b12x._lib.runtime_control import freeze_kernel_resolution, unfreeze_kernel_resolution
-    from b12x.sequence.kda_prefill import _cute_kernels as kernels
+    from b12x.sequence._shared.delta_prefill import _cute_kernels as kernels
 
     device = require_b12x()
     small = make_inputs(lengths=[1], heads=2, seed=75, device=device, state_slots=8)

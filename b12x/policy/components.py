@@ -15,6 +15,7 @@ BF16_VOCAB_PROJECTION = "gemm.bf16_vocab_projection"
 WO_PROJECTION = "gemm.wo_projection"
 EP_MOE = "moe.ep_moe"
 HYPERCONNECTION = "norm.hyperconnection"
+GDN_PREFILL = "sequence.gdn_prefill"
 KDA_PREFILL = "sequence.kda_prefill"
 MHC = "norm.mhc"
 NVFP4_QUANTIZATION = "quantization.nvfp4"
@@ -33,6 +34,7 @@ __all__ = [
     "GDN_ATTENTION",
     "GQA_ATTENTION",
     "HYPERCONNECTION",
+    "GDN_PREFILL",
     "KDA_PREFILL",
     "MLA_ATTENTION",
     "MHC",

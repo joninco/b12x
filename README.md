@@ -53,7 +53,8 @@ parallel).
 `norm.hyperconnection` (learned multi-stream residual primitives),
 `sequence.{ple_hash,ple_embedding,ple}` (prime-hashed embedding IDs, fused
 quantized lookup, and short-convolution state), `sequence.gdn_decode` (packed
-recurrent decode),
+recurrent decode), `sequence.gdn_prefill` (research-only scalar-gated prefill;
+see [GDN prefill](docs/gdn-prefill.md)), `sequence.kda_prefill` (KDA prefill),
 `sequence.mtp_feedback` (MTP token/multi-stream feedback fusion),
 `quantization.{nvfp4,mxfp8}` (row quantizers), `comm.roce` (RoCEnante: one-shot
 RDMA all-reduce/all-gather for multi-node DGX Spark TP, see `docs/rocenante.md`),

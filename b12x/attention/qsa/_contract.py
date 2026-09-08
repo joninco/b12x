@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -406,6 +406,8 @@ class _ScratchLayout:
     partial_lse_nbytes: int
     work_metadata_offset_bytes: int
     work_metadata_nbytes: int
+    draft_positions_offset_bytes: int
+    draft_errors_offset_bytes: int
     total_nbytes: int
 
 
@@ -431,6 +433,140 @@ class Plan:
 
     def bind(self, **kwargs: object) -> Binding:
         return bind(self, **kwargs)
+
+    def draft_selection_plan(
+        self, *, max_source_rows: int | None = None
+    ) -> DraftSelectionPlan:
+        """Describe persistent anchor storage without allocating or initializing it."""
+        if self.caps.max_speculative_tokens < 1:
+            raise ValueError("draft selection reuse requires speculative capacity")
+        rows = self.caps.max_q_rows if max_source_rows is None else int(max_source_rows)
+        if rows < self.caps.max_q_rows:
+            raise ValueError("draft selection state must cover planned query rows")
+        return DraftSelectionPlan(self.caps.device, rows, self.caps.selection_width)
+
+
+@dataclass(frozen=True)
+class DraftSelectionPlan:
+    """B12X-defined persistent storage layout for draft-selection anchors.
+
+    Compatible bindings may share this storage when device and selection width
+    match and source capacity covers each plan of the same model layer and
+    request/cache assignment. Storage must outlive all bound
+    operations and captured graphs. Planning and binding allocate no tensors.
+    """
+
+    device: torch.device
+    max_source_rows: int
+    selection_width: int
+
+    def __post_init__(self) -> None:
+        if self.max_source_rows < 1 or self.selection_width < 1:
+            raise ValueError("draft selection capacity and width must be positive")
+        object.__setattr__(self, "device", _canonical_device(self.device))
+
+    def _regions(self) -> tuple[tuple[str, tuple[int, ...], torch.dtype, int], ...]:
+        offset = 0
+        regions = []
+        for name, shape, dtype in (
+            (
+                "selected_positions",
+                (self.max_source_rows, self.selection_width),
+                torch.int32,
+            ),
+            ("logical_positions", (self.max_source_rows,), torch.int64),
+            ("errors", (self.max_source_rows,), torch.int32),
+            ("num_source_rows", (1,), torch.int32),
+        ):
+            offset = _align_up(offset)
+            regions.append((name, shape, dtype, offset))
+            offset += math.prod(shape) * dtype.itemsize
+        return tuple(regions)
+
+    def storage_specs(self) -> tuple[ScratchBufferSpec, ...]:
+        """Return caller allocation requirements for persistent, non-scratch storage."""
+        _, shape, dtype, offset = self._regions()[-1]
+        return (
+            scratch_buffer_spec(
+                "qsa_draft_selection",
+                nbytes=_align_up(offset + math.prod(shape) * dtype.itemsize),
+                device=self.device,
+            ),
+        )
+
+    def bind(
+        self,
+        *,
+        storage: torch.Tensor | Mapping[str, torch.Tensor] | Sequence[torch.Tensor],
+    ) -> DraftSelectionState:
+        """Create views only; call ``reset`` before the first use of uninitialized storage."""
+        buffer = scratch_tensor(
+            storage, self.storage_specs(), owner="qsa draft selection"
+        )
+        return DraftSelectionState(plan=self, _storage=buffer)
+
+
+@dataclass(frozen=True)
+class DraftSelectionState:
+    """Persistent caller-owned anchors created by ``DraftSelectionPlan.bind``.
+
+    Ordinary ``run`` replaces the valid anchor prefix. Reuse preserves it.
+    The caller must reset before first use, at round boundaries, and before
+    recycling requests; it must map each request to an anchor from that same
+    request and round. Bounds, recorded row count, error bits, and causal tail
+    positions are checked on device. Request identity and round provenance are
+    caller invariants and cannot be inferred from logical positions.
+
+    Reset, recording, map updates, and reuse must be ordered on the calling
+    stream or joined with caller-established events. Concurrent operations
+    must not share mutable storage or scratch. Captured reset and record calls
+    execute on every replay, so capture must preserve the round lifecycle.
+    Tensor properties expose inspection views; use ``reset`` and ``run`` for mutation.
+    """
+
+    plan: DraftSelectionPlan
+    _storage: torch.Tensor
+
+    def _view(self, index: int) -> torch.Tensor:
+        _, shape, dtype, offset = self.plan._regions()[index]
+        return _scratch_view(
+            self._storage, offset_bytes=offset, shape=shape, dtype=dtype
+        )
+
+    @property
+    def selected_positions(self) -> torch.Tensor:
+        return self._view(0)
+
+    @property
+    def logical_positions(self) -> torch.Tensor:
+        return self._view(1)
+
+    @property
+    def errors(self) -> torch.Tensor:
+        return self._view(2)
+
+    @property
+    def num_source_rows(self) -> torch.Tensor:
+        return self._view(3)
+
+    def reset(self) -> None:
+        """Invalidate all anchors on the calling stream without allocating storage."""
+        from ._draft_selection import reset_anchors
+
+        reset_anchors(self._storage, self.plan._regions()[3][3])
+
+
+@dataclass(frozen=True)
+class DraftSelectionReuse:
+    """Live request-to-anchor row map for one reuse transaction.
+
+    ``source_rows[request_id]`` names a row of the last ordinary run. The caller
+    supplies a contiguous int32/int64 vector of ``max_batch`` entries and keeps
+    it stable until the operation completes. Invalid active mappings poison
+    output. The caller is responsible for request identity and round lifetime.
+    """
+
+    source_rows: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -477,6 +613,10 @@ class Binding:
     partial_lse: torch.Tensor
     selection_stream: torch.cuda.Stream | None = None
     _selection_done: torch.cuda.Event | None = None
+    draft_selection: DraftSelectionState | None = None
+    _draft_work_positions: torch.Tensor | None = None
+    _draft_work_errors: torch.Tensor | None = None
+    _record_draft_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -649,6 +789,17 @@ def _scratch_layout(
     offset = partial_lse_offset + partial_lse_nbytes
     work_metadata_offset = _align_up(offset)
     offset = work_metadata_offset + work_metadata_nbytes
+    draft_positions_offset = _align_up(offset)
+    if caps.max_speculative_tokens > 0:
+        offset = (
+            draft_positions_offset
+            + caps.max_batch
+            * (caps.selection_width + caps.max_speculative_tokens)
+            * torch.int32.itemsize
+        )
+    draft_errors_offset = _align_up(offset)
+    if caps.max_speculative_tokens > 0:
+        offset = draft_errors_offset + caps.max_batch * torch.int32.itemsize
     total_nbytes = _align_up(offset)
     return (
         _ScratchLayout(
@@ -680,6 +831,8 @@ def _scratch_layout(
             partial_lse_nbytes=partial_lse_nbytes,
             work_metadata_offset_bytes=work_metadata_offset,
             work_metadata_nbytes=work_metadata_nbytes,
+            draft_positions_offset_bytes=draft_positions_offset,
+            draft_errors_offset_bytes=draft_errors_offset,
             total_nbytes=total_nbytes,
         ),
         score_chunk_groups,
@@ -1030,6 +1183,8 @@ def bind(
     output: torch.Tensor,
     selected_positions: torch.Tensor,
     selection_stream: torch.cuda.Stream | None = None,
+    selection_done: torch.cuda.Event | None = None,
+    draft_selection: DraftSelectionState | None = None,
 ) -> Binding:
     """Bind runtime storage and optional selection-stream resources.
 
@@ -1045,6 +1200,9 @@ def bind(
     covering all selector inputs, metadata, and bound state. Bind and prewarm
     before graph capture. Main Q/K/V producers execute on the calling stream;
     run joins selection before attention. Calls sharing state must be ordered.
+    Supplying a caller-established ``selection_done`` event makes rebinding
+    allocation-free, including during CUDA capture. Its lifetime must cover
+    every binding and graph that uses it.
     """
     if not isinstance(plan, Plan):
         raise TypeError("plan must be a qsa.Plan")
@@ -1356,20 +1514,115 @@ def bind(
         shape=(int(plan.max_split_row_product), int(caps.q_heads)),
         dtype=torch.float32,
     )
-    selection_done = None
+    if draft_selection is not None:
+        if not isinstance(draft_selection, DraftSelectionState):
+            raise TypeError("draft_selection must be a qsa.DraftSelectionState")
+        if caps.max_speculative_tokens < 1:
+            raise ValueError("draft selection reuse requires speculative capacity")
+        source_capacity = int(draft_selection.selected_positions.shape[0])
+        if source_capacity < caps.max_q_rows:
+            raise ValueError("draft selection state must cover planned query rows")
+        for tensor, name, shape, dtype in (
+            (
+                draft_selection.selected_positions,
+                "draft selected_positions",
+                (source_capacity, caps.selection_width),
+                torch.int32,
+            ),
+            (
+                draft_selection.logical_positions,
+                "draft logical_positions",
+                (source_capacity,),
+                torch.int64,
+            ),
+            (draft_selection.errors, "draft errors", (source_capacity,), torch.int32),
+            (
+                draft_selection.num_source_rows,
+                "draft num_source_rows",
+                (1,),
+                torch.int32,
+            ),
+        ):
+            _check_tensor(
+                tensor,
+                name=name,
+                device=caps.device,
+                shape=shape,
+                dtype=dtype,
+                contiguous=True,
+            )
+        _require_mutation_alias_contract(
+            mutable=(
+                ("draft selected_positions", draft_selection.selected_positions),
+                ("draft logical_positions", draft_selection.logical_positions),
+                ("draft errors", draft_selection.errors),
+                ("draft num_source_rows", draft_selection.num_source_rows),
+            ),
+            read_only=tuple(
+                (name, tensor)
+                for name, tensor in (
+                    ("scratch", scratch_storage),
+                    ("output", output),
+                    ("selected_positions", selected_positions),
+                    ("main_k_cache", main_k_cache),
+                    ("main_v_cache", main_v_cache),
+                    ("k_descale", k_descale),
+                    ("v_descale", v_descale),
+                    ("main_block_table", main_block_table),
+                    ("compressed_k_cache", compressed_k_cache),
+                    ("compressed_block_table", compressed_block_table),
+                    ("raw_k_ring", raw_k_ring),
+                    ("raw_logical_positions", raw_logical_positions),
+                    ("raw_rope_positions", raw_rope_positions),
+                    ("raw_interval_start_positions", raw_interval_start_positions),
+                    ("raw_state_slot_ids", raw_state_slot_ids),
+                    ("index_q_norm_weight", index_q_norm_weight),
+                    ("index_k_norm_weight", index_k_norm_weight),
+                    ("rope_cos", rope_cos),
+                    ("rope_sin", rope_sin),
+                )
+                if tensor is not None
+            ),
+        )
     if selection_stream is not None:
         if not isinstance(selection_stream, torch.cuda.Stream):
             raise TypeError("selection_stream must be a CUDA stream")
         if selection_stream.device != caps.device:
             raise ValueError("selection_stream must match the QSA plan device")
-        with torch.cuda.device(caps.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("bind selection-stream resources before graph capture")
-            selection_done = torch.cuda.Event()
-            selection_done.record(selection_stream)
+        if selection_done is None:
+            with torch.cuda.device(caps.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "bind selection-stream resources before graph capture"
+                    )
+                selection_done = torch.cuda.Event()
+                selection_done.record(selection_stream)
+        elif not isinstance(selection_done, torch.cuda.Event):
+            raise TypeError("selection_done must be a caller-established CUDA event")
+        elif selection_done.device != caps.device:
+            raise ValueError("selection_done must be recorded on the QSA plan device")
+    elif selection_done is not None:
+        raise ValueError("selection_done requires selection_stream")
     return Binding(
         selection_stream=selection_stream,
         _selection_done=selection_done,
+        draft_selection=draft_selection,
+        _draft_work_positions=_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.draft_positions_offset_bytes,
+            shape=(caps.max_batch, caps.selection_width + caps.max_speculative_tokens),
+            dtype=torch.int32,
+        )
+        if caps.max_speculative_tokens > 0
+        else None,
+        _draft_work_errors=_scratch_view(
+            scratch_storage,
+            offset_bytes=layout.draft_errors_offset_bytes,
+            shape=(caps.max_batch,),
+            dtype=torch.int32,
+        )
+        if caps.max_speculative_tokens > 0
+        else None,
         plan=plan,
         shared_compressed_raw_pool=_overlaps(compressed_k_cache, raw_k_ring),
         scratch=scratch_storage,
@@ -2681,16 +2934,17 @@ def run(
     binding: Binding,
     *,
     query: torch.Tensor,
-    index_query: torch.Tensor,
-    raw_index_key: torch.Tensor,
+    index_query: torch.Tensor | None = None,
+    raw_index_key: torch.Tensor | None = None,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
-    rope_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    is_prefilling: torch.Tensor,
+    rope_positions: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
     index_ready: torch.cuda.Event | None = None,
+    reuse: DraftSelectionReuse | None = None,
 ) -> torch.Tensor:
     """Run one packed QSA decode transaction after main K/V writes are enqueued.
 
@@ -2702,6 +2956,16 @@ def run(
     joins it on the calling stream. Intermediate positions/errors remain an
     internal handoff within this call. Bind and prewarm before graph capture,
     and record the readiness event inside the graph for captured producers.
+
+    A bound ``draft_selection`` records anchors during ordinary execution.
+    ``reuse=DraftSelectionReuse(source_rows)`` uses the accepted anchors selected
+    by the caller-owned request-to-source map and appends only the causal draft tail.
+    This mode requires one query per request inside the same draft round;
+    selector projections/metadata and ``index_ready`` must be omitted. It
+    preserves selector caches and the anchor buffers. Invalid anchors poison
+    output for invalid bounds or causal positions. Request identity and round
+    lifetime are caller invariants; see ``DraftSelectionState``. Target layers
+    must not use it.
 
     Active request intervals are the dense prefix encoded by
     ``query_start_loc``.  Remaining boundaries repeat the live-row count and
@@ -2740,6 +3004,97 @@ def run(
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be a qsa.Binding")
+    if reuse is not None:
+        if not isinstance(reuse, DraftSelectionReuse):
+            raise TypeError("reuse must be a qsa.DraftSelectionReuse")
+        state = binding.draft_selection
+        if state is None:
+            raise ValueError("draft selection reuse requires bound draft state")
+        if any(
+            value is not None
+            for value in (
+                index_query,
+                raw_index_key,
+                rope_positions,
+                sequence_lengths,
+                query_start_loc,
+                num_accepted_tokens,
+                is_prefilling,
+                index_ready,
+            )
+        ):
+            raise ValueError("draft selection reuse does not accept selector inputs")
+        rows = int(query.shape[0])
+        if not 0 < rows <= min(binding.plan.caps.max_batch, binding.output.shape[0]):
+            raise ValueError("draft selection reuse requires one row per request")
+        caps = binding.plan.caps
+        _check_tensor(
+            query,
+            name="query",
+            device=caps.device,
+            shape=(rows, caps.q_heads, caps.head_dim),
+            dtype=torch.bfloat16,
+            contiguous=True,
+        )
+        for tensor, name, dtype in (
+            (request_ids, "request_ids", (torch.int32, torch.int64)),
+            (query_positions, "query_positions", torch.int64),
+        ):
+            _check_tensor(
+                tensor,
+                name=name,
+                device=binding.plan.caps.device,
+                shape=(rows,),
+                dtype=dtype,
+                contiguous=True,
+            )
+        _check_tensor(
+            reuse.source_rows,
+            name="source_rows",
+            device=caps.device,
+            shape=(caps.max_batch,),
+            dtype=(torch.int32, torch.int64),
+            contiguous=True,
+        )
+        from ._draft_selection import prepare_selection, validate_buffers
+
+        validate_buffers(
+            [binding.scratch, binding.output],
+            [query, request_ids, query_positions, reuse.source_rows],
+        )
+        prepare_selection(
+            state._storage,
+            state.plan.max_source_rows,
+            state.plan.selection_width,
+            reuse.source_rows,
+            request_ids,
+            query_positions,
+            binding.scratch,
+            binding.plan._layout.draft_positions_offset_bytes,
+            binding.plan._layout.draft_errors_offset_bytes,
+            caps.max_batch,
+            caps.max_speculative_tokens,
+        )
+        return _run_attention(
+            binding,
+            query=query,
+            request_ids=request_ids,
+            query_positions=query_positions,
+            reuse=True,
+        )
+    if any(
+        value is None
+        for value in (
+            index_query,
+            raw_index_key,
+            rope_positions,
+            sequence_lengths,
+            query_start_loc,
+            num_accepted_tokens,
+            is_prefilling,
+        )
+    ):
+        raise ValueError("ordinary QSA execution requires every selector input")
     inputs = dict(
         query=query,
         index_query=index_query,
@@ -2752,11 +3107,24 @@ def run(
         num_accepted_tokens=num_accepted_tokens,
         is_prefilling=is_prefilling,
     )
+    if binding.draft_selection is not None:
+        from ._draft_selection import validate_buffers
+
+        state = binding.draft_selection
+        validate_buffers(
+            [
+                state._storage,
+                binding.selected_positions,
+            ],
+            list(inputs.values()),
+        )
     stream = binding.selection_stream
     if stream is None:
         if index_ready is not None:
             raise ValueError("index_ready requires a binding with selection_stream")
-        return _run(binding, **inputs)
+        result = _run(binding, **inputs)
+        _record_draft_anchors(binding, query_positions)
+        return result
     if index_ready is None:
         raise ValueError("selection_stream requires an index_ready event")
     if not torch.compiler.is_compiling():
@@ -2771,11 +3139,30 @@ def run(
             _run(binding, **inputs, selection_only=True)
             binding._selection_done.record(stream)
         main_stream.wait_event(binding._selection_done)
-        return _run_attention(
+        result = _run_attention(
             binding,
             query=query,
             request_ids=request_ids,
             query_positions=query_positions,
+        )
+        _record_draft_anchors(binding, query_positions)
+        return result
+
+
+def _record_draft_anchors(binding: Binding, positions: torch.Tensor) -> None:
+    if binding.draft_selection is not None:
+        from ._draft_selection import record_anchors
+
+        state = binding.draft_selection
+        record_anchors(
+            positions,
+            binding.scratch,
+            binding.plan._layout.state_errors_offset_bytes,
+            binding.selected_positions,
+            state._storage,
+            state.plan.max_source_rows,
+            state.plan.selection_width,
+            binding._record_draft_enabled,
         )
 
 
@@ -2789,7 +3176,7 @@ def _qsa_attention_op(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
-    selected_positions: torch.Tensor,
+    selected_positions: torch.Tensor | None,
     scratch: torch.Tensor,
     output: torch.Tensor,
     work_rows: int,
@@ -2798,6 +3185,9 @@ def _qsa_attention_op(
     partial_output_offset: int,
     partial_lse_offset: int,
     direct_kv_warps: int,
+    draft_positions_offset: int,
+    draft_width: int,
+    draft_capacity: int,
 ) -> None:
     from ._kernels import launch_poison_failed_rows
     from ._sparse_gqa import launch_sparse_paged_gqa
@@ -2810,14 +3200,27 @@ def _qsa_attention_op(
             ("query", query),
             ("request_ids", request_ids),
             ("query_positions", query_positions),
-            ("selected_positions", selected_positions),
+        )
+        + (
+            ()
+            if selected_positions is None
+            else (("selected_positions", selected_positions),)
         ),
     )
     rows, q_heads, head_dim = map(int, query.shape)
+    if selected_positions is None:
+        selected_positions = _scratch_view(
+            scratch,
+            offset_bytes=draft_positions_offset,
+            shape=(draft_capacity, draft_width),
+            dtype=torch.int32,
+        )
     errors = _scratch_view(
         scratch,
         offset_bytes=state_errors_offset,
-        shape=(int(output.shape[0]),),
+        shape=(
+            draft_capacity if draft_positions_offset >= 0 else int(output.shape[0]),
+        ),
         dtype=torch.int32,
     )
     partial_output = _scratch_view(
@@ -2878,7 +3281,7 @@ def _qsa_attention_fake(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     main_block_table: torch.Tensor,
-    selected_positions: torch.Tensor,
+    selected_positions: torch.Tensor | None,
     scratch: torch.Tensor,
     output: torch.Tensor,
     work_rows: int,
@@ -2887,6 +3290,9 @@ def _qsa_attention_fake(
     partial_output_offset: int,
     partial_lse_offset: int,
     direct_kv_warps: int,
+    draft_positions_offset: int,
+    draft_width: int,
+    draft_capacity: int,
 ) -> None:
     return None
 
@@ -2897,6 +3303,7 @@ def _run_attention(
     query: torch.Tensor,
     request_ids: torch.Tensor,
     query_positions: torch.Tensor,
+    reuse: bool = False,
 ) -> torch.Tensor:
     """Consume the bound selection and error mask within one run call."""
 
@@ -2931,15 +3338,18 @@ def _run_attention(
         binding.k_descale,
         binding.v_descale,
         binding.main_block_table,
-        binding.selected_positions,
+        None if reuse else binding.selected_positions,
         binding.scratch,
         binding.output,
         binding.plan.workspace_q_rows,
         binding.plan.max_split_row_product,
-        layout.state_errors_offset_bytes,
+        layout.draft_errors_offset_bytes if reuse else layout.state_errors_offset_bytes,
         layout.partial_output_offset_bytes,
         layout.partial_lse_offset_bytes,
         binding.plan.policy_resolution.config.sparse_gqa_direct_kv_warps,
+        layout.draft_positions_offset_bytes if reuse else -1,
+        caps.selection_width + caps.max_speculative_tokens,
+        caps.max_batch,
     )
     return binding.output[:rows]
 
@@ -2952,7 +3362,8 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
     workspace, selection, and attention specializations. Cache accesses
     and persistent selector-state writes remain masked. Scratch, output, and
     selected-position buffers are transient and have unspecified contents
-    after this call.
+    after this call, except for a bound draft state's anchor buffers, which
+    are preserved. The record kernel is warmed with persistent writes disabled.
     """
     if not isinstance(binding, Binding):
         raise TypeError("binding must be a qsa.Binding")
@@ -2963,6 +3374,7 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
     if not 0 < requested_rows <= output_capacity:
         raise ValueError("prewarm rows must fit the bound QSA output capacity")
     device = caps.device
+    binding = replace(binding, _record_draft_enabled=False)
     ready = torch.cuda.Event() if binding.selection_stream is not None else None
     sequence_lengths = torch.zeros(
         int(caps.max_batch), dtype=torch.int32, device=device
@@ -3026,6 +3438,19 @@ def prewarm(binding: Binding, *, rows: int | None = None) -> None:
                 is_prefilling=is_prefilling,
                 index_ready=ready,
             )
+            if binding.draft_selection is not None:
+                draft_rows = min(warm_row_count, int(caps.max_batch))
+                for source_rows in (
+                    sequence_lengths,
+                    binding.draft_selection.logical_positions[: caps.max_batch],
+                ):
+                    run(
+                        binding,
+                        query=query[:draft_rows],
+                        request_ids=request_ids[:draft_rows],
+                        query_positions=query_positions[:draft_rows],
+                        reuse=DraftSelectionReuse(source_rows),
+                    )
 
 
 def is_supported(device: torch.device | str | None = None) -> bool:
@@ -3041,6 +3466,9 @@ __all__ = [
     "Caps",
     "Plan",
     "Binding",
+    "DraftSelectionState",
+    "DraftSelectionPlan",
+    "DraftSelectionReuse",
     "cache_requirements",
     "plan",
     "bind",

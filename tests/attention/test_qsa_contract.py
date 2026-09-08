@@ -1236,8 +1236,6 @@ def test_qsa_shared_pool_runs_under_fullgraph_compile_and_checks_runtime_aliases
         compiled(binding.output[:1], *arguments[1:])
 
 
-
-
 def test_qsa_shared_pool_cuda_graph_replay_has_stable_addresses_and_allocation() -> (
     None
 ):
@@ -2176,7 +2174,8 @@ def test_qsa_cute_scores_preserve_chunked_selection_and_attention_graph_replay(
     torch.manual_seed(98903)
     binding = _allocate_binding(caps)
     binding = _rebind(
-        binding, selection_stream=torch.cuda.Stream(device=device) if overlap else None,
+        binding,
+        selection_stream=torch.cuda.Stream(device=device) if overlap else None,
     )
     ready = torch.cuda.Event() if overlap else None
 
@@ -2999,10 +2998,16 @@ def test_qsa_run_streams_match_combined_across_graph_replay(
     def stream_call():
         ready.record()
         projected_query.copy_(dynamic["query"])
-        return qsa.run(candidate, **attention_args, **{
-            name: value for name, value in select_args.items()
-            if name not in attention_args
-        }, index_ready=ready)
+        return qsa.run(
+            candidate,
+            **attention_args,
+            **{
+                name: value
+                for name, value in select_args.items()
+                if name not in attention_args
+            },
+            index_ready=ready,
+        )
 
     reset(reference)
     qsa.run(reference, **dynamic)
@@ -3055,8 +3060,6 @@ def test_qsa_run_streams_match_combined_across_graph_replay(
             atol=0,
             equal_nan=True,
         )
-
-
 
 
 def test_qsa_rejects_insufficient_live_output_before_mutation() -> None:
@@ -3414,8 +3417,6 @@ def test_qsa_decode_full_path_matches_exact_gqa_and_keeps_main_cache_read_only()
     assert torch.all(binding.selected_positions[0, 4:] == -1)
 
 
-
-
 def test_qsa_score_uses_tensor_device_and_stream() -> None:
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
     from b12x.attention.qsa import _score_cute as implementation
@@ -3436,10 +3437,16 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
         request_ids=torch.zeros(1, dtype=torch.int32, device=device),
         sequence_lengths=torch.full((1,), 64, dtype=torch.int32, device=device),
         compressed_cache=cache,
-        compressed_block_table=torch.arange(4, dtype=torch.int32, device=device).view(1, 4),
-        state_errors=errors, scores=output,
-        eligible_counts=torch.empty_like(errors), merge_lengths=torch.empty_like(errors),
-        group_offset=0, group_count=16, caps=caps,
+        compressed_block_table=torch.arange(4, dtype=torch.int32, device=device).view(
+            1, 4
+        ),
+        state_errors=errors,
+        scores=output,
+        eligible_counts=torch.empty_like(errors),
+        merge_lengths=torch.empty_like(errors),
+        group_offset=0,
+        group_count=16,
+        caps=caps,
     )
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -3449,7 +3456,9 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
         assert torch.cuda.current_device() == other
     stream.synchronize()
     warmed = tuple(implementation._CACHE.items())
-    freeze_kernel_resolution("QSA scorer retains tensor device under ambient device changes")
+    freeze_kernel_resolution(
+        "QSA scorer retains tensor device under ambient device changes"
+    )
     try:
         with torch.cuda.stream(stream), torch.cuda.device(other):
             graph = torch.cuda.CUDAGraph()
@@ -3465,7 +3474,9 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
                     output.fill_(float("nan"))
                 graph.replay()
                 stream.synchronize()
-                torch.testing.assert_close(output, torch.full_like(output, 4 * 128**0.5 * value))
+                torch.testing.assert_close(
+                    output, torch.full_like(output, 4 * 128**0.5 * value)
+                )
         assert tuple(implementation._CACHE.items()) == warmed
         assert not errors.any()
     finally:
@@ -3476,19 +3487,28 @@ def test_qsa_score_uses_tensor_device_and_stream() -> None:
 @pytest.mark.parametrize("budget", [2048, 8192])
 @pytest.mark.parametrize("output_rows", [4, 66])
 def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
-    overlap: bool, budget: int, output_rows: int,
+    overlap: bool,
+    budget: int,
+    output_rows: int,
 ) -> None:
     from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     device = require_sm120()
     caps = _caps(
-        device, max_q_rows=128, q_heads=24, head_dim=256, index_heads=4,
-        index_head_dim=128, index_rotary_dim=64, max_speculative_tokens=3,
+        device,
+        max_q_rows=128,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
         budget=budget,
     )
     binding = _allocate_binding(caps)
     binding = _rebind(
-        binding, output=binding.output[:output_rows],
+        binding,
+        output=binding.output[:output_rows],
         selection_stream=torch.cuda.Stream(device=device) if overlap else None,
     )
     binding.main_k_cache.zero_()
@@ -3497,9 +3517,13 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
     binding.compressed_k_cache.zero_()
     binding.raw_k_ring.zero_()
     persistent = (
-        binding.main_k_cache, binding.main_v_cache, binding.compressed_k_cache,
-        binding.raw_k_ring, binding.raw_logical_positions,
-        binding.raw_rope_positions, binding.raw_interval_start_positions,
+        binding.main_k_cache,
+        binding.main_v_cache,
+        binding.compressed_k_cache,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
     )
     saved = [t.clone() for t in persistent]
     qsa.prewarm(binding)
@@ -3516,10 +3540,11 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
         for dtype in (torch.int32, torch.int64):
             for rows in sorted({1, min(4, output_rows), output_rows}):
                 dynamic = _dynamic_inputs(
-                    binding, positions=(0,) + (-1,) * (rows - 1),
+                    binding,
+                    positions=(0,) + (-1,) * (rows - 1),
                     request_ids=(0,) + (-1,) * (rows - 1),
                 )
-                dynamic['request_ids'] = dynamic['request_ids'].to(dtype)
+                dynamic["request_ids"] = dynamic["request_ids"].to(dtype)
 
                 def invoke():
                     if ready is not None:
@@ -3532,13 +3557,16 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
                 for value in (1, 2):
                     binding.raw_interval_start_positions.fill_(-1)
                     binding.main_v_cache.fill_(value)
-                    binding.output.fill_(float('nan'))
+                    binding.output.fill_(float("nan"))
                     torch.cuda.synchronize()
                     before = torch.cuda.memory_stats()
                     graph.replay()
                     torch.cuda.synchronize()
                     after = torch.cuda.memory_stats()
-                    for key in ('allocation.all.allocated', 'allocated_bytes.all.allocated'):
+                    for key in (
+                        "allocation.all.allocated",
+                        "allocated_bytes.all.allocated",
+                    ):
                         assert after[key] == before[key]
                     assert torch.all(result[0] == value)
                     assert torch.all(result[1:] == 0)
@@ -3549,21 +3577,31 @@ def test_qsa_run_prewarm_covers_bound_capacity_and_graph_replay(
         unfreeze_kernel_resolution()
 
 
-@pytest.mark.parametrize('overlap', [False, True])
-@pytest.mark.parametrize('shared_pool', [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("shared_pool", [False, True])
 def test_qsa_run_streams_fullgraph_preserves_state_and_alias_checks(
-    overlap: bool, shared_pool: bool,
+    overlap: bool,
+    shared_pool: bool,
 ) -> None:
     device = require_sm120()
     caps = _caps(
-        device, max_batch=1, max_raw_state_slots=1, max_q_rows=1,
-        q_heads=24, head_dim=256, index_heads=4, index_head_dim=128,
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
         index_rotary_dim=64,
     )
-    allocate = _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
+    allocate = (
+        _allocate_shared_compressed_raw_binding if shared_pool else _allocate_binding
+    )
     binding = allocate(caps)
     binding = _rebind(
-        binding, selection_stream=torch.cuda.Stream(device=device) if overlap else None,
+        binding,
+        selection_stream=torch.cuda.Stream(device=device) if overlap else None,
     )
     binding.main_block_table[0, 0] = 0
     binding.main_k_cache.zero_()
@@ -3579,26 +3617,26 @@ def test_qsa_run_streams_fullgraph_preserves_state_and_alias_checks(
     def invoke(query):
         if ready is not None:
             ready.record()
-        return qsa.run(binding, **{**dynamic, 'query': query}, index_ready=ready)
+        return qsa.run(binding, **{**dynamic, "query": query}, index_ready=ready)
 
     compiled = torch.compile(invoke, fullgraph=True)
     for launch in (invoke, compiled):
         for value in (2, 3):
             binding.raw_interval_start_positions.fill_(-1)
             binding.main_v_cache.fill_(value)
-            result = launch(dynamic['query'])
+            result = launch(dynamic["query"])
             assert torch.all(result == value)
             assert result.data_ptr() == binding.output.data_ptr()
             assert binding.state_errors[0] == 0
         binding.raw_interval_start_positions.fill_(-1)
         before = binding.raw_interval_start_positions.clone()
-        with pytest.raises(ValueError, match='output.*query'):
+        with pytest.raises(ValueError, match="output.*query"):
             launch(binding.output)
         assert torch.equal(binding.raw_interval_start_positions, before)
     binding.raw_interval_start_positions.fill_(-1)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result = compiled(dynamic['query'])
+        result = compiled(dynamic["query"])
     for value in (4, 5):
         binding.raw_interval_start_positions.fill_(-1)
         binding.main_v_cache.fill_(value)
@@ -3608,32 +3646,39 @@ def test_qsa_run_streams_fullgraph_preserves_state_and_alias_checks(
 
 def test_qsa_run_stream_options_validate_before_mutation() -> None:
     device = require_sm120()
-    binding = _allocate_binding(_caps(
-        device, q_heads=24, head_dim=256, index_heads=4, index_head_dim=128,
-        index_rotary_dim=64,
-    ))
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+        )
+    )
     dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
     binding.scratch.fill_(173)
     binding.output.fill_(23)
     ready = torch.cuda.Event()
-    with pytest.raises(ValueError, match='requires a binding'):
+    with pytest.raises(ValueError, match="requires a binding"):
         qsa.run(binding, **dynamic, index_ready=ready)
     binding = _rebind(binding, selection_stream=torch.cuda.Stream(device=device))
-    with pytest.raises(ValueError, match='requires an index_ready'):
+    with pytest.raises(ValueError, match="requires an index_ready"):
         qsa.run(binding, **dynamic)
-    with pytest.raises(ValueError, match='must be recorded'):
+    with pytest.raises(ValueError, match="must be recorded"):
         qsa.run(binding, **dynamic, index_ready=ready)
     ready.record()
-    with pytest.raises(TypeError, match='query must be a tensor'):
-        qsa.run(binding, **{**dynamic, 'query': None}, index_ready=ready)
+    with pytest.raises(TypeError, match="query must be a tensor"):
+        qsa.run(binding, **{**dynamic, "query": None}, index_ready=ready)
     assert torch.all(binding.scratch == 173)
     assert torch.all(binding.output == 23)
-    assert not hasattr(qsa, 'select')
-    assert not hasattr(qsa, 'run_selected')
+    assert not hasattr(qsa, "select")
+    assert not hasattr(qsa, "run_selected")
 
 
 @torch.library.custom_op(
-    "b12x_tests::qsa_delayed_producer", mutates_args=("query", "value_cache"),
+    "b12x_tests::qsa_delayed_producer",
+    mutates_args=("query", "value_cache"),
 )
 def _qsa_delayed_producer(query: torch.Tensor, value_cache: torch.Tensor) -> None:
     # Model an opaque cache writer; Torch functionalization must not defer writes.
@@ -3647,15 +3692,22 @@ def _qsa_delayed_producer_fake(query: torch.Tensor, value_cache: torch.Tensor) -
     return None
 
 
-@pytest.mark.parametrize('compiled', [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
 def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention(
-    monkeypatch, compiled: bool,
+    monkeypatch,
+    compiled: bool,
 ) -> None:
     """A delayed producer proves stream ordering; this is not a speed benchmark."""
     device = require_sm120()
     caps = _caps(
-        device, max_batch=1, max_raw_state_slots=1, max_q_rows=1,
-        q_heads=24, head_dim=256, index_heads=4, index_head_dim=128,
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
         index_rotary_dim=64,
     )
     binding = _allocate_binding(caps)
@@ -3677,14 +3729,14 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
         if args[0] is None:
             selected.record()
 
-    monkeypatch.setattr(qsa_contract, '_qsa_decode_impl', observe)
+    monkeypatch.setattr(qsa_contract, "_qsa_decode_impl", observe)
     qsa.prewarm(binding)
     ready.record()
 
     def invoke():
         started.record()
         ready.record()
-        _qsa_delayed_producer(dynamic['query'], binding.main_v_cache)
+        _qsa_delayed_producer(dynamic["query"], binding.main_v_cache)
         produced.record()
         return qsa.run(binding, **dynamic, index_ready=ready)
 
@@ -3699,8 +3751,8 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
                 result = launch()
         for _ in range(2):
             binding.raw_interval_start_positions.fill_(-1)
-            dynamic['query'].fill_(float('nan'))
-            binding.main_v_cache.fill_(float('nan'))
+            dynamic["query"].fill_(float("nan"))
+            binding.main_v_cache.fill_(float("nan"))
             if graph_mode:
                 graph.replay()
             else:
@@ -3711,15 +3763,279 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
             assert 0 <= started.elapsed_time(selected) < started.elapsed_time(produced)
 
 
+def _draft_selection_state(binding):
+    storage_plan = binding.plan.draft_selection_plan()
+    storage = {
+        spec.name: torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+        for spec in storage_plan.storage_specs()
+    }
+    state = storage_plan.bind(storage=storage)
+    state.reset()
+    return state
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("high_page", [False, True])
+def test_qsa_run_reuses_draft_anchors_without_mutating_selector_state(
+    kv_dtype,
+    request_dtype,
+    high_page,
+    monkeypatch,
+):
+    """Accepted-row mapping, causal tails and errors survive changed-input replay."""
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+
+    device = require_sm120()
+    first_page = 2**31 // (3008 * 2 * 256) + 1 if high_page else 0
+    caps = _caps(
+        device,
+        max_batch=4,
+        max_raw_state_slots=4,
+        max_q_rows=16,
+        max_seq_len=3008,
+        main_page_size=3008,
+        compressed_page_size=752,
+        num_main_cache_pages=first_page + 4,
+        num_compressed_cache_pages=4,
+        q_heads=24,
+        kv_heads=2,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+        kv_dtype=kv_dtype,
+    )
+    if high_page:
+        pool_bytes = (
+            2
+            * caps.num_main_cache_pages
+            * caps.main_page_size
+            * caps.kv_heads
+            * caps.head_dim
+            * caps.kv_dtype.itemsize
+        )
+        _require_free_cuda_bytes(device, pool_bytes + 2**29)
+    binding = _allocate_binding(caps)
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    for request in range(4):
+        page = first_page + request
+        binding.main_block_table[request, 0] = page
+        binding.compressed_block_table[request, 0] = request
+        binding.main_k_cache[page].zero_()
+        binding.main_v_cache[page].fill_(request + 1)
+    binding.raw_k_ring.zero_()
+    binding.compressed_k_cache.zero_()
+    initial = _dynamic_inputs(
+        binding,
+        positions=tuple(i % 4 for i in range(16)),
+        request_ids=tuple(i // 4 for i in range(16)),
+    )
+    compiled = (
+        not high_page and kv_dtype == torch.bfloat16 and request_dtype == torch.int64
+    )
+    if compiled:
+
+        def record_round():
+            state.reset()
+            return qsa.run(binding, **initial)
+
+        torch.compile(record_round, fullgraph=True)()
+    else:
+        qsa.run(binding, **initial)
+    assert state.num_source_rows.item() == 16
+    torch.testing.assert_close(state.logical_positions, initial["query_positions"])
+    assert torch.equal(state.selected_positions, binding.selected_positions)
+    if compiled:
+        reuse_plan = qsa.plan(replace(caps, max_q_rows=4))
+        binding = _rebind(
+            replace(binding, plan=reuse_plan),
+            selected_positions=binding.selected_positions[:4],
+            output=binding.output[:4],
+            draft_selection=state,
+        )
+    source_rows = torch.tensor([3, 7, 11, 15], dtype=request_dtype, device=device)
+    state.errors[7] = 512
+    query = initial["query"][:4].clone()
+    requests = torch.tensor([2, 0, -1, 1], device=device, dtype=request_dtype)
+    positions = torch.tensor([4, 5, -1, 4], device=device, dtype=torch.int64)
+    persistent = (
+        binding.compressed_k_cache,
+        binding.raw_k_ring,
+        binding.raw_logical_positions,
+        binding.raw_rope_positions,
+        binding.raw_interval_start_positions,
+        state.selected_positions,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+    )
+    snapshots = [t.clone() for t in persistent]
+    qsa.prewarm(binding)
+    for tensor, expected in zip(persistent, snapshots, strict=True):
+        assert torch.equal(tensor, expected)
+    pointers = tuple(
+        t.data_ptr()
+        for t in (
+            binding.output,
+            binding.scratch,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
+        )
+    )
+
+    def invoke(rows=4):
+        return qsa.run(
+            binding,
+            query=query[:rows],
+            request_ids=requests[:rows],
+            query_positions=positions[:rows],
+            reuse=qsa.DraftSelectionReuse(source_rows),
+        )
+
+    if compiled:
+        invoke = torch.compile(invoke, fullgraph=True)
+    for rows in (1, 3, 4):
+        invoke(rows)
+    freeze_kernel_resolution("QSA draft reuse must retain prewarmed reader capacity")
+    try:
+        for rows in (1, 3, 4):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                result = invoke(rows)
+            for tail_end in (5, 4):
+                positions[0] = tail_end
+                torch.cuda.synchronize()
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                assert torch.all(result[0] == 3)
+                if rows >= 3:
+                    assert torch.all(result[1] == 1)
+                    assert torch.all(result[2] == 0)
+                if rows == 4:
+                    assert torch.isnan(result[3]).all()
+                assert binding._draft_work_positions[
+                    0, caps.selection_width :
+                ].tolist() == ([4, 5, -1] if tail_end == 5 else [4, -1, -1])
+            positions[0] = 7
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            positions[0] = 4
+            # A row outside the last ordinary run must not reuse older state.
+            source_rows[2] = 16
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            source_rows[2] = 11
+            state.num_source_rows.fill_(11)
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            state.num_source_rows.fill_(16)
+            state.reset()
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            state.num_source_rows.fill_(16)
+            requests[0] = caps.max_batch
+            graph.replay()
+            assert torch.isnan(result[0]).all()
+            requests[0] = 2
+    finally:
+        unfreeze_kernel_resolution()
+    for tensor, expected in zip(persistent, snapshots, strict=True):
+        assert torch.equal(tensor, expected)
+    assert pointers == tuple(
+        t.data_ptr()
+        for t in (
+            binding.output,
+            binding.scratch,
+            binding._draft_work_positions,
+            binding._draft_work_errors,
+        )
+    )
+
+
+@pytest.mark.parametrize("draft", [False, True])
+def test_qsa_rebind_uses_caller_events_during_capture(monkeypatch, draft):
+    """Fresh bindings may not construct synchronization resources inside capture."""
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            max_speculative_tokens=3 if draft else 0,
+        )
+    )
+    stream = torch.cuda.Stream(device=device)
+    done = torch.cuda.Event()
+    done.record(stream)
+    ready = torch.cuda.Event()
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    binding.main_block_table[0, 0] = 0
+    binding.compressed_block_table[0, 0] = 0
+    binding.main_k_cache.zero_()
+    binding.main_v_cache.fill_(3)
+    binding.raw_k_ring.zero_()
+    binding.compressed_k_cache.zero_()
+    state = _draft_selection_state(binding) if draft else None
+    warmed = _rebind(
+        binding, selection_stream=stream, selection_done=done, draft_selection=state
+    )
+    qsa.prewarm(warmed)
+    before_event = torch.cuda.Event
+
+    def forbid_event(*args, **kwargs):
+        raise AssertionError("fresh QSA binding allocated a CUDA event")
+
+    # Keep isinstance checks valid while failing any attempted construction.
+    monkeypatch.setattr(before_event, "__new__", forbid_event)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        capture_state = state.plan.bind(storage=state._storage) if state else None
+        rebound = _rebind(
+            binding,
+            selection_stream=stream,
+            selection_done=done,
+            draft_selection=capture_state,
+        )
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        if capture_state is not None:
+            capture_state.reset()
+        assert rebound is not warmed
+        assert rebound._selection_done is done
+        ready.record()
+        result = qsa.run(rebound, **dynamic, index_ready=ready)
+    graph.replay()
+    assert torch.all(result == 3)
+
+
 def test_qsa_run_stream_resources_use_plan_device() -> None:
     device = require_sm120()
     if torch.cuda.device_count() < 2:
-        pytest.skip('requires two explicitly assigned CUDA devices')
-    device = torch.device('cuda', torch.cuda.current_device())
+        pytest.skip("requires two explicitly assigned CUDA devices")
+    device = torch.device("cuda", torch.cuda.current_device())
     other = (device.index + 1) % torch.cuda.device_count()
     caps = _caps(
-        device, max_batch=1, max_raw_state_slots=1, max_q_rows=1,
-        q_heads=24, head_dim=256, index_heads=4, index_head_dim=128,
+        device,
+        max_batch=1,
+        max_raw_state_slots=1,
+        max_q_rows=1,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
         index_rotary_dim=64,
     )
     binding = _allocate_binding(caps)
@@ -3733,10 +4049,10 @@ def test_qsa_run_stream_resources_use_plan_device() -> None:
         wrong_stream = torch.cuda.Stream()
         wrong_ready = torch.cuda.Event()
         wrong_ready.record()
-    with pytest.raises(ValueError, match='selection_stream must match'):
+    with pytest.raises(ValueError, match="selection_stream must match"):
         _rebind(binding, selection_stream=wrong_stream)
     binding = _rebind(binding, selection_stream=torch.cuda.Stream(device=device))
-    with pytest.raises(ValueError, match='index_ready must be recorded on'):
+    with pytest.raises(ValueError, match="index_ready must be recorded on"):
         qsa.run(binding, **dynamic, index_ready=wrong_ready)
     with torch.cuda.device(other):
         qsa.prewarm(binding)
@@ -3746,3 +4062,89 @@ def test_qsa_run_stream_resources_use_plan_device() -> None:
         assert torch.cuda.current_device() == other
     assert torch.all(result == 2)
     assert binding.state_errors[0] == 0
+
+
+def test_qsa_draft_storage_binding_is_caller_owned_and_preserves_contents():
+    device = require_sm120()
+    caps = _caps(
+        device,
+        q_heads=24,
+        head_dim=256,
+        index_heads=4,
+        index_head_dim=128,
+        index_rotary_dim=64,
+        max_speculative_tokens=3,
+    )
+    binding = _allocate_binding(caps)
+    storage_plan = binding.plan.draft_selection_plan(max_source_rows=8)
+    (spec,) = storage_plan.storage_specs()
+    storage = torch.full(spec.shape, 37, dtype=spec.dtype, device=spec.device)
+    expected = storage.clone()
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state = storage_plan.bind(storage=storage)
+    rebound = _rebind(binding, draft_selection=state)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert torch.equal(storage, expected)
+    assert rebound.draft_selection is state
+    assert state.selected_positions.shape == (8, caps.selection_width)
+    for tensor in (
+        state.selected_positions,
+        state.logical_positions,
+        state.errors,
+        state.num_source_rows,
+    ):
+        assert tensor.untyped_storage().data_ptr() == storage.data_ptr()
+    for tensor in (rebound._draft_work_positions, rebound._draft_work_errors):
+        assert tensor.untyped_storage().data_ptr() == binding.scratch.data_ptr()
+    with pytest.raises(ValueError, match="requires"):
+        storage_plan.bind(storage=storage[:1])
+    with pytest.raises(ValueError, match="cover planned query rows"):
+        binding.plan.draft_selection_plan(max_source_rows=1)
+    for aliased_storage in (binding.main_k_cache.view(torch.uint8), binding.scratch):
+        with pytest.raises(ValueError, match="overlap"):
+            _rebind(binding, draft_selection=storage_plan.bind(storage=aliased_storage))
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    state.reset()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert state.num_source_rows.item() == 0
+
+
+def test_qsa_draft_reuse_validates_live_input_contract_before_mutation():
+    device = require_sm120()
+    binding = _allocate_binding(
+        _caps(
+            device,
+            q_heads=24,
+            head_dim=256,
+            index_heads=4,
+            index_head_dim=128,
+            index_rotary_dim=64,
+            max_speculative_tokens=3,
+        )
+    )
+    state = _draft_selection_state(binding)
+    binding = _rebind(binding, draft_selection=state)
+    dynamic = _dynamic_inputs(binding, positions=(0,), request_ids=(0,))
+    common = {
+        name: dynamic[name] for name in ("query", "request_ids", "query_positions")
+    }
+    with pytest.raises(TypeError, match="DraftSelectionReuse"):
+        qsa.run(binding, **common, reuse=True)
+    with pytest.raises(ValueError, match="shape"):
+        qsa.run(
+            binding,
+            **common,
+            reuse=qsa.DraftSelectionReuse(
+                dynamic["request_ids"][:1],
+            ),
+        )
+    source_rows = torch.zeros(
+        binding.plan.caps.max_batch, dtype=torch.int64, device=device
+    )
+    with pytest.raises(ValueError, match="does not accept selector inputs"):
+        qsa.run(binding, **dynamic, reuse=qsa.DraftSelectionReuse(source_rows))
+    aliased_rows = binding.scratch[: 8 * binding.plan.caps.max_batch].view(torch.int64)
+    with pytest.raises(ValueError, match="overlap"):
+        qsa.run(binding, **common, reuse=qsa.DraftSelectionReuse(aliased_rows))
+    assert state.num_source_rows.item() == 0
