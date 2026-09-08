@@ -1,13 +1,35 @@
-"""Compare native row-strided fused RMSNorm with a contiguous boundary copy."""
+"""Compare three residual layouts of the fused all-reduce RMSNorm on PCIe
+tensor parallelism 8.
+
+``native_strided`` passes a row-strided residual view (the residual half of
+a ``[rows, 2 * hidden]`` buffer) straight to the fused collective;
+``boundary_copy`` copies that view into a contiguous buffer inside the
+graph before the collective; ``packed_control`` passes an already
+contiguous residual and is the comparison baseline. The ratios reported are
+``native_strided / packed_control`` and ``boundary_copy / native_strided``
+of the slowest rank's median replay time (lower is better).
+
+Correctness precedes timing: every arm's graph is replayed once from the
+validated inputs and its outputs compared against an NCCL fp32 reference
+and against the ``packed_control`` arm; the residual buffers, which the
+collective updates in place, are restored before the warm-up and timed
+replays, and after the timed replays every arm is replayed once more from
+the restored inputs and must reproduce its validated outputs bitwise. The
+JSON record carries the command, the source revision and worktree state,
+rank 0's physical GPU and its operating mode before and after the timed
+work, every rank's correctness metrics, the raw per-sample timings and the
+ratios.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import pathlib
 import socket
 import statistics
-import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -19,6 +41,12 @@ from cuda.bindings import runtime as cudart
 
 import b12x
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from benchmarks.common import (  # noqa: E402
+    benchmark_provenance,
+    nvidia_smi_gpu_mode_snapshot,
+)
 
 
 ARMS = ("native_strided", "boundary_copy", "packed_control")
@@ -178,17 +206,31 @@ def _capture_case(
         source_input, residual_values, weight, epsilon
     )
     expected_residual_bf16 = expected_residual_fp32.to(torch.bfloat16)
-    for name in ARMS:
-        inputs[name].copy_(source_input)
-    native_residual.copy_(residual_values)
-    packed_residual.copy_(residual_values)
-    boundary_source.copy_(residual_values)
-    boundary_residual.fill_(0)
-    native_padding.fill_(-7.0)
-    boundary_padding.fill_(-7.0)
-    for name in ARMS:
-        graphs[name].replay()
+
+    def reset() -> None:
+        """Restore every arm's inputs: the collective updates the residual
+        buffers in place, so each replay otherwise starts from the previous
+        replay's residual."""
+        for name in ARMS:
+            inputs[name].copy_(source_input)
+        native_residual.copy_(residual_values)
+        packed_residual.copy_(residual_values)
+        boundary_source.copy_(residual_values)
+        boundary_residual.fill_(0)
+        native_padding.fill_(-7.0)
+        boundary_padding.fill_(-7.0)
+        torch.cuda.synchronize(device)
+
+    def replay(name: str) -> None:
+        # CUDAGraph.replay launches on the current stream: select the arm's
+        # stream so the synchronize below waits for the replayed work.
+        with torch.cuda.stream(streams[name]):
+            graphs[name].replay()
         streams[name].synchronize()
+
+    reset()
+    for name in ARMS:
+        replay(name)
 
     correctness = {
         name: {
@@ -212,11 +254,15 @@ def _capture_case(
         torch.count_nonzero(boundary_padding != -7.0).item()
     )
 
+    validated_outputs = {name: outputs[name].clone() for name in ARMS}
+    validated_residuals = {name: residuals[name].clone() for name in ARMS}
+
     allocation_deltas = {}
     for name in ARMS:
         before = torch.cuda.memory_allocated(device)
-        for _ in range(3):
-            graphs[name].replay()
+        with torch.cuda.stream(streams[name]):
+            for _ in range(3):
+                graphs[name].replay()
         streams[name].synchronize()
         allocation_deltas[name] = torch.cuda.memory_allocated(device) - before
 
@@ -229,6 +275,10 @@ def _capture_case(
         "boundary_source": boundary_source,
         "native_padding": native_padding,
         "boundary_padding": boundary_padding,
+        "reset": reset,
+        "replay": replay,
+        "validated_outputs": validated_outputs,
+        "validated_residuals": validated_residuals,
     }
     result = {
         "rows": rows,
@@ -248,10 +298,17 @@ def _measure(
     samples: int,
     iterations: int,
     warmups: int,
+    reset,
 ) -> dict[str, list[float]]:
+    """Slowest-rank replay times (us per replay) per arm and sample. Every
+    replay loop runs on the arm's stream (``CUDAGraph.replay`` launches on
+    the current stream) so the stream synchronize bounds the device work.
+    ``reset`` restores the validated inputs before the warm-up replays."""
+    reset()
     for name in ARMS:
-        for _ in range(warmups):
-            graphs[name].replay()
+        with torch.cuda.stream(streams[name]):
+            for _ in range(warmups):
+                graphs[name].replay()
         streams[name].synchronize()
 
     raw = {name: [] for name in ARMS}
@@ -262,8 +319,9 @@ def _measure(
         for name in order:
             dist.barrier()
             started = time.perf_counter()
-            for _ in range(iterations):
-                graphs[name].replay()
+            with torch.cuda.stream(streams[name]):
+                for _ in range(iterations):
+                    graphs[name].replay()
             streams[name].synchronize()
             elapsed_us = (time.perf_counter() - started) * 1e6 / iterations
             slowest = torch.tensor(elapsed_us, dtype=torch.float64, device=device)
@@ -292,9 +350,10 @@ def _worker(
         rank=rank,
         world_size=world_size,
     )
+    provenance = benchmark_provenance(None, device) if rank == 0 else None
     cases = []
     local_correctness = []
-    for case_index, row_count in enumerate(rows):
+    for row_count in rows:
         maximum_bytes = row_count * hidden_size * torch.bfloat16.itemsize
         channel_ids = tuple(f"graph:layout:{row_count}:{name}" for name in ARMS)
         pool = PCIeOneshotAllReducePool.from_process_group(
@@ -314,17 +373,46 @@ def _worker(
                 device,
                 1e-6,
             )
+            # The transport plan, and with it the compiled kernel, depends
+            # on the row count, so every case compiles during its capture;
+            # resolution is frozen only around the timed replays, which
+            # must not compile.
+            b12x.freeze_kernel_resolution("fused residual layout benchmark")
+            try:
+                raw = _measure(
+                    graphs,
+                    metadata["streams"],
+                    device,
+                    samples,
+                    iterations,
+                    warmups,
+                    metadata["reset"],
+                )
+            finally:
+                b12x.unfreeze_kernel_resolution()
+            # Repeated-replay state: from the restored inputs every arm must
+            # reproduce its validated outputs bitwise after the timed replays.
+            metadata["reset"]()
+            for name in ARMS:
+                metadata["replay"](name)
+            case["correctness"]["after_timing"] = {
+                name: {
+                    "output_bitwise_equal": bool(
+                        torch.equal(
+                            metadata["outputs"][name],
+                            metadata["validated_outputs"][name],
+                        )
+                    ),
+                    "residual_bitwise_equal": bool(
+                        torch.equal(
+                            metadata["residuals"][name],
+                            metadata["validated_residuals"][name],
+                        )
+                    ),
+                }
+                for name in ARMS
+            }
             local_correctness.append(case["correctness"])
-            if case_index == 0:
-                b12x.freeze_kernel_resolution("fused residual layout benchmark")
-            raw = _measure(
-                graphs,
-                metadata["streams"],
-                device,
-                samples,
-                iterations,
-                warmups,
-            )
             if rank == 0:
                 case["raw_slowest_rank_us"] = raw
                 case["summary_slowest_rank_us"] = {
@@ -351,16 +439,27 @@ def _worker(
     gathered_correctness: list[Any] = [None] * world_size
     dist.all_gather_object(gathered_correctness, local_correctness)
     if rank == 0:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-        ).stdout.strip()
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "semantic_role": "TP8 fused all-reduce RMSNorm residual-layout comparison",
-            "b12x_commit": revision,
+            "status": "measured",
+            "provenance": provenance,
+            "b12x_commit": provenance["source"]["commit"],
+            "comparison": {
+                "baseline": "packed_control",
+                "metric": "summary_slowest_rank_us.median",
+                "direction": (
+                    "ratios are arm / baseline of the slowest rank's median "
+                    "replay time; lower is better"
+                ),
+            },
+            "correctness_state": (
+                "every arm replayed once from the validated inputs before "
+                "timing (metrics under cases[].correctness) and reproduced "
+                "its outputs bitwise after the timed replays "
+                "(cases[].correctness.after_timing)"
+            ),
             "world_size": world_size,
             "hidden_size": hidden_size,
             "dtype": "torch.bfloat16",
@@ -368,7 +467,7 @@ def _worker(
             "samples": samples,
             "iterations_per_sample": iterations,
             "warmups_per_arm": warmups,
-            "kernel_resolution_frozen": b12x.kernel_resolution_frozen(),
+            "kernel_resolution_frozen_during_timing": True,
             "transport_environment": {
                 name: os.environ.get(name)
                 for name in (

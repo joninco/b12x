@@ -8,12 +8,19 @@ sort runs once per indexer layer, so its kernel time bounds what a side
 stream has to hide.
 
 For every (rows, seq_len, max_positions) case the sort is captured alone in
-a CUDA graph and replayed; the time is the mean of CUDA-event timings around
+a CUDA graph, its replay is checked against ``sort_convert_reference``
+(correctness precedes timing; a mismatch aborts the run), and the graph is
+replayed ``--iters`` times: the time is the mean of CUDA-event timings around
 the replay, and the kernel's own GPU time comes from the profiler. The
 selection is rebuilt before every replay (a sorted row would otherwise be
 re-sorted as if its slots were positions). ``max_positions`` is the compile
 key (bitmap words); the row's own length decides how many bitmap words are
-cleared and scanned.
+cleared and scanned. There is no baseline arm: the kernel time is absolute
+(lower is better).
+
+The JSON output records the command, the source revision and worktree
+state, the physical GPU and its operating mode before and after the timed
+work, the correctness state, and the raw per-replay timings of every case.
 
 Usage:
   python benchmarks/benchmark_topk_sort.py [--rows 4,8,16]
@@ -25,9 +32,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 
 import torch
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 
 def _case(rows: int, topk: int, seq_len: int, block_size: int, device, seed: int):
@@ -59,8 +69,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     from b12x.attention import topk_sort
+    from benchmarks.common import benchmark_provenance, nvidia_smi_gpu_mode_snapshot
 
     device = torch.device("cuda")
+    provenance = benchmark_provenance(argv, device)
     records = []
     for max_positions in (int(x) for x in args.max_positions.split(",")):
         topk_sort.precompile(max_positions, device)
@@ -116,7 +128,9 @@ def main(argv=None) -> int:
                     "seq_len": seq_len,
                     "max_positions": max_positions,
                     "topk": args.topk,
+                    "correctness": "graph replay equals sort_convert_reference",
                     "replay_us_mean": replay_us,
+                    "replay_us_samples": times,
                     "kernel_us_mean": kernel_us[0] if kernel_us else None,
                 }
                 records.append(record)
@@ -127,10 +141,22 @@ def main(argv=None) -> int:
                 )
                 del graph
     if args.json:
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
         with open(args.json, "w") as fh:
             json.dump(
                 {
                     "semantic_role": "topk_sort kernel time per launch at decode row counts",
+                    "status": "measured",
+                    "provenance": provenance,
+                    "args": vars(args),
+                    "correctness_state": (
+                        "every case's graph replay matched sort_convert_reference "
+                        "before it was timed"
+                    ),
+                    "comparison": {
+                        "baseline": None,
+                        "direction": "absolute kernel time per launch; lower is better",
+                    },
                     "device": torch.cuda.get_device_name(device),
                     "records": records,
                 },

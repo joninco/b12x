@@ -26,9 +26,23 @@ every replay unless ``--warm``):
                 attribute (staging overlaps the spin)
 
 "after spin" is the replay time minus the spin kernel's GPU time: the time
-the projection adds to the step. The acceptance condition recorded for the
-production port is ``wf-pdl`` after-spin time at 4 rows at most half the
-``cublas`` after-spin time for the ``router_shared`` shape.
+the projection adds to the step. ``cublas`` is the baseline; the ratio
+reported per variant is ``after_spin_us(variant) / after_spin_us(cublas)``
+and lower is better. The acceptance condition for the GLM-5.3-NVFP4 serving
+launch (tensor parallel 8 over PCIe on RTX PRO 6000 Blackwell Max-Q, where
+each rank's router gate plus shared-expert gate_up projection is the
+``router_shared`` shape ``[768, 6144]``) is that at 4 rows the ``wf-pdl``
+ratio is at most 0.5.
+
+Correctness precedes timing: every captured graph is replayed once and its
+output checked against the fp32 product before it is timed. The check
+rejects non-finite values and any element outside the BF16 bound
+``|y - ref| <= |ref| * 2^-8 + (|x| @ |w|^T) * K * 2^-24 + 1e-6`` (one BF16
+ulp plus fp32 accumulation noise); a failure aborts the run. The JSON
+output records the command, the source revision and worktree state, the
+physical GPU and its operating mode before and after the timed work, the
+validation result and raw per-replay timings of every variant, and the
+ratios against ``cublas``.
 
 Usage:
   python benchmarks/benchmark_weight_first_gemv_pdl.py [--shapes router_shared,q_b]
@@ -40,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 
 import cutlass
@@ -58,6 +73,42 @@ from b12x.gemm.weight_first_gemv._kernel import (
     compile_weight_first_gemv,
     smem_bytes,
 )
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from benchmarks.common import (  # noqa: E402
+    benchmark_provenance,
+    nvidia_smi_gpu_mode_snapshot,
+)
+
+#: Elementwise BF16 acceptance bound against the fp32 product: one BF16 ulp
+#: of the reference plus the fp32 accumulation noise of a K-term sum.
+BF16_ERROR_BOUND = "|y - ref| <= |ref| * 2^-8 + (|x| @ |w|^T) * K * 2^-24 + 1e-6"
+
+
+def validate_output(
+    y: torch.Tensor, ref32: torch.Tensor, mass: torch.Tensor, k: int
+) -> dict:
+    """Check ``y`` against the fp32 product under ``BF16_ERROR_BOUND``;
+    returns the validation record (``status`` is ``pass`` or the reason)."""
+    y32 = y.float()
+    finite = bool(torch.isfinite(y32).all().item())
+    err = (y32 - ref32).abs()
+    tol = ref32.abs() * 2.0**-8 + mass * k * 2.0**-24 + 1e-6
+    within = bool((err <= tol).all().item()) if finite else False
+    record = {
+        "bound": BF16_ERROR_BOUND,
+        "finite": finite,
+        "max_abs_err": float(err.max().item()) if finite else None,
+        "max_err_over_bound": float((err / tol).max().item()) if finite else None,
+    }
+    if not finite:
+        record["status"] = "non-finite output"
+    elif not within:
+        record["status"] = "output outside the BF16 bound"
+    else:
+        record["status"] = "pass"
+    return record
+
 
 SHAPES = {  # name: (N, K)
     "router": (256, 6144),
@@ -161,6 +212,7 @@ def main(argv=None) -> int:
         print("CUDA is required", file=sys.stderr)
         return 2
     dev = torch.device("cuda")
+    provenance = benchmark_provenance(argv, dev)
     torch.manual_seed(0)
     spin = compile_spin()
     flush_buf = torch.ones(192 << 20, dtype=torch.uint8, device=dev)
@@ -196,12 +248,9 @@ def main(argv=None) -> int:
             if "reduce_kernel" in ev.key and "ReduceOp" in ev.key:
                 continue  # the L2 flush
             times[ev.key] = (ev.count / iters, ev.device_time_total / iters)
-        total = (
-            sum(s.elapsed_time(e) for s, e in zip(starts, ends, strict=False))
-            * 1000
-            / iters
-        )
-        return times, total
+        samples = [s.elapsed_time(e) * 1000 for s, e in zip(starts, ends, strict=False)]
+        total = sum(samples) / iters
+        return times, total, samples
 
     def part(times, *subs):
         return sum(t for key, (_, t) in times.items() if any(s in key for s in subs))
@@ -219,6 +268,7 @@ def main(argv=None) -> int:
         for m in rows_list:
             x = (torch.randn(m, k, device=dev) * 0.5).to(torch.bfloat16)
             ref32 = torch.nn.functional.linear(x.float(), w.float())
+            mass = torch.nn.functional.linear(x.float().abs(), w.float().abs())
             ref = torch.nn.functional.linear(x, w)
             err_cublas = (ref.float() - ref32).abs().max().item()
             for nt, kt in bricks:
@@ -259,6 +309,7 @@ def main(argv=None) -> int:
                             )
                     return graph
 
+                group = []
                 for variant in variants:
                     if variant == "cublas" and (nt, kt) != bricks[0]:
                         continue
@@ -267,11 +318,30 @@ def main(argv=None) -> int:
                         flush_l2()
                         graph.replay()
                     torch.cuda.synchronize()
+                    # Correctness precedes timing: one checked replay on a
+                    # cleared output before the timed replays.
                     y.zero_()
-                    times, total = measure(graph, args.iters, do_flush=not args.warm)
                     graph.replay()
                     torch.cuda.synchronize()
-                    err = (y.float() - ref32).abs().max().item()
+                    validation = validate_output(y, ref32, mass, k)
+                    if validation["status"] != "pass":
+                        raise SystemExit(
+                            f"{name} M={m} brick {nt}x{kt} {variant}: "
+                            f"{validation['status']} ({validation})"
+                        )
+                    y.zero_()
+                    times, total, samples = measure(
+                        graph, args.iters, do_flush=not args.warm
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    after_timing = validate_output(y, ref32, mass, k)
+                    if after_timing["status"] != "pass":
+                        raise SystemExit(
+                            f"{name} M={m} brick {nt}x{kt} {variant} after timing: "
+                            f"{after_timing['status']} ({after_timing})"
+                        )
+                    err = validation["max_abs_err"]
                     gemm_us = part(
                         times,
                         "nvjet",
@@ -288,33 +358,88 @@ def main(argv=None) -> int:
                         f"{total:6.1f} us  after spin {after:5.1f}  (max abs err {err:.4f})",
                         flush=True,
                     )
-                    records.append(
-                        {
-                            "shape": name,
-                            "n": n,
-                            "k": k,
-                            "rows": m,
-                            "brick": f"{nt}x{kt}",
-                            "variant": variant,
-                            "depth": args.depth,
-                            "spin_us": args.spin_us,
-                            "spin_ctas": args.spin_ctas,
-                            "gemm_us": gemm_us,
-                            "spin_kernel_us": spin_us,
-                            "replay_us": total,
-                            "after_spin_us": after,
-                            "max_abs_err": err,
-                            "kernels": {
-                                key: {"count": c, "us": t}
-                                for key, (c, t) in times.items()
-                            },
-                        }
-                    )
+                    record = {
+                        "shape": name,
+                        "n": n,
+                        "k": k,
+                        "rows": m,
+                        "brick": f"{nt}x{kt}",
+                        "variant": variant,
+                        "depth": args.depth,
+                        "spin_us": args.spin_us,
+                        "spin_ctas": args.spin_ctas,
+                        "gemm_us": gemm_us,
+                        "spin_kernel_us": spin_us,
+                        "replay_us": total,
+                        "replay_us_samples": samples,
+                        "after_spin_us": after,
+                        "max_abs_err": err,
+                        "validation": validation,
+                        "validation_after_timing": after_timing,
+                        "kernels": {
+                            key: {"count": c, "us": t} for key, (c, t) in times.items()
+                        },
+                    }
+                    records.append(record)
+                    group.append(record)
                     del graph
+                # Ratios against the cuBLAS baseline of the same shape and
+                # row count (measured with the first brick).
+                baseline = next(
+                    (
+                        r
+                        for r in records
+                        if r["shape"] == name
+                        and r["rows"] == m
+                        and r["variant"] == "cublas"
+                    ),
+                    None,
+                )
+                for record in group:
+                    record["after_spin_ratio_vs_cublas"] = (
+                        None
+                        if baseline is None or baseline["after_spin_us"] <= 0
+                        else record["after_spin_us"] / baseline["after_spin_us"]
+                    )
+                    if record["variant"] == "wf-pdl" and baseline is not None:
+                        ratio = record["after_spin_ratio_vs_cublas"]
+                        print(
+                            f"  wf-pdl / cublas after-spin ratio at M={m}: "
+                            f"{ratio:.3f} (acceptance for router_shared at 4 rows: "
+                            f"<= 0.5)",
+                            flush=True,
+                        )
             torch.cuda.empty_cache()
     if args.json:
+        provenance["gpu_mode_after"] = nvidia_smi_gpu_mode_snapshot()
         with open(args.json, "w", encoding="utf-8") as fh:
-            json.dump({"args": vars(args), "records": records}, fh, indent=2)
+            json.dump(
+                {
+                    "semantic_role": (
+                        "exposed time of a decode projection behind an HBM-idle "
+                        "kernel with programmatic dependent launch"
+                    ),
+                    "status": "measured",
+                    "provenance": provenance,
+                    "args": vars(args),
+                    "correctness_state": (
+                        "every variant's graph replay passed the BF16 bound "
+                        "before and after its timed replays"
+                    ),
+                    "comparison": {
+                        "baseline": "cublas",
+                        "metric": "after_spin_us",
+                        "direction": (
+                            "after_spin_ratio_vs_cublas = variant / cublas; "
+                            "lower is better; acceptance: wf-pdl <= 0.5 at 4 rows "
+                            "for router_shared"
+                        ),
+                    },
+                    "records": records,
+                },
+                fh,
+                indent=2,
+            )
     return 0
 
 
