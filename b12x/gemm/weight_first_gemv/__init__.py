@@ -49,6 +49,7 @@ META = OpMeta(
         "is_disabled",
         "MAX_ROWS",
         "DEFAULT_STAGE_DEPTH",
+        "STAGE_DEPTHS",
     ),
     dtypes=("bf16",),
     # First revision of the op (CuTe DSL kernel, opaque custom op and
@@ -66,6 +67,7 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         DEFAULT_STAGE_DEPTH,
         MAX_ROWS,
+        STAGE_DEPTHS,
         WeightFirstProjection,
         brick_for,
         is_disabled,

@@ -70,6 +70,12 @@ _WARPS = _THREADS // 32
 #: Largest row count the kernel serves; larger inputs use cuBLAS inside the op.
 MAX_ROWS = 16
 
+#: Staging depths the kernel honors: ``cp.async`` groups left in flight per
+#: CTA while a brick is staged (the ``cp_async_wait_group`` chain of the
+#: brick staging loop); 0 issues the whole brick at once. Any other value would
+#: fall through that chain and stage unbounded, so callers reject it.
+STAGE_DEPTHS = frozenset({0, 1, 2, 3, 4, 6, 8})
+
 #: Brick shapes the kernel is compiled for (rows, columns).
 BRICKS: Tuple[Tuple[int, int], ...] = ((48, 768), (32, 768), (64, 512), (128, 256))
 
@@ -580,6 +586,11 @@ def weight_first_gemv(
     Every other shape, and a shape whose kernel is not compiled while a
     stream is capturing, falls back to cuBLAS inside the op.
     """
+    if int(depth) not in STAGE_DEPTHS:
+        raise ValueError(
+            f"stage depth {depth} is not honored by the kernel; use 0 "
+            f"(unbounded) or one of {sorted(STAGE_DEPTHS - {0})}"
+        )
     if not _kernel_applies(x, weight, nt, kt):
         return _cublas_split(x, weight, n0)
     if not x.is_contiguous() or x.data_ptr() % 16 != 0:

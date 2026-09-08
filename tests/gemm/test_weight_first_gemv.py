@@ -341,6 +341,28 @@ def test_graph_capture_replay_without_allocation():
 
 
 @cuda_required
+def test_rejects_stage_depths_the_kernel_does_not_honor():
+    """Only the depths of the kernel's wait-group chain (and 0, unbounded)
+    are accepted, at construction and at the raw op."""
+    api = _api()
+    device = _supported_device()
+    (w,) = _random_weights((320,), 6144, device)
+    assert sorted(api.STAGE_DEPTHS) == [0, 1, 2, 3, 4, 6, 8]
+    assert api.DEFAULT_STAGE_DEPTH in api.STAGE_DEPTHS
+    for depth in sorted(api.STAGE_DEPTHS):
+        assert api.WeightFirstProjection([w], depth=depth).depth == depth
+    for depth in (-1, 5, 7, 12):
+        with pytest.raises(ValueError, match="stage depth"):
+            api.WeightFirstProjection([w], depth=depth)
+    proj = api.WeightFirstProjection([w])
+    x = _random_x(2, 6144, device)
+    with pytest.raises(ValueError, match="stage depth"):
+        torch.ops.b12x.weight_first_gemv(
+            x, proj.weight, proj.partial, proj.counters, 320, proj.nt, proj.kt, 5, False
+        )
+
+
+@cuda_required
 def test_direct_op_single_weight_and_zero_second_output():
     api = _api()
     device = _supported_device()

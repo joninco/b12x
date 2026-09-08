@@ -8,7 +8,7 @@ import torch
 
 from ..._lib.gating import default_is_supported
 from . import META
-from ._kernel import BRICKS, MAX_ROWS, brick_for  # noqa: F401
+from ._kernel import BRICKS, MAX_ROWS, STAGE_DEPTHS, brick_for  # noqa: F401
 from ._kernel import compile_weight_first_gemv, get_cached_weight_first_gemv
 from ._kernel import weight_first_gemv  # noqa: F401  (registers the op; alias)
 
@@ -178,6 +178,11 @@ class WeightFirstProjection:
             (self.n + self.nt - 1) // self.nt, dtype=torch.int32, device=self.device
         )
         self.depth = DEFAULT_STAGE_DEPTH if depth is None else int(depth)
+        if self.depth not in STAGE_DEPTHS:
+            raise ValueError(
+                f"stage depth {self.depth} is not honored by the kernel; use 0 "
+                f"(unbounded) or one of {sorted(STAGE_DEPTHS - {0})}"
+            )
         self.pdl = bool(pdl)
         if precompile_kernel:
             precompile(self.n, self.k, self.device)
@@ -224,5 +229,6 @@ __all__ = [
     "is_disabled",
     "MAX_ROWS",
     "DEFAULT_STAGE_DEPTH",
+    "STAGE_DEPTHS",
     "BRICKS",
 ]
