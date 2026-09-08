@@ -930,6 +930,42 @@ def test_fused_add_rms_norm_rejects_noncontiguous_rows():
         )
 
 
+def test_fused_add_rms_norm_requires_dense_output_rows():
+    """The kernel writes the output at (row * hidden_packs + column): a
+    permuted layout that covers its storage, or a wider row stride, is
+    refused for ``out`` while the residual output keeps its row stride."""
+    runtime = _make_runtime(eager=True)
+    inp = torch.ones((4, 8), dtype=torch.bfloat16)
+    weight = torch.ones(8, dtype=torch.bfloat16)
+    permuted = torch.empty((8, 4), dtype=torch.bfloat16).t()
+    assert permuted.shape == inp.shape and permuted.stride() == (1, 4)
+    with pytest.raises(ValueError, match="output tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp, torch.zeros_like(inp), weight, 1e-6, out=permuted
+        )
+    wide = torch.empty((4, 16), dtype=torch.bfloat16)[:, :8]
+    with pytest.raises(ValueError, match="output tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp, torch.zeros_like(inp), weight, 1e-6, out=wide
+        )
+    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp, torch.zeros_like(inp), weight, 1e-6, residual_out=wide
+    )
+    assert out.is_contiguous() and residual_out.data_ptr() == wide.data_ptr()
+
+
+def test_fused_add_rms_norm_requires_dense_input_rows():
+    runtime = _make_runtime(eager=True)
+    permuted = torch.ones((8, 4), dtype=torch.bfloat16).t()
+    with pytest.raises(ValueError, match="input tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            permuted,
+            torch.zeros((4, 8), dtype=torch.bfloat16),
+            torch.ones(8, dtype=torch.bfloat16),
+            1e-6,
+        )
+
+
 def test_fused_add_rms_norm_requires_pack_aligned_rows():
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)

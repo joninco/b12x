@@ -212,8 +212,9 @@ def _eager_payload_shards(
     """Return the fixed-size shards of the payload region in each eager slot.
 
     Topology transports reserve one source shard per rank. The scatter-gather
-    transport keeps the staging shard, the scatter region and the two-input
-    fp32 gather region, ``_SCATTER_GATHER_SLOT_MULTIPLIER`` shards in total.
+    transport stages the input in the scatter shard and follows it with the
+    two-input fp32 gather region, ``_SCATTER_GATHER_SLOT_MULTIPLIER`` shards
+    in total.
     """
 
     if _uses_sharded_eager_storage(world_size, transport_policy):
@@ -3313,8 +3314,14 @@ class PCIeOneshotAllReduce:
                 )
             if tensor.shape != inp.shape or tensor.dtype != inp.dtype:
                 raise ValueError(f"{name} tensor must match input shape and dtype")
-        if not _is_weak_contiguous(out):
-            raise ValueError("output tensor must be weak-contiguous")
+        # The kernel stages the input and writes the normalized output at
+        # (row * hidden_packs + column) * 16 bytes, so both need dense
+        # pack-aligned rows; only the residual tensors carry a row stride.
+        dense_row_packs = int(hidden_size) * inp.element_size() // 16
+        if _fused_row_stride_packs(inp) != dense_row_packs:
+            raise ValueError("input tensor must have dense pack-aligned rows")
+        if _fused_row_stride_packs(out) != dense_row_packs:
+            raise ValueError("output tensor must have dense pack-aligned rows")
         if _fused_row_stride_packs(residual_out) is None:
             raise ValueError(
                 "residual output tensor must have pack-aligned contiguous rows"
