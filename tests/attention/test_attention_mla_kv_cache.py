@@ -513,6 +513,98 @@ def test_writer_records_feed_production_head_multisplit_decode(
 
 
 @pytest.mark.parametrize(
+    "rows,heads,high_page_ids",
+    [(1, 8, False), (4, 32, False), (16, 32, False), (4, 32, True)],
+)
+@torch.inference_mode()
+def test_nvfp4_decode_natural_lse_matches_quantized_records(
+    rows: int, heads: int, high_page_ids: bool
+) -> None:
+    """DCP's 32-head partials must carry the LSE of their quantized KV rows."""
+    device = require_b12x()
+    topk = 129
+    q, compact_cache, indices = _make_written_reader_case(
+        rows=rows, topk=topk, seed=4103, device=device
+    )
+    q = q[:, :heads].contiguous()
+    lengths = torch.tensor(
+        ([1, 3, 64, topk] * 4)[:rows], dtype=torch.int32, device=device
+    )
+    cache = compact_cache
+    physical_indices = torch.full((rows, 2048), -1, dtype=torch.int32, device=device)
+    physical_indices[:, :topk].copy_(indices)
+    if high_page_ids:
+        # A small live tail crosses the signed 32-bit byte-offset boundary.
+        page_base = (1 << 31) // (_PAGE_SIZE * _RECORD_BYTES) + 1
+        cache = torch.empty(
+            (page_base + compact_cache.shape[0], _PAGE_SIZE, _RECORD_BYTES),
+            dtype=torch.uint8,
+            device=device,
+        )
+        cache[page_base:].copy_(compact_cache)
+        physical_indices[:, :topk] += page_base * _PAGE_SIZE
+    sm_scale = 192**-0.5
+    plan = sparse_mla.plan(
+        sparse_mla.Caps(
+            device=device,
+            num_q_heads=heads,
+            max_q_rows=16,
+            max_batch=16,
+            max_width=2048,
+            max_chunks_per_row=32,
+            page_size=_PAGE_SIZE,
+            softmax_scale=sm_scale,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            scale_format=ScaleFormat.NVFP4_E4M3,
+            fp8_rope=True,
+            return_lse=True,
+            lse_scale="natural",
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    storage = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+    binding = sparse_mla.bind(
+        plan,
+        scratch=storage,
+        q=q,
+        kv_cache=cache,
+        selected_indices=physical_indices,
+        cache_lengths=torch.full_like(lengths, topk),
+        selected_lengths=lengths,
+    )
+    output, lse = sparse_mla.run(binding)
+    eager_output, eager_lse = output.clone(), lse.clone()
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        sparse_mla.run(binding)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output, lse = sparse_mla.run(binding)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize(device)
+
+    nope, _, rope, _ = _dequantize_records(compact_cache.reshape(-1, _RECORD_BYTES))
+    keys = torch.cat((nope, rope), dim=-1).double()
+    expected_output, expected_lse = [], []
+    for row, length in enumerate(lengths.cpu().tolist()):
+        selected = indices[row, :length].long()
+        scores = q[row].double() @ keys.index_select(0, selected).T * sm_scale
+        expected_lse.append(torch.logsumexp(scores, dim=-1))
+        expected_output.append(
+            torch.softmax(scores, dim=-1) @ nope.index_select(0, selected).double()
+        )
+    expected_output = torch.stack(expected_output).float()
+    expected_lse = torch.stack(expected_lse).float()
+    for actual_output, actual_lse in ((eager_output, eager_lse), (output, lse)):
+        _assert_reader_matches_dequantized_records(actual_output, expected_output)
+        torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.parametrize(
     "per_token_scale",
     [False, True],
     ids=["static", "dynamic-token"],
