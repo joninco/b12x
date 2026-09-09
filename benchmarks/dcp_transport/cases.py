@@ -71,6 +71,8 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     query = local.query.to(device)
     partial, lse = local.partial.to(device), local.lse.to(device)
     output = torch.empty((rows, 8, 512), dtype=torch.bfloat16, device=device)
+    details = {}
+    query_name, pair_name = kind + "_query", kind + "_pair"
     if kind == "b12x":
         pool = _pool(group, device)
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
@@ -91,13 +93,61 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
             DirectDCPQGatherWorkspace,
         )
 
-        q_workspace = DirectDCPQGatherWorkspace(gpu_group, device, 16, 8, 576)
+        from torch._C._autograd import DeviceType
+        from torch._C._distributed_c10d import _SymmetricMemory
+
+        multicast = _SymmetricMemory.has_multicast_support(
+            DeviceType.CUDA, device.index
+        )
+        if multicast:
+            q_workspace = DirectDCPQGatherWorkspace(gpu_group, device, 16, 8, 576)
+            gathered = q_workspace.final_query[0, :rows]
+            q_signal = q_workspace.received_signal[0]
+            q_completion = q_workspace.completion[0]
+            q_epoch = q_workspace.epoch[:1]
+            q_multicast, signal_multicast = q_workspace.multicast_ptrs[0]
+
+            def gather():
+                torch.ops._C.direct_dcp_q_gather(
+                    query,
+                    gathered,
+                    q_signal,
+                    q_completion,
+                    q_epoch,
+                    4,
+                    rank,
+                    16,
+                    32,
+                    q_multicast,
+                    signal_multicast,
+                )
+        else:
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+            q_workspace = PyNcclCommunicator(group, device)
+            if q_workspace.disabled:
+                raise RuntimeError("The query all-gather baseline requires PyNccl")
+            rank_major = torch.empty(
+                (4, rows, 8, 576), dtype=query.dtype, device=device
+            )
+            gathered = torch.empty((rows, 32, 576), dtype=query.dtype, device=device)
+            destination = gathered.view(rows, 4, 8, 576)
+            source = rank_major.movedim(0, 1)
+
+            def gather():
+                q_workspace.all_gather(rank_major, query)
+                # Same rank-major-to-head-major copy as GroupCoordinator's
+                # dimension-1 all-gather, with its destination preallocated.
+                destination.copy_(source)
+
+            query_name = "nccl_query"
+            pair_name = "nccl_query_native_combine"
+            details = {
+                "compiled_query_status": "unsupported",
+                "compiled_query_reason": "NVLS symmetric-memory multicast unavailable",
+                "query_transport": "PyNccl all-gather and rank-to-head layout copy",
+            }
         o_workspace = DirectDCPA2AWorkspace(gpu_group, device, 16, 8, 512)
-        gathered = q_workspace.final_query[0, :rows]
-        q_signal = q_workspace.received_signal[0]
-        q_completion = q_workspace.completion[0]
-        q_epoch = q_workspace.epoch[:1]
-        q_multicast, signal_multicast = q_workspace.multicast_ptrs[0]
         o_args = (
             o_workspace.peer_output_ptrs[0],
             o_workspace.peer_lse_ptrs[0],
@@ -113,21 +163,6 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
         if rows > 1:
             local_lengths[1] = 0
         query_starts = torch.arange(rows + 1, dtype=torch.int32, device=device)
-
-        def gather():
-            torch.ops._C.direct_dcp_q_gather(
-                query,
-                gathered,
-                q_signal,
-                q_completion,
-                q_epoch,
-                4,
-                rank,
-                16,
-                32,
-                q_multicast,
-                signal_multicast,
-            )
 
         def combine():
             # Invoke the compiled operation with caller-owned output. The
@@ -157,7 +192,15 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     # Resources are closed by the final case after all three serial captures
     # and their replays finish; every closure retains its input tensors.
     return [
-        Case(kind + "_query", "query", gather, (gathered,), (expected_query,), capture),
+        Case(
+            query_name,
+            "query",
+            gather,
+            (gathered,),
+            (expected_query,),
+            capture,
+            details=details,
+        ),
         Case(
             kind + "_combine",
             "combine",
@@ -167,13 +210,14 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
             capture,
         ),
         Case(
-            kind + "_pair",
+            pair_name,
             "pair",
             pair,
             (gathered, output),
             (expected_query, expected_output),
             capture,
             resources,
+            details,
         ),
     ]
 
