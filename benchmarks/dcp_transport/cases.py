@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
+from functools import partial as bind_arguments
 from typing import Callable
 
 import torch
@@ -29,6 +30,7 @@ class Case:
     capture: Callable = nullcontext
     resources: list = field(default_factory=list)
     details: dict = field(default_factory=dict)
+    refresh: Callable | None = None
 
     def check(self):
         for actual, expected in zip(self.outputs, self.expected, strict=True):
@@ -49,7 +51,7 @@ class Case:
                 close()
 
 
-def _pool(group, device, *, heads=32, dim=512, query_dim=576):
+def _pool(group, device, *, heads=32, dim=512, query_dim=576, channels=("benchmark",)):
     pool = PCIeDCPA2APool.from_process_group(
         process_group=group,
         device=device,
@@ -58,9 +60,10 @@ def _pool(group, device, *, heads=32, dim=512, query_dim=576):
         head_dim=dim,
         query_head_dim=query_dim,
     )
-    pool.prepare_channels(("benchmark",))
-    pool.prepare_graph_all_gather_heads(channel_id="benchmark")
-    pool.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, channel_id="benchmark")
+    pool.prepare_channels(channels)
+    for channel in channels:
+        pool.prepare_graph_all_gather_heads(channel_id=channel)
+        pool.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, channel_id=channel)
     return pool
 
 
@@ -74,17 +77,18 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     details = {}
     query_name, pair_name = kind + "_query", kind + "_pair"
     if kind == "b12x":
-        pool = _pool(group, device)
+        pool = _pool(group, device, channels=("query", "combine", "pair"))
+        active_channel = "query"
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
 
         def gather():
-            pool.all_gather_heads(query, gathered, channel_id="benchmark")
+            pool.all_gather_heads(query, gathered, channel_id=active_channel)
 
         def combine():
-            pool.lse_reduce_scatter(partial, lse, output, channel_id="benchmark")
+            pool.lse_reduce_scatter(partial, lse, output, channel_id=active_channel)
 
         def capture():
-            return pool.capture(channel_id="benchmark")
+            return pool.capture(channel_id=active_channel)
 
         resources = [pool]
     elif kind == "native":
@@ -189,9 +193,18 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
         gather()
         combine()
 
-    # Resources are closed by the final case after all three serial captures
-    # and their replays finish; every closure retains its input tensors.
-    return [
+    def refresh(seed):
+        values = [rank_inputs(r, rows, seed=seed) for r in range(4)]
+        query.copy_(values[rank].query)
+        partial.copy_(values[rank].partial)
+        lse.copy_(values[rank].lse)
+        q_reference, o_reference, _ = references(values, rank)
+        expected_query.copy_(q_reference)
+        expected_output.copy_(o_reference)
+
+    # Each operation owns a graph channel. The final case owns cleanup after
+    # every graph has finished; closures retain all input tensors until then.
+    cases = [
         Case(
             query_name,
             "query",
@@ -220,6 +233,19 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
             details,
         ),
     ]
+    for case in cases:
+        case.refresh = refresh
+        if kind == "b12x":
+            operation = case.run
+
+            def run_in_channel(operation=operation, channel=case.operation):
+                nonlocal active_channel
+                active_channel = channel
+                operation()
+
+            case.run = run_in_channel
+            case.capture = bind_arguments(pool.capture, channel_id=case.operation)
+    return cases
 
 
 @triton.jit
@@ -243,6 +269,13 @@ def candidate_case(kind, group, device, rows, rank):
     ids, scores = local.local_ids.to(device), local.scores.to(device)
     packed = torch.empty((padded_rows, 2048, 2), device=device)
     output = torch.empty((padded_rows, 2048), dtype=torch.int32, device=device)
+
+    def refresh(seed):
+        values = [rank_inputs(r, padded_rows, seed=seed) for r in range(4)]
+        ids.copy_(values[rank].local_ids)
+        scores.copy_(values[rank].scores)
+        expected.copy_(references(values, rank)[2][:rows])
+
     if kind == "rank_major":
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
@@ -265,6 +298,7 @@ def candidate_case(kind, group, device, rows, rank):
             (expected,),
             resources=[communicator],
             details={"transport": "PyNccl rank-major all-gather"},
+            refresh=refresh,
         )
     if kind != "owner":
         raise ValueError(f"Unknown candidate transport {kind}")
@@ -327,6 +361,7 @@ def candidate_case(kind, group, device, rows, rank):
             "candidate_transport": "peer stores in owner staging",
             "result_transport": "plain peer loads and row-order restoration",
         },
+        refresh,
     )
 
 

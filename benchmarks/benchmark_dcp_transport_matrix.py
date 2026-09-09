@@ -78,11 +78,17 @@ def capture(case, repetitions):
     return graph
 
 
-def validate(case):
+def validate(case, repetitions):
     for _ in range(3):
         case.run()
     torch.cuda.synchronize()
-    graph = capture(case, 1)
+    freeze_kernel_resolution("DCP transport graph capture")
+    try:
+        graph = capture(case, repetitions)
+    finally:
+        unfreeze_kernel_resolution()
+    if case.refresh:
+        case.refresh(1931)
     graph.replay()
     torch.cuda.synchronize()
     initial = [out.clone() for out in case.outputs]
@@ -90,7 +96,10 @@ def validate(case):
     allocated = torch.cuda.memory_allocated()
     errors = []
     bitwise = True
-    for _ in range(30):
+    for replay in range(30):
+        changed = replay == 15 and case.refresh is not None
+        if changed:
+            case.refresh(3911)
         graph.replay()
         torch.cuda.synchronize()
         try:
@@ -98,6 +107,9 @@ def validate(case):
         except AssertionError as error:
             if not errors:
                 errors.append(str(error))
+        if changed:
+            for snapshot, out in zip(initial, case.outputs, strict=True):
+                snapshot.copy_(out)
         bitwise &= all(
             torch.equal(out, before)
             for out, before in zip(case.outputs, initial, strict=True)
@@ -113,7 +125,9 @@ def validate(case):
         "bitwise_output_order_repeatable": bitwise,
         "allocation_delta_bytes": allocation_delta,
         "stable_output_pointers": stable_pointers,
-    }
+        "input_versions_after_capture": 2 if case.refresh else 0,
+        "operations_per_replay": repetitions,
+    }, graph
 
 
 def measure(graph, args):
@@ -247,17 +261,13 @@ def main():
                             "rows": rows,
                             "details": case.details,
                         }
-                        result["correctness"] = all_ranks(validate(case))
+                        validation, graph = validate(case, args.repetitions)
+                        result["correctness"] = all_ranks(validation)
                         passed = all(c["passed"] for c in result["correctness"])
                         failed |= not passed
                         if passed and not args.correctness_only:
-                            freeze_kernel_resolution("DCP transport timing")
-                            try:
-                                graph = capture(case, args.repetitions)
-                                result["timing"] = measure(graph, args)
-                                del graph
-                            finally:
-                                unfreeze_kernel_resolution()
+                            result["timing"] = measure(graph, args)
+                        del graph
                         record["cases"].append(result)
                         write_record(path, record)
                         print(
