@@ -308,48 +308,68 @@ def main():
                         in ("native", "b12x", "opaque_attention", "compiled_attention")
                         else [candidate_case(kind, group, device, rows, rank % 4)]
                     )
-                try:
+                execution_stream = None
+                if kind in (
+                    "opaque_attention",
+                    "compiled_attention",
+                    "pull",
+                    "compiled_pull",
+                ):
+                    execution_stream = torch.cuda.Stream(device=device)
+                    execution_stream.wait_stream(torch.cuda.current_stream())
                     for case in cases:
-                        result = {
-                            "name": case.name,
-                            "operation": case.operation,
-                            "rows": rows,
-                            "details": case.details,
-                            "gpu_before_capture": gpu_state(),
-                        }
-                        validation, graph = validate(case, args.repetitions)
-                        result["correctness"] = all_ranks(validation)
-                        passed = all(c["passed"] for c in result["correctness"])
-                        failed |= not passed
-                        if passed and not args.correctness_only:
-                            result["timing"] = measure(graph, args)
-                        if passed and args.profile_replays:
-                            from benchmarks.dcp_transport.replay_profile import (
-                                profile_replays,
-                            )
-
-                            result["replay_profile"] = profile_replays(
-                                graph, args.output_dir, rank, case.name, rows
-                            )
-                            profile_ok = all(
-                                all_ranks(result["replay_profile"]["passed"])
-                            )
-                            failed |= not profile_ok
-                        del graph
-                        result["gpu_after_replays"] = gpu_state()
-                        record["cases"].append(result)
-                        write_record(path, record)
-                        print(
-                            json.dumps(
-                                {
-                                    "rank": rank,
-                                    "rows": rows,
-                                    "case": case.name,
-                                    "correctness": passed,
-                                }
-                            ),
-                            flush=True,
+                        case.details["separate_construction_and_execution_streams"] = (
+                            True
                         )
+                        case.details["construction_stream_id"] = int(
+                            torch.cuda.current_stream().cuda_stream
+                        )
+                        case.details["execution_stream_id"] = int(
+                            execution_stream.cuda_stream
+                        )
+                try:
+                    with torch.cuda.stream(execution_stream):
+                        for case in cases:
+                            result = {
+                                "name": case.name,
+                                "operation": case.operation,
+                                "rows": rows,
+                                "details": case.details,
+                                "gpu_before_capture": gpu_state(),
+                            }
+                            validation, graph = validate(case, args.repetitions)
+                            result["correctness"] = all_ranks(validation)
+                            passed = all(c["passed"] for c in result["correctness"])
+                            failed |= not passed
+                            if passed and not args.correctness_only:
+                                result["timing"] = measure(graph, args)
+                            if passed and args.profile_replays:
+                                from benchmarks.dcp_transport.replay_profile import (
+                                    profile_replays,
+                                )
+
+                                result["replay_profile"] = profile_replays(
+                                    graph, args.output_dir, rank, case.name, rows
+                                )
+                                profile_ok = all(
+                                    all_ranks(result["replay_profile"]["passed"])
+                                )
+                                failed |= not profile_ok
+                            del graph
+                            result["gpu_after_replays"] = gpu_state()
+                            record["cases"].append(result)
+                            write_record(path, record)
+                            print(
+                                json.dumps(
+                                    {
+                                        "rank": rank,
+                                        "rows": rows,
+                                        "case": case.name,
+                                        "correctness": passed,
+                                    }
+                                ),
+                                flush=True,
+                            )
                 finally:
                     for case in reversed(cases):
                         case.close()

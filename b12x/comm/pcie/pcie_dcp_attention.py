@@ -144,11 +144,11 @@ class PCIeDCPAttention:
         )
         try:
             self._pool.prepare_channels((channel_id,))
-            self._pool.prepare_graph_all_gather_heads(channel_id=channel_id)
-            self._pool.prepare_graph_lse_reduce_scatter(
-                dtype=torch.bfloat16, channel_id=channel_id
-            )
-            runtime = self._pool.for_stream(channel_id=channel_id)
+            # Preparation compiles geometry without assigning an execution
+            # stream. The model-loading stream need not own the captured graph.
+            runtime = self._pool._logical_channels[channel_id]
+            runtime.prepare_graph_all_gather_heads()
+            runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16)
             precompile_local_lse_mask(local_heads * 4, self.device.index)
             self.allocated_bytes = (
                 runtime._staging1_ptrs[runtime.rank]

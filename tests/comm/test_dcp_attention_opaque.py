@@ -1,11 +1,75 @@
 """Opaque attention calls preserve ordering and reject released channel handles."""
 
 from types import SimpleNamespace
+from contextlib import contextmanager
 
 import pytest
 import torch
 
 from b12x.comm.pcie import pcie_dcp_attention as module
+from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
+
+
+def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(monkeypatch):
+    class Runtime:
+        _stream_affine = True
+        _owner_stream_key = None
+        rank = 0
+        _signal_ptrs = [100]
+        _staging1_ptrs = [200]
+        _slot_bytes = 100
+        _bind_stream_key = PCIeDCPA2A._bind_stream_key
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            pass
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            pass
+
+    runtime = Runtime()
+
+    class Pool:
+        _logical_channels = {"target": runtime}
+
+        def prepare_channels(self, ids):
+            assert ids == ("target",)
+
+        def for_stream(self, **kwargs):
+            runtime._bind_stream_key(1)
+            return runtime
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            self.for_stream().prepare_graph_all_gather_heads()
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            self.for_stream().prepare_graph_lse_reduce_scatter()
+
+        @contextmanager
+        def capture(self, **kwargs):
+            runtime._bind_stream_key(2)
+            yield
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        module.PCIeDCPA2APool, "from_process_group", lambda **kw: Pool()
+    )
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(module, "_normalize_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(module, "precompile_local_lse_mask", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "_tensor_from_cuda_pointer",
+        lambda *a, **kw: torch.zeros(4, dtype=torch.uint8),
+    )
+    channel = module.PCIeDCPAttention(
+        process_group=object(), device="cpu", channel_id="target"
+    )
+    assert runtime._owner_stream_key is None
+    with channel.capture():
+        assert runtime._owner_stream_key == 2
+    channel.close()
 
 
 @pytest.mark.parametrize("masked", [False, True])
