@@ -260,6 +260,7 @@ def main():
                             "operation": case.operation,
                             "rows": rows,
                             "details": case.details,
+                            "gpu_before_capture": gpu_state(),
                         }
                         validation, graph = validate(case, args.repetitions)
                         result["correctness"] = all_ranks(validation)
@@ -268,6 +269,7 @@ def main():
                         if passed and not args.correctness_only:
                             result["timing"] = measure(graph, args)
                         del graph
+                        result["gpu_after_replays"] = gpu_state()
                         record["cases"].append(result)
                         write_record(path, record)
                         print(
