@@ -651,3 +651,276 @@ def test_writer_records_feed_production_head_multitile_prefill_mg(
     )
     torch.cuda.synchronize(device)
     _assert_reader_matches_dequantized_records(actual, expected)
+
+
+def _fp8_dsa_record_reference(latent: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+    """CPU byte oracle for group-128 E4M3 latent plus unchanged BF16 RoPE."""
+    groups = latent.cpu().float().reshape(-1, 4, 128)
+    scales = (groups.abs().amax(-1) / 448.0).clamp_min(torch.finfo(torch.float32).tiny)
+    quant = (groups / scales[..., None]).to(torch.float8_e4m3fn)
+    return torch.cat(
+        (
+            quant.reshape(-1, 512).view(torch.uint8),
+            scales.contiguous().view(torch.uint8),
+            rope.cpu().contiguous().view(torch.uint8),
+        ),
+        dim=1,
+    )
+
+
+def test_fp8_dsa_record_oracle_preserves_rope_and_zero_scale_floor():
+    latent = torch.zeros((2, 512), dtype=torch.bfloat16)
+    latent[1, 0] = 448
+    rope = torch.arange(128).reshape(2, 64).to(torch.bfloat16)
+    records = _fp8_dsa_record_reference(latent, rope)
+    assert records.shape == (2, 656)
+    assert torch.equal(records[:, 528:], rope.view(torch.uint8))
+    scales = records[:, 512:528].contiguous().view(torch.float32)
+    assert scales[1, 0] == 1
+    assert torch.all(scales[0] == torch.finfo(torch.float32).tiny)
+    assert records[1, 0] == torch.tensor(448.0).to(torch.float8_e4m3fn).view(
+        torch.uint8
+    )
+
+
+@pytest.mark.parametrize("case", ["latent", "rope", "cache", "slot", "rows", "device"])
+def test_fp8_dsa_writer_rejects_invalid_contract_on_cpu(case):
+    from b12x.attention._shared.mla.kv_cache import concat_and_cache_fp8_ds_mla
+
+    latent = torch.empty((2, 512), dtype=torch.bfloat16)
+    rope = torch.empty((2, 64), dtype=torch.bfloat16)
+    cache = torch.empty((1, 4, 656), dtype=torch.uint8)
+    slots = torch.arange(2, dtype=torch.int64)
+    rows = 2
+    if case == "latent":
+        latent = latent.float()
+    elif case == "rope":
+        rope = rope[:, :32]
+    elif case == "cache":
+        cache = cache[..., :655]
+    elif case == "slot":
+        slots = slots.int()
+    elif case == "rows":
+        rows = 3
+    with pytest.raises(ValueError):
+        concat_and_cache_fp8_ds_mla(latent, rope, cache, slots, num_tokens=rows)
+
+
+@pytest.mark.parametrize("case", ["out", "rows", "rank_shape", "boundaries", "device"])
+def test_ckv_current_chunk_mapping_rejects_invalid_contract_on_cpu(case):
+    from b12x.attention._shared.mla.kv_cache import map_ckv_current_chunk_slots
+
+    starts = torch.tensor([0, 2])
+    requests = torch.tensor([0, 0])
+    lengths = torch.tensor([2])
+    ranks = torch.zeros((4, 1), dtype=torch.int64)
+    out = torch.empty(2, dtype=torch.int64)
+    rows = 2
+    if case == "out":
+        out = out.int()
+    elif case == "rows":
+        rows = 3
+    elif case == "rank_shape":
+        ranks = ranks[:3]
+    elif case == "boundaries":
+        starts = starts[:1]
+    with pytest.raises(ValueError):
+        map_ckv_current_chunk_slots(
+            starts,
+            requests,
+            lengths,
+            ranks,
+            padded_tokens=16,
+            dcp_world_size=4,
+            interleave=1,
+            out=out,
+            num_tokens=rows,
+        )
+
+
+@pytest.mark.parametrize("interleave", [1, 4])
+def test_fp8_dsa_changed_chunk_matches_native_bytes_and_request_mapping(interleave):
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import (
+        concat_and_cache_fp8_ds_mla,
+        map_ckv_current_chunk_slots,
+    )
+
+    device = torch.device("cuda")
+    starts = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+    requests = torch.tensor([0, 0, 0, 1, 1, -1], dtype=torch.int32, device=device)
+    lengths = torch.tensor([11, 6], dtype=torch.int32, device=device)
+    # Sliced rank rows exercise a non-contiguous request dimension extent.
+    rank_storage = torch.zeros((4, 5), dtype=torch.int64, device=device)
+    rank_storage[:, 1] = 16
+    rank_starts = rank_storage[:, :2]
+    slots = torch.full((6,), -2, dtype=torch.int64, device=device)
+    cache = torch.full((4, 32, 656), 0xA5, dtype=torch.uint8, device=device)
+    latent = torch.empty((6, 520), dtype=torch.bfloat16, device=device)[:, :512]
+    rope = torch.empty((6, 72), dtype=torch.bfloat16, device=device)[:, :64]
+    for seed in [17, 29]:
+        torch.manual_seed(seed)
+        latent.normal_()
+        rope.normal_()
+        map_ckv_current_chunk_slots(
+            starts,
+            requests,
+            lengths,
+            rank_starts,
+            padded_tokens=32,
+            dcp_world_size=4,
+            interleave=interleave,
+            out=slots,
+            num_tokens=6,
+        )
+        expected_slots = []
+        for req, position in [(0, 8), (0, 9), (0, 10), (1, 4), (1, 5)]:
+            owner = (position // interleave) % 4
+            local = position // (4 * interleave) * interleave + position % interleave
+            expected_slots.append(owner * 32 + req * 16 + local)
+        assert slots.cpu().tolist() == expected_slots + [-1]
+        before = cache.clone()
+        concat_and_cache_fp8_ds_mla(latent, rope, cache, slots)
+        expected = _fp8_dsa_record_reference(latent[:5], rope[:5])
+        flat = cache.view(-1, 656)
+        assert torch.equal(flat[expected_slots].cpu(), expected)
+        untouched = torch.ones(128, dtype=torch.bool, device=device)
+        untouched[expected_slots] = False
+        assert torch.equal(flat[untouched], before.view(-1, 656)[untouched])
+
+
+def test_ckv_current_chunk_mapping_uses_64bit_rank_offsets():
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import map_ckv_current_chunk_slots
+
+    device = torch.device("cuda")
+    offset = 2**31 + 64
+    starts = torch.tensor([0, 2], device=device)
+    reqs = torch.zeros(2, dtype=torch.int64, device=device)
+    lengths = torch.tensor([2], device=device)
+    ranks = torch.full((4, 1), offset, dtype=torch.int64, device=device)
+    output = torch.empty(2, dtype=torch.int64, device=device)
+    padded = offset + 128
+    map_ckv_current_chunk_slots(
+        starts,
+        reqs,
+        lengths,
+        ranks,
+        padded_tokens=padded,
+        dcp_world_size=4,
+        interleave=1,
+        out=output,
+        num_tokens=2,
+    )
+    assert output.cpu().tolist() == [offset, padded + offset]
+
+
+def test_fp8_dsa_writer_addresses_records_beyond_signed_int32_bytes():
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import concat_and_cache_fp8_ds_mla
+
+    device = torch.device("cuda")
+    block_size = 64
+    block_stride = block_size * 656
+    large_page = 2**31 // block_stride + 1
+    # A mostly uninitialized pool places the live record beyond a 32-bit offset.
+    cache = torch.empty(
+        (large_page + 1, block_size, 656), dtype=torch.uint8, device=device
+    )
+    latent = torch.full((1, 512), 2.0, dtype=torch.bfloat16, device=device)
+    rope = torch.full((1, 64), 3.0, dtype=torch.bfloat16, device=device)
+    slots = torch.tensor([large_page * block_size], device=device)
+    concat_and_cache_fp8_ds_mla(latent, rope, cache, slots)
+    expected = _fp8_dsa_record_reference(latent, rope)
+    assert torch.equal(cache[large_page, :1].cpu(), expected)
+
+
+def test_fp8_dsa_chunk_live_rows_reuse_compiled_kernels(monkeypatch):
+    require_b12x()
+    from b12x.attention._shared.mla import kv_cache as writer
+
+    device = torch.device("cuda")
+    starts = torch.tensor([0, 5], dtype=torch.int32, device=device)
+    reqs = torch.zeros(5, dtype=torch.int32, device=device)
+    lengths = torch.tensor([5], dtype=torch.int32, device=device)
+    ranks = torch.zeros((4, 1), dtype=torch.int32, device=device)
+    slots = torch.full((5,), -1, dtype=torch.int64, device=device)
+    latent = torch.ones((5, 512), dtype=torch.bfloat16, device=device)
+    rope = torch.ones((5, 64), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros((4, 8, 656), dtype=torch.uint8, device=device)
+
+    def run(rows):
+        writer.map_ckv_current_chunk_slots(
+            starts,
+            reqs,
+            lengths,
+            ranks,
+            padded_tokens=8,
+            dcp_world_size=4,
+            interleave=1,
+            out=slots,
+            num_tokens=rows,
+        )
+        writer.concat_and_cache_fp8_ds_mla(latent, rope, cache, slots, num_tokens=rows)
+
+    run(1)
+
+    def reject_compile(*args, **kwargs):
+        raise AssertionError("live row count changed the compiled callable")
+
+    monkeypatch.setattr(writer._map_ckv_chunk_slots_kernel, "compile", reject_compile)
+    monkeypatch.setattr(
+        writer._concat_and_cache_fp8_ds_mla_kernel, "compile", reject_compile
+    )
+    for rows in [2, 5, 1]:
+        latent.fill_(rows)
+        rope.fill_(rows + 1)
+        run(rows)
+        selected = slots[:rows].cpu().tolist()
+        expected = _fp8_dsa_record_reference(latent[:rows], rope[:rows])
+        assert torch.equal(cache.view(-1, 656)[selected].cpu(), expected)
+
+
+def test_fp8_dsa_writer_skips_invalid_slots_and_zero_rows():
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import concat_and_cache_fp8_ds_mla
+
+    device = torch.device("cuda")
+    latent = torch.ones((2, 512), dtype=torch.bfloat16, device=device)
+    rope = torch.ones((2, 64), dtype=torch.bfloat16, device=device)
+    cache = torch.full((1, 4, 656), 0xA5, dtype=torch.uint8, device=device)
+    slots = torch.tensor([-1, 4], dtype=torch.int64, device=device)
+    concat_and_cache_fp8_ds_mla(latent, rope, cache, slots)
+    assert torch.all(cache == 0xA5)
+    slots.zero_()
+    concat_and_cache_fp8_ds_mla(latent, rope, cache, slots, num_tokens=0)
+    assert torch.all(cache == 0xA5)
+
+
+def test_fp8_dsa_writer_matches_vllm_native_record_bytes():
+    require_b12x()
+    ops = pytest.importorskip("vllm._custom_ops")
+    from b12x.attention._shared.mla.kv_cache import concat_and_cache_fp8_ds_mla
+
+    device = torch.device("cuda")
+    latent = torch.zeros((6, 512), dtype=torch.bfloat16, device=device)
+    rope = torch.empty((6, 64), dtype=torch.bfloat16, device=device)
+    slots = torch.arange(6, dtype=torch.int64, device=device)
+    candidate = torch.empty((1, 8, 656), dtype=torch.uint8, device=device)
+    native = torch.empty_like(candidate)
+    for seed, outer_scale in [(7, 0.25), (11, 4.0)]:
+        torch.manual_seed(seed)
+        latent.normal_()
+        rope.normal_()
+        latent[0].zero_()
+        latent[1].fill_(torch.finfo(torch.bfloat16).tiny)
+        latent[2].fill_(-448.0)
+        # Group maxima pin scale to one; adjacent values exercise E4M3 ties.
+        latent[3].fill_(448.0)
+        latent[3, :8] = torch.tensor(
+            [1.0, 1.0625, 1.125, 1.1875, -1.0, -1.0625, -1.125, -1.1875], device=device
+        )
+        scale = torch.tensor(outer_scale, dtype=torch.float32, device=device)
+        concat_and_cache_fp8_ds_mla(latent, rope, candidate, slots)
+        ops.concat_and_cache_mla(latent, rope, native, slots, "fp8_ds_mla", scale)
+        assert torch.equal(candidate[0, :6], native[0, :6])

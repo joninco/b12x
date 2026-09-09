@@ -73,6 +73,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+import triton
+import triton.language as tl
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
@@ -1205,3 +1207,237 @@ def concat_and_cache_nvfp4_mla_fp8_rope(
     torch.ops.b12x.concat_and_cache_nvfp4_mla_fp8_rope(
         kv_c, k_pe, kv_cache, slot_mapping, per_token_scale
     )
+
+
+# Native GLM DSA FP8 records match concat_and_cache_ds_mla_kernel in vLLM:
+# four independently scaled 128-value latent groups, followed by raw BF16 RoPE.
+
+
+@triton.jit(
+    do_not_specialize=["rows", "requests", "padded", "rank_stride", "request_stride"]
+)
+def _map_ckv_chunk_slots_kernel(
+    starts,
+    request_ids,
+    lengths,
+    rank_starts,
+    output,
+    rows,
+    requests,
+    padded,
+    rank_stride,
+    request_stride,
+    DCP: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.load(request_ids + row, row < rows, other=-1).to(tl.int64)
+    valid = (row < rows) & (req >= 0) & (req < requests)
+    begin = tl.load(starts + req, valid, other=0).to(tl.int64)
+    end = tl.load(starts + req + 1, valid, other=0).to(tl.int64)
+    length = tl.load(lengths + req, valid, other=0).to(tl.int64)
+    pos = length - (end - begin) + row - begin
+    valid = valid & (row >= begin) & (row < end) & (pos >= 0) & (pos < length)
+    owner = (pos // INTERLEAVE) % DCP
+    local = (pos // (DCP * INTERLEAVE)) * INTERLEAVE + pos % INTERLEAVE
+    rank_start = tl.load(
+        rank_starts + owner * rank_stride + req * request_stride, valid, other=0
+    ).to(tl.int64)
+    local = rank_start + local
+    slot = owner * padded + local
+    valid = valid & (rank_start >= 0) & (local >= 0) & (local < padded)
+    tl.store(output + row, tl.where(valid, slot, -1), row < rows)
+
+
+def map_ckv_current_chunk_slots(
+    query_start_loc: torch.Tensor,
+    request_ids: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    rank_req_starts: torch.Tensor,
+    *,
+    padded_tokens: int,
+    dcp_world_size: int,
+    interleave: int,
+    out: torch.Tensor,
+    num_tokens: int,
+) -> None:
+    """Map request-local current positions into rank-major gathered records.
+
+    Invalid request IDs, positions and rank spans produce -1. Output entries
+    beyond num_tokens are untouched. Metadata must describe disjoint valid
+    request ranges; the caller owns the int64 output and its lifetime.
+    """
+    vectors = (query_start_loc, request_ids, global_seq_lens)
+    if any(
+        t.ndim != 1
+        or not t.is_contiguous()
+        or t.dtype not in (torch.int32, torch.int64)
+        for t in vectors
+    ):
+        raise ValueError("CKV query metadata requires contiguous integer vectors")
+    requests = global_seq_lens.numel()
+    if (
+        dcp_world_size < 1
+        or interleave < 1
+        or padded_tokens < 0
+        or query_start_loc.numel() < requests + 1
+    ):
+        raise ValueError("CKV mapping requires valid DCP geometry and query boundaries")
+    if (
+        rank_req_starts.ndim != 2
+        or rank_req_starts.shape != (dcp_world_size, requests)
+        or rank_req_starts.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "CKV rank starts must have shape (DCP, requests) and integer dtype"
+        )
+    if out.ndim != 1 or out.dtype != torch.int64 or not out.is_contiguous():
+        raise ValueError("CKV output slots require a contiguous int64 vector")
+    if not 0 <= num_tokens <= min(out.numel(), request_ids.numel()):
+        raise ValueError("CKV live rows exceed metadata or output capacity")
+    if any(t.device != out.device for t in (*vectors, rank_req_starts)):
+        raise ValueError("CKV mapping tensors must share one device")
+    if out.device.type != "cuda":
+        raise ValueError("CKV mapping requires CUDA tensors")
+    if num_tokens:
+        _map_ckv_chunk_slots_kernel[(triton.cdiv(num_tokens, 128),)](
+            query_start_loc,
+            request_ids,
+            global_seq_lens,
+            rank_req_starts,
+            out,
+            num_tokens,
+            requests,
+            padded_tokens,
+            rank_req_starts.stride(0),
+            rank_req_starts.stride(1),
+            dcp_world_size,
+            interleave,
+            128,
+        )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "rows",
+        "slots_count",
+        "block_size",
+        "block_stride",
+        "entry_stride",
+        "latent_stride",
+        "rope_stride",
+    ]
+)
+def _concat_and_cache_fp8_ds_mla_kernel(
+    latent,
+    rope,
+    cache,
+    slots,
+    rows,
+    slots_count,
+    block_size,
+    block_stride,
+    entry_stride,
+    latent_stride,
+    rope_stride,
+):
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(slots + row).to(tl.int64)
+    if (row < rows) & (slot >= 0) & (slot < slots_count):
+        address = (slot // block_size) * block_stride + (
+            slot % block_size
+        ) * entry_stride
+        group = tl.arange(0, 4)
+        col = tl.arange(0, 128)
+        values = tl.load(
+            latent + row * latent_stride + group[:, None] * 128 + col[None, :]
+        ).to(tl.float32)
+        scale = tl.maximum(
+            tl.div_rn(tl.max(tl.abs(values), axis=1), 448.0), 1.1754943508222875e-38
+        )
+        quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+        tl.store(
+            (cache + address).to(tl.pointer_type(tl.float8e4nv))
+            + group[:, None] * 128
+            + col[None, :],
+            quantized,
+        )
+        tl.store((cache + address + 512).to(tl.pointer_type(tl.float32)) + group, scale)
+        rope_col = tl.arange(0, 64)
+        rope_values = tl.load(rope + row * rope_stride + rope_col)
+        tl.store(
+            (cache + address + 528).to(tl.pointer_type(tl.bfloat16)) + rope_col,
+            rope_values,
+        )
+
+
+def concat_and_cache_fp8_ds_mla(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    num_tokens: int | None = None,
+) -> None:
+    """Write native 656-byte GLM DSA FP8 records into caller-owned slots.
+
+    The latent uses group-128 absmax/448 scales with an FP32 minimum-normal
+    floor. RoPE stays BF16. Native FP8 records do not use a layer outer scale.
+    Negative or out-of-capacity slots are skipped. Rows may have padded strides;
+    input features and cache records must have unit inner stride.
+    """
+    if (
+        kv_c.ndim != 2
+        or kv_c.shape[1] != 512
+        or k_pe.ndim != 2
+        or k_pe.shape[1] != 64
+        or kv_c.dtype != torch.bfloat16
+        or k_pe.dtype != torch.bfloat16
+        or kv_c.stride(1) != 1
+        or k_pe.stride(1) != 1
+    ):
+        raise ValueError("FP8 DSA writer requires BF16 latent[:,512] and RoPE[:,64]")
+    if (
+        kv_cache.ndim != 3
+        or kv_cache.shape[2] != 656
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.stride(2) != 1
+        or kv_cache.shape[0] < 1
+        or kv_cache.shape[1] < 1
+        or kv_cache.stride(1) < 656
+        or kv_cache.stride(0) < kv_cache.shape[1] * kv_cache.stride(1)
+        or kv_cache.stride(0) % 4
+        or kv_cache.stride(1) % 4
+        or kv_cache.data_ptr() % 4
+    ):
+        raise ValueError(
+            "FP8 DSA cache requires non-overlapping aligned 656-byte records"
+        )
+    if (
+        slot_mapping.ndim != 1
+        or slot_mapping.dtype != torch.int64
+        or not slot_mapping.is_contiguous()
+    ):
+        raise ValueError("FP8 DSA slot mapping requires a contiguous int64 vector")
+    rows = slot_mapping.numel() if num_tokens is None else num_tokens
+    if not 0 <= rows <= min(kv_c.shape[0], k_pe.shape[0], slot_mapping.numel()):
+        raise ValueError("FP8 DSA live rows exceed input or slot capacity")
+    if any(t.device != kv_cache.device for t in (kv_c, k_pe, slot_mapping)):
+        raise ValueError("FP8 DSA writer tensors must share one device")
+    if kv_cache.device.type != "cuda":
+        raise ValueError("FP8 DSA writer requires CUDA tensors")
+    if rows:
+        _concat_and_cache_fp8_ds_mla_kernel[(rows,)](
+            kv_c,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            rows,
+            kv_cache.shape[0] * kv_cache.shape[1],
+            kv_cache.shape[1],
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_c.stride(0),
+            k_pe.stride(0),
+        )
