@@ -133,9 +133,19 @@ def publication_combine_case(group, device, rows, rank):
     )
 
 
-def publication_candidate_case(group, device, rows, rank):
+def publication_candidate_case(
+    group, device, rows, rank, *, packaged=False, compiled=False
+):
     """Isolate candidate publication for comparison with shared publication."""
-    channel = PublicationChannel(group, device)
+    if packaged:
+        from b12x.comm.pcie.pcie_dcp_topk_pull import PCIeDCPTopKPull
+
+        channel = PCIeDCPTopKPull(process_group=group, device=device)
+        merge = (
+            torch.compile(channel.merge, fullgraph=True) if compiled else channel.merge
+        )
+    else:
+        channel = PublicationChannel(group, device)
     ids = torch.empty((rows, 2048), dtype=torch.int32, device=device)
     scores = torch.empty((rows, 2048), dtype=torch.float32, device=device)
     packed = torch.empty((rows, 2048, 2), device=device)
@@ -151,18 +161,27 @@ def publication_candidate_case(group, device, rows, rank):
 
     def run():
         pack_dcp_candidates(ids, scores, packed, rank, 4, 1)
-        channel.publish("candidates", packed)
-        select_peers(channel.candidate_pointers, selected, 4096)
+        if packaged:
+            merge(packed, selected)
+        else:
+            channel.publish("candidates", packed)
+            select_peers(channel.candidate_pointers, selected, 4096)
 
     refresh(731)
     return Case(
-        "published_candidates",
+        ("compiled_pull_candidates" if compiled else "pull_candidates")
+        if packaged
+        else "published_candidates",
         "candidates",
         run,
         (selected,),
         (expected,),
         channel.capture,
         [channel],
-        {"publication_blocks": 16},
+        {
+            "publication_blocks": 16,
+            "require_bitwise": packaged,
+            "torch_compile_fullgraph": compiled,
+        },
         refresh,
     )

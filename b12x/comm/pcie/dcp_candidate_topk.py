@@ -221,6 +221,41 @@ class _RankMajorTopKKernel:
 
         threshold = threshold_bin_smem.load()
         should_include_threshold = include_threshold_bin_smem.load() != Int32(0)
+        self._commit_keys(
+            keys,
+            output,
+            storage,
+            tid,
+            prefix,
+            prefix_bits,
+            shift,
+            bin_mask,
+            threshold,
+            should_include_threshold,
+        )
+        cute.arch.sync_threads()
+
+        pass_finished = include_threshold_bin_smem.load()
+        if tid == Int32(0) and pass_finished == Int32(0):
+            prefix_smem.store(prefix | (Uint64(threshold) << Uint64(shift)))
+        cute.arch.sync_threads()
+        return pass_finished
+
+    @cute.jit
+    def _commit_keys(
+        self,
+        keys,
+        output,
+        storage,
+        tid,
+        prefix,
+        prefix_bits,
+        shift,
+        bin_mask,
+        threshold,
+        should_include_threshold,
+    ):
+        committed_count_smem = storage.committed_count.data_ptr()
         for key_idx in cutlass.range_constexpr(self.keys_per_thread):
             key = keys[key_idx]
             if self._prefix_matches(key, prefix, prefix_bits):
@@ -237,13 +272,6 @@ class _RankMajorTopKKernel:
                     )
                     if dst < Int32(self.topk):
                         output[dst] = (~Uint32(key)).bitcast(Int32)
-        cute.arch.sync_threads()
-
-        pass_finished = include_threshold_bin_smem.load()
-        if tid == Int32(0) and pass_finished == Int32(0):
-            prefix_smem.store(prefix | (Uint64(threshold) << Uint64(shift)))
-        cute.arch.sync_threads()
-        return pass_finished
 
     @cute.kernel
     def kernel(

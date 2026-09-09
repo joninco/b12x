@@ -125,6 +125,8 @@ def validate(case, repetitions):
     stable_pointers = pointers == [out.data_ptr() for out in case.outputs]
     if allocation_delta or not stable_pointers:
         errors.append("Replay changed allocated bytes or output pointers")
+    if case.details.get("require_bitwise") and not bitwise:
+        errors.append("Replay changed deterministic output order")
     return {
         "passed": not errors,
         "replays": 30,
@@ -180,7 +182,15 @@ def main():
     parser.add_argument(
         "--transports",
         nargs="+",
-        choices=("native", "b12x", "rank_major", "owner", "publication"),
+        choices=(
+            "native",
+            "b12x",
+            "rank_major",
+            "owner",
+            "publication",
+            "pull",
+            "compiled_pull",
+        ),
         default=["native", "b12x", "rank_major", "owner", "publication"],
     )
     parser.add_argument(
@@ -192,8 +202,8 @@ def main():
     parser.add_argument("--graphs-per-sample", type=int, default=8)
     parser.add_argument("--correctness-only", action="store_true")
     args = parser.parse_args()
-    if any(r not in (1, 2, 4, 8, 16) for r in args.rows):
-        parser.error("rows must be drawn from 1, 2, 4, 8, 16")
+    if any(r not in range(1, 17) for r in args.rows):
+        parser.error("rows must be in 1 through 16")
     if args.samples < 2 or args.repetitions < 1 or args.graphs_per_sample < 1:
         parser.error(
             "samples >= 2, repetitions >= 1 and graphs-per-sample >= 1 required"
@@ -277,6 +287,17 @@ def main():
                     cases.append(
                         publication_candidate_case(group, device, rows, rank % 4)
                     )
+                elif kind in ("pull", "compiled_pull"):
+                    cases = [
+                        publication_candidate_case(
+                            group,
+                            device,
+                            rows,
+                            rank % 4,
+                            packaged=True,
+                            compiled=kind == "compiled_pull",
+                        )
+                    ]
                 else:
                     cases = (
                         attention_cases(kind, group, gpu_group, device, rows, rank % 4)
