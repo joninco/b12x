@@ -72,6 +72,10 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     local = ranks[rank]
     query = local.query.to(device)
     partial, lse = local.partial.to(device), local.lse.to(device)
+    masked_lse = torch.empty_like(lse)
+    local_lengths = torch.isfinite(lse).any(dim=1).to(torch.int32)
+    if kind in ("opaque_attention", "compiled_attention"):
+        lse.masked_fill_(local_lengths[:, None] == 0, 7)
     output = torch.empty((rows, 8, 512), dtype=torch.bfloat16, device=device)
     details = {}
     query_name, pair_name = kind + "_query", kind + "_pair"
@@ -93,7 +97,11 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
                 )
                 for name in ("query", "combine", "pair")
             }
-            details = {"require_bitwise": True, "opaque_operators": True}
+            details = {
+                "require_bitwise": True,
+                "opaque_operators": True,
+                "per_query_local_lse_mask": True,
+            }
         active_channel = "query"
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
 
@@ -111,7 +119,9 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
                     partial, lse, output, channel_id="benchmark"
                 )
             else:
-                pools[active_channel].combine(partial, lse, output)
+                pools[active_channel].combine_masked(
+                    partial, lse, local_lengths, masked_lse, output
+                )
 
         def capture():
             return pools[active_channel].capture(channel_id="benchmark")
@@ -224,6 +234,9 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
         query.copy_(values[rank].query)
         partial.copy_(values[rank].partial)
         lse.copy_(values[rank].lse)
+        if kind in ("opaque_attention", "compiled_attention"):
+            local_lengths.copy_(torch.isfinite(values[rank].lse).any(dim=1))
+            lse.masked_fill_(local_lengths[:, None] == 0, 7)
         q_reference, o_reference, _ = references(values, rank)
         expected_query.copy_(q_reference)
         expected_output.copy_(o_reference)

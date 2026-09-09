@@ -16,6 +16,7 @@ import torch.distributed as dist
 from .pcie_dcp_a2a import PCIeDCPA2APool, _SIGNAL_BYTES
 from .pcie_dcp_topk import _tensor_from_cuda_pointer
 from .pcie_oneshot import _normalize_device
+from ._dcp_attention_metadata import mask_local_lse, precompile_local_lse_mask
 
 
 _HANDLES = count(1)
@@ -76,6 +77,35 @@ def _combine_fake(partial, lse, out, state, handle) -> None:
     pass
 
 
+@torch.library.custom_op(
+    "b12x::dcp_attention_combine_masked", mutates_args=("out", "state", "masked_lse")
+)
+def _combine_masked_op(
+    partial: torch.Tensor,
+    lse: torch.Tensor,
+    local_seq_lens: torch.Tensor,
+    masked_lse: torch.Tensor,
+    out: torch.Tensor,
+    state: torch.Tensor,
+    handle: int,
+) -> None:
+    _channel(handle, state)
+    if any(
+        torch._C._overlaps(masked_lse, tensor)
+        for tensor in (partial, lse, local_seq_lens, out, state)
+    ):
+        raise ValueError("DCP masked LSE scratch must not alias inputs or outputs")
+    mask_local_lse(lse, local_seq_lens, masked_lse)
+    _combine_op(partial, masked_lse, out, state, handle)
+
+
+@_combine_masked_op.register_fake
+def _combine_masked_fake(
+    partial, lse, local_seq_lens, masked_lse, out, state, handle
+) -> None:
+    pass
+
+
 class PCIeDCPAttention:
     """Own precompiled query/combine exchanges for one serially replayed graph.
 
@@ -119,6 +149,12 @@ class PCIeDCPAttention:
                 dtype=torch.bfloat16, channel_id=channel_id
             )
             runtime = self._pool.for_stream(channel_id=channel_id)
+            precompile_local_lse_mask(local_heads * 4, self.device.index)
+            self.allocated_bytes = (
+                runtime._staging1_ptrs[runtime.rank]
+                + runtime._slot_bytes
+                - runtime._signal_ptrs[runtime.rank]
+            )
             self._state = _tensor_from_cuda_pointer(
                 runtime._signal_ptrs[runtime.rank],
                 (_SIGNAL_BYTES,),
@@ -146,6 +182,23 @@ class PCIeDCPAttention:
         """
         _combine_op(partial, lse, out, self._state, self._handle)
 
+    def combine_masked(
+        self,
+        partial: torch.Tensor,
+        lse: torch.Tensor,
+        local_seq_lens: torch.Tensor,
+        masked_lse: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """Mask each empty local query row before reducing its partial output.
+
+        local_seq_lens contains one int32 causal local length per query, including
+        separate rows of an MTP request. masked_lse is caller-owned float32 scratch.
+        """
+        _combine_masked_op(
+            partial, lse, local_seq_lens, masked_lse, out, self._state, self._handle
+        )
+
     @contextmanager
     def capture(self):
         """Claim a single graph identity collectively before CUDA capture."""
@@ -160,5 +213,6 @@ class PCIeDCPAttention:
             return
         self._pool.close()
         self._closed = True
+        self.allocated_bytes = 0
         _CHANNELS.pop(self._handle, None)
         self._state = None
