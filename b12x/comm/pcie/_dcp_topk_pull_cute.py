@@ -71,6 +71,9 @@ class _PeerTopK(_RankMajorTopKKernel):
             )
             offset = row * row_stride + (col % Int64(self.topk)) * Int64(2)
             score = (pointer + offset).load()
+            # IEEE signed zeros compare equal and must use the token-id tie break.
+            if score == Float32(0):
+                score = Float32(0)
             token_id = Int32((pointer + offset + Int64(1)).load())
             keys[i] = self._stable_key(score, token_id)
         if tid == Int32(0):
@@ -160,7 +163,7 @@ def precompile_peer_topk(topk: int, world_size: int, device_index: int):
             1,
             1,
             current_cuda_stream(),
-            compile_spec=KernelCompileSpec.from_facts("comm.pcie.peer_topk", 2, *key),
+            compile_spec=KernelCompileSpec.from_facts("comm.pcie.peer_topk", 3, *key),
         )
 
 

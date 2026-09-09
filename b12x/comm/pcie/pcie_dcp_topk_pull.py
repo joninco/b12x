@@ -44,10 +44,12 @@ def _merge_op(
     state: torch.Tensor,
     peer_slabs: list[int],
     rank: int,
+    topk: int,
+    max_rows: int,
 ) -> None:
     if (
         packed.ndim != 3
-        or packed.shape[-1] != 2
+        or packed.shape[1:] != (topk, 2)
         or packed.dtype != torch.float32
         or not packed.is_contiguous()
         or not packed.is_cuda
@@ -61,7 +63,9 @@ def _merge_op(
         or len(peer_slabs) != 4
         or rank not in range(4)
         or state.numel() < PAYLOAD_OFFSET + packed.numel() * packed.element_size()
-        or not 1 <= packed.shape[0] <= 16
+        or not 1 <= packed.shape[0] <= max_rows <= 16
+        or topk not in (512, 1024, 2048)
+        or state.numel() != PAYLOAD_OFFSET + max_rows * topk * 8
     ):
         raise ValueError("DCP candidate tensors or peer geometry are incompatible")
     if peer_slabs[rank] != state.data_ptr() or any(
@@ -90,7 +94,7 @@ def _merge_op(
 
 
 @_merge_op.register_fake
-def _merge_fake(packed, out, state, peer_slabs, rank) -> None:
+def _merge_fake(packed, out, state, peer_slabs, rank, topk, max_rows) -> None:
     pass
 
 
@@ -167,7 +171,15 @@ class PCIeDCPTopKPull(_IPCChannel):
         Inputs and output must not overlap the channel state or each other.
         """
         if torch.compiler.is_compiling():
-            _merge_op(packed, out, self._state, self._peer_slabs, self.rank)
+            _merge_op(
+                packed,
+                out,
+                self._state,
+                self._peer_slabs,
+                self.rank,
+                self.topk,
+                self.max_rows,
+            )
             return
         if self._closed:
             raise RuntimeError("DCP candidate channel is closed")
@@ -187,7 +199,15 @@ class PCIeDCPTopKPull(_IPCChannel):
         if _is_current_stream_capturing(self.device) and not self._capture_depth:
             raise RuntimeError("Capture DCP candidate merge inside channel.capture()")
         self._bind_stream()
-        _merge_op(packed, out, self._state, self._peer_slabs, self.rank)
+        _merge_op(
+            packed,
+            out,
+            self._state,
+            self._peer_slabs,
+            self.rank,
+            self.topk,
+            self.max_rows,
+        )
 
     def _free_ipc_exports(self) -> None:
         self._state = None

@@ -75,22 +75,43 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     output = torch.empty((rows, 8, 512), dtype=torch.bfloat16, device=device)
     details = {}
     query_name, pair_name = kind + "_query", kind + "_pair"
-    if kind == "b12x":
+    if kind in ("b12x", "opaque_attention", "compiled_attention"):
         # Pool stream bindings are exclusive even outside capture. Each graph
         # therefore owns its pool, not merely an id in a shared stream's pool.
-        pools = {name: _pool(group, device) for name in ("query", "combine", "pair")}
+        if kind == "b12x":
+            pools = {
+                name: _pool(group, device) for name in ("query", "combine", "pair")
+            }
+        else:
+            from b12x.comm.pcie.pcie_dcp_attention import PCIeDCPAttention
+
+            pools = {
+                name: PCIeDCPAttention(
+                    process_group=group,
+                    device=device,
+                    channel_id=f"{kind}-{name}",
+                )
+                for name in ("query", "combine", "pair")
+            }
+            details = {"require_bitwise": True, "opaque_operators": True}
         active_channel = "query"
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
 
         def gather():
-            pools[active_channel].all_gather_heads(
-                query, gathered, channel_id="benchmark"
-            )
+            if kind == "b12x":
+                pools[active_channel].all_gather_heads(
+                    query, gathered, channel_id="benchmark"
+                )
+            else:
+                pools[active_channel].query(query, gathered)
 
         def combine():
-            pools[active_channel].lse_reduce_scatter(
-                partial, lse, output, channel_id="benchmark"
-            )
+            if kind == "b12x":
+                pools[active_channel].lse_reduce_scatter(
+                    partial, lse, output, channel_id="benchmark"
+                )
+            else:
+                pools[active_channel].combine(partial, lse, output)
 
         def capture():
             return pools[active_channel].capture(channel_id="benchmark")
@@ -238,9 +259,16 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
             details,
         ),
     ]
+    if kind == "compiled_attention":
+        cases = cases[-1:]
+        cases[0].details = {**details, "torch_compile_fullgraph": True}
+        pair = torch.compile(pair, fullgraph=True)
+        cases[0].run = pair
     for case in cases:
         case.refresh = refresh
-        if kind == "b12x":
+        if kind in ("opaque_attention", "compiled_attention"):
+            case.details = {**details, **case.details}
+        if kind in ("b12x", "opaque_attention", "compiled_attention"):
             operation = case.run
 
             def run_in_channel(operation=operation, channel=case.operation):
@@ -249,8 +277,10 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
                 operation()
 
             case.run = run_in_channel
-            case.capture = bind_arguments(
-                pools[case.operation].capture, channel_id="benchmark"
+            case.capture = (
+                bind_arguments(pools[case.operation].capture, channel_id="benchmark")
+                if kind == "b12x"
+                else pools[case.operation].capture
             )
     return cases
 

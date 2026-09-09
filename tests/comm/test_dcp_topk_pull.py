@@ -14,6 +14,50 @@ from b12x.comm.pcie._dcp_topk_pull_cute import (
 from benchmarks.dcp_transport.fixtures import rank_inputs, references
 
 
+@pytest.mark.parametrize("mismatch", ["topk", "capacity"])
+def test_compiled_candidate_merge_enforces_planned_geometry(monkeypatch, mismatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.comm.pcie import pcie_dcp_topk_pull as module
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    channel = object.__new__(module.PCIeDCPTopKPull)
+    channel.device, channel.rank = device, 0
+    channel.topk, channel.max_rows = 2048, 4
+    channel._state = torch.empty(
+        module.PAYLOAD_OFFSET + 4 * 2048 * 8, dtype=torch.uint8, device=device
+    )
+    channel._peer_slabs = [channel._state.data_ptr()] * 4
+    rows, topk = (1, 512) if mismatch == "topk" else (5, 2048)
+    packed = torch.empty((rows, topk, 2), device=device)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=device)
+
+    def unexpected_launch(*args, **kwargs):
+        raise AssertionError("Invalid geometry reached publication kernel resolution")
+
+    monkeypatch.setattr(module, "precompile_candidate_publication", unexpected_launch)
+    compiled = torch.compile(channel.merge, backend="eager", fullgraph=True)
+    with pytest.raises(ValueError, match="geometry are incompatible"):
+        compiled(packed, out)
+
+
+def test_peer_selector_ties_signed_zero_by_token_id():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda", torch.cuda.current_device())
+    topk = 512
+    ids = torch.arange(topk * 4).reshape(4, 1, topk).float()
+    scores = torch.zeros_like(ids)
+    scores[0] = -0.0
+    slabs = torch.stack((scores, ids), -1).to(device)
+    out = torch.empty((1, topk), dtype=torch.int32, device=device)
+    precompile_peer_topk(topk, 4, device.index)
+    select_peer_topk(tuple(slabs[r].data_ptr() for r in range(4)), out, topk * 2)
+    torch.testing.assert_close(
+        out.cpu().sort().values, torch.arange(topk, dtype=torch.int32)[None]
+    )
+
+
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_peer_selector_exact_repeatable_all_live_rows(topk):
     if not torch.cuda.is_available():

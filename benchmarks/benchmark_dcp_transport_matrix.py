@@ -190,6 +190,8 @@ def main():
             "publication",
             "pull",
             "compiled_pull",
+            "opaque_attention",
+            "compiled_attention",
         ),
         default=["native", "b12x", "rank_major", "owner", "publication"],
     )
@@ -201,6 +203,7 @@ def main():
     parser.add_argument("--repetitions", type=int, default=32)
     parser.add_argument("--graphs-per-sample", type=int, default=8)
     parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument("--profile-replays", action="store_true")
     args = parser.parse_args()
     if any(r not in range(1, 17) for r in args.rows):
         parser.error("rows must be in 1 through 16")
@@ -301,7 +304,8 @@ def main():
                 else:
                     cases = (
                         attention_cases(kind, group, gpu_group, device, rows, rank % 4)
-                        if kind in ("native", "b12x")
+                        if kind
+                        in ("native", "b12x", "opaque_attention", "compiled_attention")
                         else [candidate_case(kind, group, device, rows, rank % 4)]
                     )
                 try:
@@ -319,6 +323,18 @@ def main():
                         failed |= not passed
                         if passed and not args.correctness_only:
                             result["timing"] = measure(graph, args)
+                        if passed and args.profile_replays:
+                            from benchmarks.dcp_transport.replay_profile import (
+                                profile_replays,
+                            )
+
+                            result["replay_profile"] = profile_replays(
+                                graph, args.output_dir, rank, case.name, rows
+                            )
+                            profile_ok = all(
+                                all_ranks(result["replay_profile"]["passed"])
+                            )
+                            failed |= not profile_ok
                         del graph
                         result["gpu_after_replays"] = gpu_state()
                         record["cases"].append(result)
