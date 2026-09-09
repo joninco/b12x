@@ -1,5 +1,7 @@
 """Rank-major candidate selection: exact sets, strided storage and graph reuse."""
 
+import math
+
 import pytest
 import torch
 
@@ -110,3 +112,73 @@ def test_packed_local_candidates_select_global_positions(interleave):
         selected = valid_ids[row][valid_ids[row] >= 0].sort().values[:topk]
         expected[row, : len(selected)] = selected
     torch.testing.assert_close(output.cpu().sort().values, expected.sort().values)
+
+
+def _selected_id_reference(candidates: torch.Tensor, topk: int) -> torch.Tensor:
+    """CPU set oracle with the selector's positive-zero-before-negative-zero rule."""
+    ranks, rows, width, _ = candidates.shape
+    result = torch.full((rows, topk), -1, dtype=torch.int32)
+    for row in range(rows):
+        valid = []
+        seen = set()
+        for score, token in candidates[:, row].reshape(ranks * width, 2).tolist():
+            if token < 0:
+                continue
+            if math.isnan(score) or not token.is_integer() or token in seen:
+                raise ValueError(
+                    "Reference requires non-NaN scores and unique integer IDs"
+                )
+            seen.add(token)
+            # Numeric comparison handles all finite values and infinities.
+            # The bit-key selector distinguishes the two IEEE zero encodings.
+            positive_zero = score == 0 and math.copysign(1.0, score) > 0
+            valid.append((score, positive_zero, -int(token)))
+        valid.sort(reverse=True)
+        for index, (_, _, negative_id) in enumerate(valid[:topk]):
+            result[row, index] = -negative_id
+    return result
+
+
+def test_selection_reference_distinguishes_signed_zero_and_global_id_ties():
+    candidates = torch.tensor(
+        [
+            [[[0.0, 9], [-0.0, 1], [2.0, 8], [float("nan"), -1]]],
+            [[[0.0, 3], [-0.0, 0], [2.0, 2], [-float("inf"), 7]]],
+        ],
+        dtype=torch.float32,
+    )
+    assert _selected_id_reference(candidates, 7).tolist() == [[2, 8, 3, 9, 0, 1, 7]]
+
+
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_owner_row_views_preserve_exact_candidate_sets(topk):
+    """Owner slices retain rank pitch while selecting the same changed candidates."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    ranks, rows, owner_rows = 4, 12, 3
+    storage = torch.empty((ranks, rows + 5, topk, 2), device="cuda")
+    full_output = torch.empty((rows, topk), dtype=torch.int32, device="cuda")
+    owner_output = torch.empty((owner_rows, topk), dtype=torch.int32, device="cuda")
+    generator = torch.Generator().manual_seed(941)
+    for generation in range(2):
+        scores = torch.randint(-2, 3, (ranks, rows, topk), generator=generator).float()
+        scores[0, :, : topk // 2] = -0.0
+        scores[1, :, : topk // 2] = 0.0
+        ids = torch.randperm(ranks * topk, generator=generator).reshape(ranks, 1, topk)
+        ids = ids.expand(-1, rows, -1).clone() + generation * ranks * topk
+        ids[:, 0] = -1
+        ids[1:, 1] = -1
+        candidates = torch.stack((scores, ids.float()), dim=-1)
+        expected = _selected_id_reference(candidates, topk)
+        storage[:, :rows].copy_(candidates)
+        rank_major_topk(storage[:, :rows], full_output)
+        torch.testing.assert_close(
+            full_output.cpu().sort().values, expected.sort().values
+        )
+        for owner in range(ranks):
+            start = owner * owner_rows
+            rank_major_topk(storage[:, start : start + owner_rows], owner_output)
+            torch.testing.assert_close(
+                owner_output.cpu().sort().values,
+                expected[start : start + owner_rows].sort().values,
+            )

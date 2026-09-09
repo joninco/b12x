@@ -5,6 +5,7 @@
 Input is float32 [rank, row, candidate, (score, global token id)]. Token ids
 must be exactly representable in float32; negative ids mark absent candidates.
 The selected set orders scores descending and breaks ties by smaller token id.
+Positive zero precedes negative zero, matching the IEEE bit-key ordering.
 Output positions within that set are unspecified. Valid token ids must be unique
 within each row across ranks. NaN scores are unsupported.
 """
