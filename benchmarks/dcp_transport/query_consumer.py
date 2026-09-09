@@ -2,7 +2,7 @@
 
 Status: research-only. The consumer uses UnifiedDecodeKernel's GLM FP8 math,
 32 query heads, and split-K partial outputs. Its local and peer variants differ
-only in query addressing. The caller owns publication/overwrite synchronization
+only in query memory access. The caller owns publication/overwrite synchronization
 and keeps every peer allocation alive until the attention kernel completes.
 No serving dispatch selects this benchmark entry.
 """
@@ -167,7 +167,7 @@ def _compile(topk, splits, capacity, peer_reads, device_index):
             1,
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_facts(
-                "benchmark.dcp_transport.query_consumer", 1, *key
+                "benchmark.dcp_transport.query_consumer", 2, *key
             ),
         )
 

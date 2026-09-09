@@ -67,6 +67,7 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    ld_global_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_shared_f32,
@@ -643,7 +644,11 @@ def s0_quantize_q_vec(
                     peer_local_heads,
                     d_nope + d_rope,
                 )
-                w0, w1, w2, w3 = ld_global_nc_v4_u32(address)
+                # PCIe peer payloads require ordinary global loads.
+                if cutlass.const_expr(len(peer_query_pointers)):
+                    w0, w1, w2, w3 = ld_global_v4_u32(address)
+                else:
+                    w0, w1, w2, w3 = ld_global_nc_v4_u32(address)
             q_words.append((w0, w1, w2, w3))
 
     rope_groups = d_rope // 8
@@ -666,7 +671,10 @@ def s0_quantize_q_vec(
                     peer_local_heads,
                     d_nope + d_rope,
                 )
-                r0, r1, r2, r3 = ld_global_nc_v4_u32(address)
+                if cutlass.const_expr(len(peer_query_pointers)):
+                    r0, r1, r2, r3 = ld_global_v4_u32(address)
+                else:
+                    r0, r1, r2, r3 = ld_global_nc_v4_u32(address)
 
     # ── Phase B: Q-RoPE row copy (bf16 pass-through; zero-filled invalid heads). ──
     if cutlass.const_expr(d_rope > 0):
