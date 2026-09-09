@@ -924,3 +924,357 @@ def test_fp8_dsa_writer_matches_vllm_native_record_bytes():
         concat_and_cache_fp8_ds_mla(latent, rope, candidate, slots)
         ops.concat_and_cache_mla(latent, rope, native, slots, "fp8_ds_mla", scale)
         assert torch.equal(candidate[0, :6], native[0, :6])
+
+
+def _local_token_count(total, rank, dcp, interleave):
+    cycles, remainder = divmod(total, dcp * interleave)
+    return cycles * interleave + min(max(remainder - rank * interleave, 0), interleave)
+
+
+def test_native_chunk_copy_rejects_cpu_and_invalid_capacity():
+    from b12x.attention._shared.mla.kv_cache import (
+        gather_ckv_current_chunk,
+        gather_ckv_history,
+        insert_ckv_current_chunk,
+    )
+
+    cache = torch.empty((2, 4, 656), dtype=torch.uint8)
+    output = torch.empty((8, 656), dtype=torch.uint8)
+    table = torch.tensor([[0, 1]], dtype=torch.int32)
+    starts = torch.zeros((4, 1), dtype=torch.int32)
+    lengths = torch.ones((4, 1), dtype=torch.int32)
+    full = torch.tensor([4], dtype=torch.int32)
+    queries = torch.tensor([0, 4], dtype=torch.int32)
+    with pytest.raises(ValueError, match="CUDA"):
+        gather_ckv_history(
+            cache,
+            output,
+            table,
+            starts,
+            lengths,
+            full,
+            queries,
+            dcp_rank=0,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=1,
+            padded_tokens=8,
+        )
+    with pytest.raises(ValueError, match="capacity"):
+        gather_ckv_current_chunk(
+            cache,
+            output,
+            table,
+            full,
+            queries,
+            dcp_rank=0,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=1,
+            current_capacity=9,
+        )
+    with pytest.raises(ValueError, match="CUDA"):
+        gather_ckv_current_chunk(
+            cache,
+            output,
+            table,
+            full,
+            queries,
+            dcp_rank=0,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=1,
+            current_capacity=8,
+        )
+    with pytest.raises(ValueError, match="capacity"):
+        insert_ckv_current_chunk(
+            output,
+            torch.empty_like(output),
+            starts,
+            full,
+            queries,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=1,
+            current_capacity=3,
+            padded_tokens=2,
+        )
+
+
+@pytest.mark.parametrize("interleave", [1, 4])
+@pytest.mark.parametrize("record_bytes", [368, 656])
+def test_native_history_and_chunk_exchange_match_full_gather(interleave, record_bytes):
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import (
+        gather_ckv_current_chunk,
+        gather_ckv_history,
+        insert_ckv_current_chunk,
+    )
+
+    device = torch.device("cuda")
+    full_lengths = [11, 6]
+    chunks = [3, 2]
+    dcp, page_size, padded, capacity = 4, 4, 16, 8
+    full = torch.tensor(full_lengths, dtype=torch.int32, device=device)
+    queries = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
+    tables = torch.tensor(
+        [[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32, device=device
+    )
+    lengths_cpu = [
+        [_local_token_count(length, rank, dcp, interleave) for length in full_lengths]
+        for rank in range(dcp)
+    ]
+    starts_cpu = [[0, lengths[0]] for lengths in lengths_cpu]
+    # Strided rank metadata preserves builder-owned capacity beyond live requests.
+    starts_storage = torch.zeros((dcp, 5), dtype=torch.int64, device=device)
+    lens_storage = torch.zeros_like(starts_storage)
+    starts = starts_storage[:, :2]
+    lengths = lens_storage[:, :2]
+    starts.copy_(torch.tensor(starts_cpu, device=device))
+    lengths.copy_(torch.tensor(lengths_cpu, device=device))
+    staging = [
+        torch.empty((padded, record_bytes), dtype=torch.uint8, device=device)
+        for _ in range(dcp)
+    ]
+    compact = [
+        torch.empty((capacity, record_bytes), dtype=torch.uint8, device=device)
+        for _ in range(dcp)
+    ]
+    for seed in [3, 19]:
+        expected_ranks, expected_history, expected_current = [], [], []
+        for rank in range(dcp):
+            raw = (
+                (
+                    torch.arange(8 * page_size * record_bytes, dtype=torch.int64)
+                    + seed
+                    + rank * 31
+                )
+                % 251
+                + 1
+            ).to(torch.uint8)
+            cpu_cache = raw.view(8, page_size, record_bytes)
+            cache = cpu_cache.to(device)
+            expected = torch.zeros((padded, record_bytes), dtype=torch.uint8)
+            history = torch.zeros_like(expected)
+            packed = []
+            for req, count in enumerate(lengths_cpu[rank]):
+                previous = _local_token_count(
+                    full_lengths[req] - chunks[req], rank, dcp, interleave
+                )
+                for position in range(count):
+                    record = cpu_cache[
+                        req * 4 + position // page_size, position % page_size
+                    ]
+                    slot = starts_cpu[rank][req] + position
+                    expected[slot] = record
+                    if position < previous:
+                        history[slot] = record
+                    else:
+                        packed.append(record)
+            packed_expected = torch.zeros((capacity, record_bytes), dtype=torch.uint8)
+            if packed:
+                packed_expected[: len(packed)] = torch.stack(packed)
+            gather_ckv_history(
+                cache,
+                staging[rank],
+                tables,
+                starts,
+                lengths,
+                full,
+                queries,
+                dcp_rank=rank,
+                dcp_world_size=dcp,
+                interleave=interleave,
+                num_reqs=2,
+                padded_tokens=padded,
+            )
+            assert torch.equal(staging[rank].cpu(), history)
+            gather_ckv_current_chunk(
+                cache,
+                compact[rank],
+                tables,
+                full,
+                queries,
+                dcp_rank=rank,
+                dcp_world_size=dcp,
+                interleave=interleave,
+                num_reqs=2,
+                current_capacity=capacity,
+            )
+            assert torch.equal(compact[rank].cpu(), packed_expected)
+            expected_ranks.append(expected)
+            expected_history.append(history)
+            expected_current.append(packed_expected)
+        gathered = torch.cat(staging)
+        packed_all = torch.cat(compact)
+        insert_ckv_current_chunk(
+            packed_all,
+            gathered.view(-1, page_size, record_bytes),
+            starts,
+            full,
+            queries,
+            dcp_world_size=dcp,
+            interleave=interleave,
+            num_reqs=2,
+            current_capacity=capacity,
+            padded_tokens=padded,
+        )
+        assert torch.equal(gathered.cpu(), torch.cat(expected_ranks))
+
+
+def test_native_history_gather_excludes_unwritten_chunk_pages():
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import gather_ckv_history
+
+    device = torch.device("cuda")
+    cache = torch.full((1, 2, 656), 23, dtype=torch.uint8, device=device)
+    output = torch.full((6, 656), 99, dtype=torch.uint8, device=device)
+    # Rank 0 owns two produced history tokens and two future tokens. The future
+    # tokens' table entry points outside the source allocation and must not load.
+    table = torch.tensor([[0, 2**31]], dtype=torch.int64, device=device)
+    starts = torch.zeros((4, 1), dtype=torch.int64, device=device)
+    lengths = torch.full((4, 1), 4, dtype=torch.int64, device=device)
+    full = torch.tensor([16], dtype=torch.int64, device=device)
+    queries = torch.tensor([0, 8], dtype=torch.int64, device=device)
+    gather_ckv_history(
+        cache,
+        output,
+        table,
+        starts,
+        lengths,
+        full,
+        queries,
+        dcp_rank=0,
+        dcp_world_size=4,
+        interleave=1,
+        num_reqs=1,
+        padded_tokens=6,
+    )
+    assert torch.all(output[:2] == 23)
+    assert torch.all(output[2:] == 0)
+
+
+def test_native_history_and_chunk_gather_address_large_recycled_pages():
+    require_b12x()
+    from b12x.attention._shared.mla.kv_cache import (
+        gather_ckv_current_chunk,
+        gather_ckv_history,
+    )
+
+    device = torch.device("cuda")
+    record_bytes = 656
+    page = 2**31 // record_bytes + 1
+    cache = torch.empty((page + 2, 1, record_bytes), dtype=torch.uint8, device=device)
+    cache[page].fill_(19)
+    cache[page + 1].fill_(71)
+    table = torch.tensor([[page, page + 1]], dtype=torch.int64, device=device)
+    starts = torch.zeros((4, 1), dtype=torch.int64, device=device)
+    lengths = torch.full((4, 1), 2, dtype=torch.int64, device=device)
+    full = torch.tensor([8], dtype=torch.int64, device=device)
+    queries = torch.tensor([0, 4], dtype=torch.int64, device=device)
+    history = torch.empty((2, record_bytes), dtype=torch.uint8, device=device)
+    current = torch.empty_like(history)
+    gather_ckv_history(
+        cache,
+        history,
+        table,
+        starts,
+        lengths,
+        full,
+        queries,
+        dcp_rank=0,
+        dcp_world_size=4,
+        interleave=1,
+        num_reqs=1,
+        padded_tokens=2,
+    )
+    gather_ckv_current_chunk(
+        cache,
+        current,
+        table,
+        full,
+        queries,
+        dcp_rank=0,
+        dcp_world_size=4,
+        interleave=1,
+        num_reqs=1,
+        current_capacity=2,
+    )
+    assert torch.all(history[0] == 19)
+    assert torch.all(history[1] == 0)
+    assert torch.all(current[0] == 71)
+    assert torch.all(current[1] == 0)
+
+
+def test_native_copy_empty_requests_reuse_precompiled_capacity(monkeypatch):
+    require_b12x()
+    from b12x.attention._shared.mla import kv_cache as writer
+
+    device = torch.device("cuda")
+    cache = torch.ones((2, 4, 656), dtype=torch.uint8, device=device)
+    history = torch.empty((4, 656), dtype=torch.uint8, device=device)
+    current = torch.empty_like(history)
+    full_output = torch.full((16, 656), 29, dtype=torch.uint8, device=device)
+    gathered = torch.ones_like(full_output)
+    table = torch.zeros((1, 2), dtype=torch.int32, device=device)
+    starts = torch.zeros((4, 1), dtype=torch.int32, device=device)
+    lengths = torch.ones_like(starts)
+    full = torch.tensor([4], dtype=torch.int32, device=device)
+    queries = torch.tensor([0, 4], dtype=torch.int32, device=device)
+
+    def run(requests):
+        writer.gather_ckv_history(
+            cache,
+            history,
+            table,
+            starts,
+            lengths,
+            full,
+            queries,
+            dcp_rank=0,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=requests,
+            padded_tokens=4,
+        )
+        writer.gather_ckv_current_chunk(
+            cache,
+            current,
+            table,
+            full,
+            queries,
+            dcp_rank=0,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=requests,
+            current_capacity=4,
+        )
+        writer.insert_ckv_current_chunk(
+            gathered,
+            full_output,
+            starts,
+            full,
+            queries,
+            dcp_world_size=4,
+            interleave=1,
+            num_reqs=requests,
+            current_capacity=4,
+            padded_tokens=4,
+        )
+
+    run(1)
+
+    def reject_compile(*args, **kwargs):
+        raise AssertionError("live request count changed native-copy compilation")
+
+    for kernel in [
+        writer._gather_ckv_history_kernel,
+        writer._gather_ckv_current_chunk_kernel,
+        writer._insert_ckv_current_chunk_kernel,
+    ]:
+        monkeypatch.setattr(kernel, "compile", reject_compile)
+    full_output.fill_(29)
+    run(0)
+    assert torch.all(history == 0)
+    assert torch.all(current == 0)
+    assert torch.all(full_output == 29)
