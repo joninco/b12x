@@ -14,11 +14,13 @@ Example (inside a source-bound image with its Python environment activated)::
       --runtime-manifest /evidence/runtime-manifest.json \
       --output-dir /evidence/results --correctness-only
 
-The implemented paths are the compiled symmetric-memory query/combine,
-PCIeDCPA2A query/combine, rank-major candidate gather/selection, and owner
-staging/selection/direct result redistribution. A transport decision also
-requires the consumer-side query pull and shared-publication prototypes;
-this benchmark does not treat an absent path as a losing timing result.
+The implemented paths are the compiled symmetric-memory query/combine (with
+an explicitly recorded query fallback if multicast is unavailable), PCIeDCPA2A
+query/combine, rank-major candidate gather/selection, owner staging/selection/
+direct result redistribution, and publication with peer consumers. Query-pull
+timings include the actual sparse-attention consumer; subtract its matched
+local-query case to estimate exchange overhead. Shared publication measures
+independent query and candidate consumers with fixed attention indices.
 """
 
 import argparse
@@ -40,6 +42,11 @@ from b12x._lib.runtime_control import (
     unfreeze_kernel_resolution,
 )
 from benchmarks.dcp_transport.cases import attention_cases, candidate_case
+from benchmarks.dcp_transport.prototype_cases import (
+    publication_candidate_case,
+    publication_combine_case,
+    query_consumer_case,
+)
 
 
 def gpu_state():
@@ -173,9 +180,10 @@ def main():
     parser.add_argument(
         "--transports",
         nargs="+",
-        choices=("native", "b12x", "rank_major", "owner"),
-        default=["native", "b12x", "rank_major", "owner"],
+        choices=("native", "b12x", "rank_major", "owner", "publication"),
+        default=["native", "b12x", "rank_major", "owner", "publication"],
     )
+    parser.add_argument("--consumer-splits", type=int, choices=(8, 32), default=32)
     parser.add_argument("--rows", nargs="+", type=int, default=[1, 2, 4, 8, 16])
     parser.add_argument("--samples", type=int, default=31)
     parser.add_argument("--repetitions", type=int, default=32)
@@ -223,10 +231,7 @@ def main():
         "gpu_before": gpu_state(),
         "cases": [],
         "selection_complete": False,
-        "missing_paths": [
-            "consumer-side query pull",
-            "shared query/candidate publication",
-        ],
+        "consumer_splits": args.consumer_splits,
     }
     write_record(path, record)
     failed = False
@@ -248,11 +253,34 @@ def main():
                     ),
                     flush=True,
                 )
-                cases = (
-                    attention_cases(kind, group, gpu_group, device, rows, rank % 4)
-                    if kind in ("native", "b12x")
-                    else [candidate_case(kind, group, device, rows, rank % 4)]
-                )
+                if kind == "publication":
+                    cases = [
+                        query_consumer_case(
+                            mode,
+                            group,
+                            device,
+                            rows,
+                            rank % 4,
+                            splits=args.consumer_splits,
+                        )
+                        for mode in (
+                            "local_consumer",
+                            "published_consumer",
+                            "shared_consumers",
+                        )
+                    ]
+                    cases.append(
+                        publication_combine_case(group, device, rows, rank % 4)
+                    )
+                    cases.append(
+                        publication_candidate_case(group, device, rows, rank % 4)
+                    )
+                else:
+                    cases = (
+                        attention_cases(kind, group, gpu_group, device, rows, rank % 4)
+                        if kind in ("native", "b12x")
+                        else [candidate_case(kind, group, device, rows, rank % 4)]
+                    )
                 try:
                     for case in cases:
                         result = {

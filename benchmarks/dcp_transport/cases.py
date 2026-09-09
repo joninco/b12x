@@ -35,7 +35,7 @@ class Case:
     def check(self):
         for actual, expected in zip(self.outputs, self.expected, strict=True):
             actual = actual.cpu()
-            if self.operation == "candidates":
+            if expected.dtype == torch.int32:
                 actual = actual.sort(dim=-1).values
             tolerance = 0 if expected.dtype in (torch.int32, torch.int64) else 0.02
             if self.operation == "query":

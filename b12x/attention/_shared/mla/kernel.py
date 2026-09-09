@@ -869,6 +869,7 @@ class UnifiedDecodeKernel:
         *,
         has_extra: cutlass.Constexpr,
         per_token_len: cutlass.Constexpr,
+        peer_query_pointers: tuple = (),
     ):
         t = self.traits
         L = self.layout
@@ -1046,6 +1047,8 @@ class UnifiedDecodeKernel:
                     num_threads=self.math_threads,
                     barrier_id=2,
                     hpb_local=self.vector_q_hpb,
+                    peer_query_pointers=peer_query_pointers,
+                    query_token=Int64(token_idx),
                 )
         pre_idx0 = Int32(-1)
         pre_idx1 = Int32(-1)
