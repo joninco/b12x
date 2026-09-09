@@ -1,4 +1,4 @@
-"""Mask natural-log partial LSE with per-query local KV lengths."""
+"""Localize DCP causal lengths and mask natural-log partial LSE."""
 
 from functools import cache
 
@@ -10,6 +10,113 @@ from cutlass import Float32, Int32, Int64
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+
+
+class _DCPSequenceLengths:
+    @cute.jit
+    def __call__(
+        self,
+        lengths: cute.Pointer,
+        out: cute.Pointer,
+        rows: Int32,
+        world_size: Int32,
+        rank: Int32,
+        interleave: Int32,
+        stream: CUstream,
+    ):
+        self.localize(lengths, out, rows, world_size, rank, interleave).launch(
+            grid=((rows + 127) // 128, 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def localize(
+        self,
+        lengths: cute.Pointer,
+        out: cute.Pointer,
+        rows: Int32,
+        world_size: Int32,
+        rank: Int32,
+        interleave: Int32,
+    ):
+        block, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        row = block * 128 + thread
+        if row < rows:
+            length = (lengths + Int64(row)).load()
+            cycle = world_size * interleave
+            rounds = length // cycle
+            remainder = length - rounds * cycle - rank * interleave
+            if remainder < Int32(0):
+                remainder = Int32(0)
+            if remainder > interleave:
+                remainder = interleave
+            (out + Int64(row)).store(rounds * interleave + remainder)
+
+
+@cache
+def precompile_dcp_sequence_lengths(device_index: int):
+    """Compile one callable per device; live lengths and rows are runtime data."""
+    raise_if_kernel_resolution_frozen(
+        "cute.compile", target=_DCPSequenceLengths, cache_key=(device_index,)
+    )
+    with torch.cuda.device(device_index):
+        return b12x_compile(
+            _DCPSequenceLengths(),
+            _ptr(Int32, 16),
+            _ptr(Int32, 16),
+            1,
+            1,
+            0,
+            1,
+            current_cuda_stream(),
+            compile_spec=KernelCompileSpec.from_facts(
+                "comm.pcie.dcp_sequence_lengths", 1, device_index
+            ),
+        )
+
+
+def localize_dcp_sequence_lengths(
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    world_size: int,
+    rank: int,
+    interleave: int,
+) -> None:
+    """Write local counts for nonnegative global bounds, allowing exact aliasing."""
+    if (
+        lengths.ndim != 1
+        or out.shape != lengths.shape
+        or lengths.dtype != torch.int32
+        or out.dtype != torch.int32
+        or not lengths.is_cuda
+        or out.device != lengths.device
+        or not lengths.is_contiguous()
+        or not out.is_contiguous()
+        or world_size < 1
+        or not 0 <= rank < world_size
+        or interleave < 1
+        or world_size * interleave > 2**31 - 1
+        or (
+            torch._C._overlaps(lengths, out)
+            and lengths.data_ptr() != out.data_ptr()
+        )
+    ):
+        raise ValueError(
+            "DCP lengths require contiguous CUDA int32 vectors, valid shard "
+            "geometry, and disjoint or exactly aliased storage"
+        )
+    if lengths.numel() == 0:
+        return
+    with torch.cuda.device(lengths.device):
+        precompile_dcp_sequence_lengths(lengths.device.index)(
+            _ptr(Int32, lengths.data_ptr()),
+            _ptr(Int32, out.data_ptr()),
+            lengths.numel(),
+            world_size,
+            rank,
+            interleave,
+            current_cuda_stream(),
+        )
 
 
 class _MaskLocalLSE:

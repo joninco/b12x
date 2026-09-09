@@ -10,6 +10,54 @@ from b12x.comm.pcie import pcie_dcp_attention as module
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("interleave", [1, 64])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_local_lengths_reuse_compiled_geometry_and_replay(rank, interleave, inplace):
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
+    from b12x.comm.pcie._dcp_attention_metadata import (
+        localize_dcp_sequence_lengths,
+        precompile_dcp_sequence_lengths,
+    )
+
+    device = torch.cuda.current_device()
+    compiled = precompile_dcp_sequence_lengths(device)
+    freeze_kernel_resolution("DCP causal lengths must not specialize live rows")
+    try:
+        for rows in (1, 2, 3, 4, 8, 16, 127, 128, 129):
+            values = torch.arange(rows, dtype=torch.int32) * 67
+            seed = values.to(device)
+            source = torch.empty_like(seed)
+            out = source if inplace else torch.empty_like(seed)
+
+            def run():
+                source.copy_(seed)
+                localize_dcp_sequence_lengths(source, out, 4, rank, interleave)
+
+            run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            values += 1
+            seed.copy_(values)
+            cycle = 4 * interleave
+            expected = values // cycle * interleave + (
+                values % cycle - rank * interleave
+            ).clamp(0, interleave)
+            pointer = out.data_ptr()
+            for _ in range(3):
+                graph.replay()
+                torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+                assert out.data_ptr() == pointer
+                assert precompile_dcp_sequence_lengths(device) is compiled
+    finally:
+        unfreeze_kernel_resolution()
+
+
 def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(monkeypatch):
     class Runtime:
         _stream_affine = True
