@@ -183,7 +183,9 @@ def main():
         choices=("native", "b12x", "rank_major", "owner", "publication"),
         default=["native", "b12x", "rank_major", "owner", "publication"],
     )
-    parser.add_argument("--consumer-splits", type=int, choices=(8, 32), default=32)
+    parser.add_argument(
+        "--consumer-splits", type=int, choices=(8, 11, 16, 32), default=32
+    )
     parser.add_argument("--rows", nargs="+", type=int, default=[1, 2, 4, 8, 16])
     parser.add_argument("--samples", type=int, default=31)
     parser.add_argument("--repetitions", type=int, default=32)
