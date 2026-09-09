@@ -516,9 +516,10 @@ def test_writer_records_feed_production_head_multisplit_decode(
     "rows,heads,high_page_ids",
     [(1, 8, False), (4, 32, False), (16, 32, False), (4, 32, True)],
 )
+@pytest.mark.parametrize("mode", ["decode", "extend"])
 @torch.inference_mode()
-def test_nvfp4_decode_natural_lse_matches_quantized_records(
-    rows: int, heads: int, high_page_ids: bool
+def test_nvfp4_natural_lse_matches_quantized_records(
+    rows: int, heads: int, high_page_ids: bool, mode: str
 ) -> None:
     """DCP's 32-head partials must carry the LSE of their quantized KV rows."""
     device = require_b12x()
@@ -560,6 +561,7 @@ def test_nvfp4_decode_natural_lse_matches_quantized_records(
             fp8_rope=True,
             return_lse=True,
             lse_scale="natural",
+            mode=mode,
         )
     )
     spec = plan.scratch_specs()[0]
