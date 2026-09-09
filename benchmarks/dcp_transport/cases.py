@@ -51,7 +51,7 @@ class Case:
                 close()
 
 
-def _pool(group, device, *, heads=32, dim=512, query_dim=576, channels=("benchmark",)):
+def _pool(group, device, *, heads=32, dim=512, query_dim=576):
     pool = PCIeDCPA2APool.from_process_group(
         process_group=group,
         device=device,
@@ -60,10 +60,9 @@ def _pool(group, device, *, heads=32, dim=512, query_dim=576, channels=("benchma
         head_dim=dim,
         query_head_dim=query_dim,
     )
-    pool.prepare_channels(channels)
-    for channel in channels:
-        pool.prepare_graph_all_gather_heads(channel_id=channel)
-        pool.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, channel_id=channel)
+    pool.prepare_channels(("benchmark",))
+    pool.prepare_graph_all_gather_heads(channel_id="benchmark")
+    pool.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, channel_id="benchmark")
     return pool
 
 
@@ -77,20 +76,26 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
     details = {}
     query_name, pair_name = kind + "_query", kind + "_pair"
     if kind == "b12x":
-        pool = _pool(group, device, channels=("query", "combine", "pair"))
+        # Pool stream bindings are exclusive even outside capture. Each graph
+        # therefore owns its pool, not merely an id in a shared stream's pool.
+        pools = {name: _pool(group, device) for name in ("query", "combine", "pair")}
         active_channel = "query"
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
 
         def gather():
-            pool.all_gather_heads(query, gathered, channel_id=active_channel)
+            pools[active_channel].all_gather_heads(
+                query, gathered, channel_id="benchmark"
+            )
 
         def combine():
-            pool.lse_reduce_scatter(partial, lse, output, channel_id=active_channel)
+            pools[active_channel].lse_reduce_scatter(
+                partial, lse, output, channel_id="benchmark"
+            )
 
         def capture():
-            return pool.capture(channel_id=active_channel)
+            return pools[active_channel].capture(channel_id="benchmark")
 
-        resources = [pool]
+        resources = list(pools.values())
     elif kind == "native":
         from vllm.v1.attention.ops.dcp import (
             DirectDCPA2AWorkspace,
@@ -244,7 +249,9 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
                 operation()
 
             case.run = run_in_channel
-            case.capture = bind_arguments(pool.capture, channel_id=case.operation)
+            case.capture = bind_arguments(
+                pools[case.operation].capture, channel_id="benchmark"
+            )
     return cases
 
 
