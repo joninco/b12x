@@ -137,6 +137,12 @@ from b12x.moe._shared.kernels.w4a8_phase1 import (
 from b12x.moe._shared.kernels.w4a8_phase2 import (
     W4A8MaterializedPhase2Kernel,
 )
+from b12x.moe._shared.kernels.nvfp4_phase1 import (
+    Nvfp4MaterializedPhase1Kernel,
+)
+from b12x.moe._shared.kernels.nvfp4_phase2 import (
+    Nvfp4MaterializedPhase2Kernel,
+)
 
 
 _SF_VEC_SIZE = 16
@@ -707,8 +713,19 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
+        numerical_recipe: str = "default",
     ):
         activation = normalize_moe_activation(activation)
+        self.deepseek_v41 = numerical_recipe == "deepseek_v41"
+        if numerical_recipe not in {"default", "deepseek_v41"}:
+            raise ValueError(f"unsupported numerical_recipe {numerical_recipe!r}")
+        if self.deepseek_v41 and not (
+            quant_recipe == "w4a8_mx" and activation == "silu"
+            and w4a8_repacked and materialize_intermediate
+            and deterministic_output and mma_tiler_mn == (64, 128)
+            and share_input_across_experts and not direct_routing
+        ):
+            raise ValueError("deepseek_v41 requires the planned materialized M64 W4A8 pipeline")
         if quant_recipe not in {
             "nvfp4",
             "w4a8_mx",
@@ -860,73 +877,169 @@ class MoEDynamicKernelBackend:
         self.w4a8_split_materialized = bool(
             self.w4a8_m64_materialized or self.w4a8_m128_materialized
         )
-        # Dense M64/M128 retains this kernel as a routing/input-quantization
-        # front-end. Compact stream-ordered M64xN128 kernels compute FC1/FC2
-        # through the existing caller-owned MXFP8 workspace.  The split
+        # NVFP4 split-materialized (large-M prefill): the cooperative kernel
+        # keeps only the routing/input-quantization front-end (it publishes
+        # the expert-major packed-A + swizzled-SFA domain and the deferred
+        # task metadata exactly as the monolithic kernel does); the compact
+        # Nvfp4MaterializedPhase1/Phase2 kernels run both GEMMs externally
+        # against the ORIGINAL (non-repacked) swizzled weight tensors.  Like
+        # the W4A8 split this is graph-safe: every grid is fixed from the
+        # preplanned launch capacity and no host value is read between the
+        # three launches.  Gated SiLU + grouped routing + shared per-token
+        # input quantization only (see the materialize_intermediate gate
+        # below); K and n must be exact 128 multiples on the host side.
+        self.nvfp4_split_materialized = bool(
+            quant_recipe == "nvfp4"
+            and self.materialize_intermediate
+            and mma_tiler_mn == (128, 128)
+            and not self.w4a8_repacked
+        )
+        # Dense M128 retains this kernel as a routing/input-quantization
+        # front-end.  Compact stream-ordered M128xN128 kernels compute FC1/FC2
+        # through the existing caller-owned materialized workspace.  The split
         # removes both GEMM bodies from the routing kernel's register/shared
         # union and is graph-safe: every grid is fixed from preplanned launch
-        # capacity and no host value is read between launches.
-        self.external_materialized_fc1 = self.w4a8_split_materialized
-        self.external_materialized_fc2 = self.w4a8_split_materialized
+        # capacity and no host value is read between launches.  The M64 source
+        # tile is deliberately NOT admitted: the phase kernels' 64-row
+        # multi-tile specialization is not yet validated and is known-wrong on
+        # multi-tile experts, so those shapes keep the monolithic path.
+        self.external_materialized_fc1 = bool(
+            self.w4a8_split_materialized or self.nvfp4_split_materialized
+        )
+        self.external_materialized_fc2 = self.external_materialized_fc1
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
         self.num_topk = int(num_topk)
         materialized_source_tile_m = (
-            mma_tiler_mn[0] if self.w4a8_split_materialized else 128
+            mma_tiler_mn[0]
+            if (self.w4a8_split_materialized or self.nvfp4_split_materialized)
+            else 128
         )
-        self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
-            fast_math=self.fast_math,
-            source_tile_m=materialized_source_tile_m,
-            deterministic_output=bool(deterministic_output),
-            num_topk=self.num_topk,
-            trellis_bits=(
-                trellis_bits
-                if self.w4a8_trellis and self.w4a8_split_materialized
-                else None
-            ),
-            trellis_coupled=(
-                self.trellis_coupled and self.w4a8_split_materialized
-            ),
-            trellis_direct_lut=(
-                self.trellis_direct_lut and self.w4a8_split_materialized
-            ),
-            # This helper is gated-only and is never launched unless the split
-            # materialized path is active.  Use a valid inert specialization for
-            # non-split activations (notably ReLU2) instead of rejecting them
-            # during otherwise valid monolithic-kernel construction.
-            activation=self.activation if self.w4a8_split_materialized else "silu",
-        )
-        self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
-            source_tile_m=materialized_source_tile_m,
-            deterministic_output=bool(deterministic_output),
-            trellis_bits=(
-                trellis_bits
-                if self.w4a8_trellis and self.w4a8_split_materialized
-                else None
-            ),
-            trellis_direct_lut=(
-                self.trellis_direct_lut and self.w4a8_split_materialized
-            ),
-        )
+        if self.nvfp4_split_materialized:
+            # NVFP4 split: the phase kernels consume the ORIGINAL swizzled
+            # FP4 weights and the expert-major packed-A/SFA domain the
+            # route/pack front-end publishes.  alpha[e] (FC1 dequant) and
+            # global_scale[e] (the FC2-input/a2 requant scale, matching the
+            # monolithic in-kernel requant at global_scale) feed phase 1;
+            # down_alpha[e] feeds phase 2.
+            self.materialized_phase1_kernel = Nvfp4MaterializedPhase1Kernel(
+                fast_math=self.fast_math,
+                source_tile_m=materialized_source_tile_m,
+                # The materialize_intermediate gate below only admits SiLU
+                # for nvfp4 splits, so self.activation is always the kernel's
+                # supported specialization here.
+                activation=self.activation,
+                swiglu_limit=swiglu_limit,
+            )
+            self.materialized_phase2_kernel = Nvfp4MaterializedPhase2Kernel(
+                source_tile_m=materialized_source_tile_m,
+                deterministic_output=bool(deterministic_output),
+            )
+        else:
+            self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
+                fast_math=self.fast_math,
+                numerical_recipe=numerical_recipe,
+                source_tile_m=materialized_source_tile_m,
+                deterministic_output=bool(deterministic_output),
+                num_topk=self.num_topk,
+                trellis_bits=(
+                    trellis_bits
+                    if self.w4a8_trellis and self.w4a8_split_materialized
+                    else None
+                ),
+                trellis_coupled=(
+                    self.trellis_coupled and self.w4a8_split_materialized
+                ),
+                trellis_direct_lut=(
+                    self.trellis_direct_lut and self.w4a8_split_materialized
+                ),
+                # This helper is gated-only and is never launched unless the
+                # split materialized path is active.  Use a valid inert
+                # specialization for non-split activations (notably ReLU2)
+                # instead of rejecting them during otherwise valid
+                # monolithic-kernel construction.
+                activation=(
+                    self.activation if self.w4a8_split_materialized else "silu"
+                ),
+            )
+            self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
+                source_tile_m=materialized_source_tile_m,
+                numerical_recipe=numerical_recipe,
+                deterministic_output=bool(deterministic_output),
+                trellis_bits=(
+                    trellis_bits
+                    if self.w4a8_trellis and self.w4a8_split_materialized
+                    else None
+                ),
+                trellis_direct_lut=(
+                    self.trellis_direct_lut and self.w4a8_split_materialized
+                ),
+            )
         if self.w4a8_repacked and quant_recipe not in ("w4a8_mx", "w4a8_trellis"):
             raise ValueError(
                 "repacked W4A8 weights are only valid for w4a8_mx or w4a8_trellis"
             )
-        if self.materialize_intermediate and not (
-            self.w4a8_repacked
-            and (
-                quant_recipe == "w4a8_mx"
-                or (
-                    quant_recipe == "w4a8_trellis"
-                    and mma_tiler_mn in {(64, 128), (128, 128)}
-                )
-            )
-            and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
+        # NVFP4 split-materialized admission (external phase kernels).  The
+        # premise below is load-bearing for correctness, not a convenience:
+        #   * share_input_across_experts=True — the front-end quantizes each
+        #     token exactly ONCE with ``input_global_scale[0]`` (the shared
+        #     input branch) and fans the same quantized row out to every
+        #     routed expert's physical row.  Phase 1 reads that expert-major
+        #     packed-A/SFA domain directly by physical row, so ALL experts'
+        #     FC1 input global scales must be identical (a host invariant that
+        #     __init__ cannot inspect; the policy layer must keep feeding
+        #     equal a1 scales, exactly as the shared-input monolithic path
+        #     already requires).
+        #   * SiLU gated + original (non-repacked) swizzled weights: phase 1
+        #     computes [up, gate] in one K sweep with the monolithic alpha
+        #     semantics (a1/a2 ride in the published SFA planes and the
+        #     intermediate requant uses global_scale[e]).
+        #   * no swap_ab / separate_w13_halves / direct_routing /
+        #     external_route_plan / dynamic_down_scale / deterministic_output
+        #     yet: the phase-kernel addressing assumes the plain packed w13
+        #     and the atomic scatter contract (deterministic output needs the
+        #     fixed-order top-k reduction kernel that the W4A8 split has and
+        #     NVFP4 does not wire up here).
+        #   * work_source is non-streaming (materialized/persistent): the
+        #     deferred task publish is what the phase kernels index.
+        # K and n must be exact 128 multiples (phase geometry); like the
+        # W4A8 split that shape gate lives on the host side, not here.
+        nvfp4_materialized_ok = bool(
+            quant_recipe == "nvfp4"
+            and not self.w4a8_repacked
+            and mma_tiler_mn == (128, 128)
+            and self.activation == "silu"
+            and self.is_gated
+            and share_input_across_experts
+            and not swap_ab
+            and not separate_w13_halves
+            and not self.direct_routing
+            and not self.external_route_plan
+            and not dynamic_down_scale
+            and not deterministic_output
+            and sf_vec_size == 16
             and work_source != _WORK_SOURCE_READY_QUEUE
+        )
+        if self.materialize_intermediate and not (
+            nvfp4_materialized_ok
+            or (
+                self.w4a8_repacked
+                and (
+                    quant_recipe == "w4a8_mx"
+                    or (
+                        quant_recipe == "w4a8_trellis"
+                        and mma_tiler_mn in {(64, 128), (128, 128)}
+                    )
+                )
+                and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
+                and work_source != _WORK_SOURCE_READY_QUEUE
+            )
         ):
             raise ValueError(
                 "materialized-intermediate execution currently requires the "
-                "repacked W4A8 MX M16/M32/M64/M128 non-streaming specialization"
+                "repacked W4A8 MX M16/M32/M64/M128 non-streaming "
+                "specialization or the shared-input SiLU NVFP4 M128 "
+                "split-materialized specialization"
             )
         if self.direct_routing and not (
             (
@@ -969,9 +1082,8 @@ class MoEDynamicKernelBackend:
             )
         self.dynamic_down_scale = dynamic_down_scale
         self.share_input_across_experts = share_input_across_experts
-        # Small repacked W4A8 has six route warps.  Split them into three
-        # two-warp token groups: this matches the pair-owned producer's useful
-        # warp/CTA concurrency while every K/32 block is quantized once.
+        # Pair route warps per input token. M16/M32 have three pairs; M64
+        # and M128 have five. Every pair needs an independent rendezvous.
         self.input_warps_per_token = (
             2 if self.is_w4a8 and share_input_across_experts else 1
         )
@@ -1103,6 +1215,16 @@ class MoEDynamicKernelBackend:
         )
         self.input_pair_barrier_2 = pipeline.NamedBarrier(
             barrier_id=6,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
+        # IDs 7-10 belong to the later QMMA staging pipeline. The two extra
+        # M64/M128 input pairs must not collide with pair 2 on barrier 6.
+        self.input_pair_barrier_3 = pipeline.NamedBarrier(
+            barrier_id=11,
+            num_threads=self.input_warps_per_token * self.num_threads_per_warp,
+        )
+        self.input_pair_barrier_4 = pipeline.NamedBarrier(
+            barrier_id=12,
             num_threads=self.input_warps_per_token * self.num_threads_per_warp,
         )
         w4a8_stage_threads = (self.num_mma_warps + 1) * self.num_threads_per_warp
@@ -1493,6 +1615,12 @@ class MoEDynamicKernelBackend:
         )
 
     @cute.jit
+    def _quantize_mx(self, values: cute.Tensor, max_abs: cutlass.Float32):
+        if cutlass.const_expr(self.deepseek_v41):
+            max_abs = cutlass.max(max_abs, cutlass.Float32(1.0e-4))
+        return quantize_block_fp8_mx(values, max_abs)
+
+    @cute.jit
     def _gated_activation_value(self, gate: cutlass.Float32, up: cutlass.Float32):
         if cutlass.const_expr(self.has_swiglu_limit):
             limit = cutlass.Float32(self.swiglu_limit)
@@ -1552,8 +1680,12 @@ class MoEDynamicKernelBackend:
             self.input_pair_barrier_0.arrive_and_wait()
         elif pair_idx == Int32(1):
             self.input_pair_barrier_1.arrive_and_wait()
-        else:
+        elif pair_idx == Int32(2):
             self.input_pair_barrier_2.arrive_and_wait()
+        elif pair_idx == Int32(3):
+            self.input_pair_barrier_3.arrive_and_wait()
+        else:
+            self.input_pair_barrier_4.arrive_and_wait()
 
     @cute.jit
     def _sync_w4a8_stage_ready(self, stage: Int32):
@@ -2531,46 +2663,99 @@ class MoEDynamicKernelBackend:
             cooperative=True,
             stream=stream,
         )
+        # External split-materialized launch (same @cute.jit call, same
+        # stream as the cooperative front-end above, so CUDA-graph capture
+        # covers every kernel with no host reads and no replay-time
+        # allocations).  Per-recipe operand contracts:
+        #   * W4A8 split consumes the repacked weight planes and folds the
+        #     self-ranged calibrated scales on the device side.
+        #   * NVFP4 split consumes the ORIGINAL swizzled tensors: w13 payload
+        #     [E][2n][K/2 bytes] (b_w13_u32 flat, expert-major) with its
+        #     compact F8_128x4 sfb plane, down payload [E][K][n/2 bytes]
+        #     (b_down_u32) with its compact sfb plane.  alpha[e] is the FC1
+        #     weight dequant, global_scale[e] the intermediate-requant (a2)
+        #     scale (the a1 scale is already carried by the published SFA
+        #     plane), down_alpha[e] the FC2 weight dequant.  Every pool-scaled
+        #     row/byte offset is computed inside the phase kernels in Int64.
         if cutlass.const_expr(self.external_materialized_fc1):
-            self.materialized_phase1_kernel(
-                packed_a_storage,
-                scale_storage,
-                w13_rp,
-                w13_sfb_rp,
-                intermediate_u32,
-                token_map,
-                task_expert,
-                task_valid_rows,
-                expert_tile_base,
-                alpha,
-                input_global_scale,
-                trellis_lut,
-                trellis_rotations,
-                Int32(a_input.shape[1]) // Int32(128),
-                gate_tile_cnt,
-                Int32(b_w13.shape[0]) // Int32(256),
-                max_active_clusters,
-                stream,
-            )
+            if cutlass.const_expr(self.nvfp4_split_materialized):
+                self.materialized_phase1_kernel(
+                    packed_a_storage,
+                    scale_storage,
+                    b_w13_u32,
+                    sfb_w13_tensor,
+                    intermediate_u32,
+                    token_map,
+                    task_expert,
+                    task_valid_rows,
+                    expert_tile_base,
+                    alpha,
+                    global_scale,
+                    Int32(a_input.shape[1]) // Int32(128),
+                    gate_tile_cnt,
+                    Int32(b_w13.shape[0]) // Int32(128),
+                    max_active_clusters,
+                    stream,
+                )
+            else:
+                self.materialized_phase1_kernel(
+                    packed_a_storage,
+                    scale_storage,
+                    w13_rp,
+                    w13_sfb_rp,
+                    intermediate_u32,
+                    token_map,
+                    token_weights,
+                    task_expert,
+                    task_valid_rows,
+                    expert_tile_base,
+                    alpha,
+                    input_global_scale,
+                    trellis_lut,
+                    trellis_rotations,
+                    Int32(a_input.shape[1]) // Int32(128),
+                    gate_tile_cnt,
+                    Int32(b_w13.shape[0]) // Int32(256),
+                    max_active_clusters,
+                    stream,
+                )
         if cutlass.const_expr(self.external_materialized_fc2):
-            self.materialized_phase2_kernel(
-                intermediate_u32,
-                down_rp,
-                down_sfb_rp,
-                scatter_output,
-                token_map,
-                token_weights,
-                task_expert,
-                task_valid_rows,
-                expert_tile_base,
-                down_alpha,
-                global_scale,
-                trellis_lut,
-                gate_tile_cnt,
-                Int32(b_down.shape[0]) // Int32(256),
-                max_active_clusters,
-                stream,
-            )
+            if cutlass.const_expr(self.nvfp4_split_materialized):
+                self.materialized_phase2_kernel(
+                    intermediate_u32,
+                    b_down_u32,
+                    sfb_down_tensor,
+                    scatter_output,
+                    token_map,
+                    token_weights,
+                    task_expert,
+                    task_valid_rows,
+                    expert_tile_base,
+                    down_alpha,
+                    gate_tile_cnt,
+                    Int32(b_down.shape[0]) // Int32(128),
+                    max_active_clusters,
+                    stream,
+                )
+            else:
+                self.materialized_phase2_kernel(
+                    intermediate_u32,
+                    down_rp,
+                    down_sfb_rp,
+                    scatter_output,
+                    token_map,
+                    token_weights,
+                    task_expert,
+                    task_valid_rows,
+                    expert_tile_base,
+                    down_alpha,
+                    global_scale,
+                    trellis_lut,
+                    gate_tile_cnt,
+                    Int32(b_down.shape[0]) // Int32(256),
+                    max_active_clusters,
+                    stream,
+                )
 
     @cute.kernel
     def kernel(
@@ -2989,7 +3174,7 @@ class MoEDynamicKernelBackend:
         # routed scratch therefore needs no 4x-output clear; poison/replay
         # coverage verifies that phase 2 really overwrites the full domain.
         if cutlass.const_expr(
-            not (self.deterministic_output and self.external_materialized_fc2)
+            self.deepseek_v41 or not (self.deterministic_output and self.external_materialized_fc2)
         ):
             scatter_rows = Int32(scatter_output.shape[0])
             scatter_total_u32 = scatter_rows * cols_u32
@@ -3063,15 +3248,11 @@ class MoEDynamicKernelBackend:
                         m1_block_start,
                     )
                     if cutlass.const_expr(self.w4a8_trellis):
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                            _w4a8_trellis_permute_k32(m1_values),
-                            m1_block_max,
-                        )
+                        m1_payload, m1_mx_scale_byte = self._quantize_mx(_w4a8_trellis_permute_k32(m1_values),
+                        m1_block_max,)
                     else:
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                            m1_values,
-                            m1_block_max,
-                        )
+                        m1_payload, m1_mx_scale_byte = self._quantize_mx(m1_values,
+                        m1_block_max,)
                     for m1_payload_pair in cutlass.range_constexpr(4):
                         m1_packed64 = (
                             Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
@@ -3308,18 +3489,14 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3395,18 +3572,14 @@ class MoEDynamicKernelBackend:
                                         )
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         for payload_pair in cutlass.range_constexpr(4):
                                             packed64 = (
@@ -3745,18 +3918,14 @@ class MoEDynamicKernelBackend:
                                             block_max = fmax_f32(block_max, fabs_f32(value))
                                         if cutlass.const_expr(self.w4a8_trellis):
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    _w4a8_trellis_permute_k32(
-                                                        values
-                                                    ),
-                                                    block_max,
-                                                )
+                                                self._quantize_mx(_w4a8_trellis_permute_k32(
+                                                    values
+                                                ),
+                                                block_max,)
                                             )
                                         else:
                                             payload, mx_scale_byte = (
-                                                quantize_block_fp8_mx(
-                                                    values, block_max
-                                                )
+                                                self._quantize_mx(values, block_max)
                                             )
                                         output_offset = (
                                             phys_row * output_bytes_per_row + block_start
@@ -6391,14 +6560,10 @@ class MoEDynamicKernelBackend:
                                     values[elem_idx] = value
                                     block_max = fmax_f32(block_max, fabs_f32(value))
                                 if cutlass.const_expr(self.w4a8_trellis):
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
-                                        _w4a8_trellis_permute_k32(values),
-                                        block_max,
-                                    )
+                                    payload, mx_scale_byte = self._quantize_mx(_w4a8_trellis_permute_k32(values),
+                                    block_max,)
                                 else:
-                                    payload, mx_scale_byte = quantize_block_fp8_mx(
-                                        values, block_max
-                                    )
+                                    payload, mx_scale_byte = self._quantize_mx(values, block_max)
                                 pay_addr = (
                                     sa_flat_addr
                                     + row * Int32(self.tile_shape_mnk[2])
@@ -9273,7 +9438,15 @@ class MoEDynamicKernelBackend:
                     self.pass_final_barrier.wait_unaligned()
                     slice_idx += Int32(1)
 
-        if cutlass.const_expr(not self.is_w4a8):
+        # When the split-materialized path skips the consumer steady state
+        # entirely (external_materialized_fc1), the TMA producer warps never
+        # stage a single tile, so there are no outstanding pipeline arrivals
+        # to drain.  Skip the tails (the W4A8 split already relied on this
+        # exclusion via not is_w4a8); relying on fresh-pipeline acquire
+        # parity here would be untested behavior.
+        if cutlass.const_expr(
+            not self.is_w4a8 and not self.external_materialized_fc1
+        ):
             if warp_idx == self.tma_load_warp_id:
                 ml_pipeline.producer_tail(prod_state)
                 if self.is_gated:
