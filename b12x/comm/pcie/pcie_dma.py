@@ -41,6 +41,35 @@ SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
 
 
+def _eager_replay_capacities(
+    max_bytes: int,
+    min_bytes: int,
+    itemsize: int,
+    world_size: int,
+    *,
+    max_elements: int | None = None,
+) -> tuple[int, ...]:
+    """Fixed element capacities with eight-value shards on every supported ring."""
+    multiple = world_size * 8
+    elements = max_bytes // itemsize
+    if max_elements is not None:
+        if max_elements <= 0 or max_elements > elements:
+            raise ValueError("DMA dtype capacity must fit the positive ring byte bound")
+        elements = max_elements
+    elements -= elements % multiple
+    if elements <= 0:
+        raise ValueError("DMA replay capacity is too small")
+    size_bytes = 1 << (max(1 << 20, min_bytes) - 1).bit_length()
+    capacities = []
+    while size_bytes < elements * itemsize:
+        capacity = size_bytes // itemsize
+        capacity -= capacity % multiple
+        if capacity > 0:
+            capacities.append(capacity)
+        size_bytes *= 2
+    return (*capacities, elements)
+
+
 def _fp8_mode() -> str:
     """Opt-in compressed wire transport mode.
 
@@ -177,7 +206,8 @@ class PCIeDmaAllReduce:
         self._ipc.cudaSetDevice(self.device.index or 0)
         self._closed = False
         self._eager_replays: dict[
-            torch.dtype, tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph]
+            torch.dtype,
+            tuple[tuple[torch.Tensor, torch.Tensor, torch.cuda.CUDAGraph], ...],
         ] = {}
 
         self.shard_capacity = _align_up(
@@ -339,32 +369,67 @@ class PCIeDmaAllReduce:
             return False
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
-    def prepare_eager_replay(self, dtype: torch.dtype) -> None:
-        """Capture a capacity-sized lossless ring for later eager calls.
+    def prepare_eager_replay(
+        self, dtype: torch.dtype, *, max_elements: int | None = None
+    ) -> None:
+        """Precapture bounded-capacity lossless rings for later eager calls.
 
-        Call collectively before serving. Live sizes never select a graph:
-        each dtype reuses the planned capacity, and only the caller's prefix
-        is copied in/out. The private output cannot alias a retained result.
+        Call collectively before serving. Powers-of-two capacities, capped at
+        max_bytes, bound padding traffic without capturing on a request path.
+        Graphs borrow one private input/output allocation per dtype. Live sizes
+        select a covering graph, not a compilation or allocation cache entry.
+        The private output cannot alias a retained result.
+        max_elements bounds this dtype independently of the ring byte capacity,
+        so preparing FP32 reductions does not double BF16 replay storage.
         """
         if self._closed or self._fp8:
             raise ValueError("eager replay requires an open lossless DMA ring")
         if dtype not in SUPPORTED_DTYPES:
             raise TypeError(f"unsupported DMA replay dtype: {dtype}")
+        if max_elements is None:
+            elements = self.max_bytes // dtype.itemsize
+        else:
+            if isinstance(max_elements, bool) or not isinstance(max_elements, int):
+                raise TypeError("DMA replay max_elements must be an integer")
+            if max_elements * dtype.itemsize > self.max_bytes:
+                raise ValueError(
+                    f"DMA replay max_elements={max_elements} for {dtype} "
+                    f"exceeds max_bytes={self.max_bytes}"
+                )
+            elements = max_elements
+        alignment = self.world_size * 8
+        elements -= elements % alignment
+        if elements <= 0:
+            raise ValueError(
+                f"DMA replay capacity must contain at least {alignment} elements"
+            )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare DMA eager replay before CUDA graph capture")
+        capacities = _eager_replay_capacities(
+            self.max_bytes,
+            self.min_bytes,
+            dtype.itemsize,
+            self.world_size,
+            max_elements=max_elements,
+        )
         if dtype in self._eager_replays:
+            if capacities[-1] != self._eager_replays[dtype][-1][0].numel():
+                raise ValueError(
+                    "DMA dtype replay capacity cannot change after preparation"
+                )
             return
-        elements = self.max_bytes // dtype.itemsize
-        elements -= elements % (self.world_size * 8)
-        if elements <= 0:
-            raise ValueError("DMA replay capacity is too small")
+        elements = capacities[-1]
         with torch.cuda.device(self.device):
             source = torch.zeros(elements, dtype=dtype, device=self.device)
             result = torch.empty_like(source)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                self._all_reduce_on_device(source, out=result)
-        self._eager_replays[dtype] = (source, result, graph)
+            replays = []
+            for capacity in capacities:
+                source_view, result_view = source[:capacity], result[:capacity]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self._all_reduce_on_device(source_view, out=result_view)
+                replays.append((source_view, result_view, graph))
+        self._eager_replays[dtype] = tuple(replays)
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: Optional[torch.Tensor] = None
@@ -393,14 +458,18 @@ class PCIeDmaAllReduce:
             raise ValueError(
                 "output must match input shape/dtype/device and be contiguous"
             )
-        replay = self._eager_replays.get(inp.dtype)
-        if replay is not None and not torch.cuda.is_current_stream_capturing():
-            source, result, graph = replay
+        replays = self._eager_replays.get(inp.dtype)
+        if replays is not None and not torch.cuda.is_current_stream_capturing():
             elements = inp.numel()
-            source[:elements].copy_(inp.view(-1))
-            graph.replay()
-            out.view(-1).copy_(result[:elements])
-            return out
+            replay = next(
+                (item for item in replays if item[0].numel() >= elements), None
+            )
+            if replay is not None:
+                source, result, graph = replay
+                source[:elements].copy_(inp.view(-1))
+                graph.replay()
+                out.view(-1).copy_(result[:elements])
+                return out
         kernels = self._kernels
         world = self.world_size
         rank = self.rank

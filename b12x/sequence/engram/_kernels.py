@@ -13,7 +13,7 @@ import triton.language as tl
 from ..ple_hash._kernels import _request_ids_kernel, _reset_error_kernel, _source_token
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["prepared_tokens"])
 def _compress_validate(
     ids,
     token_mask,
@@ -25,6 +25,7 @@ def _compress_validate(
     num_tokens,
     compressed,
     error,
+    prepared_tokens,
     T: tl.constexpr,
     S: tl.constexpr,
     R: tl.constexpr,
@@ -33,7 +34,14 @@ def _compress_validate(
 ):
     i = tl.program_id(0)
     ns, nt = tl.load(num_seqs), tl.load(num_tokens)
-    capacity_ok = (ns >= 0) & (ns <= S) & (nt >= 0) & (nt <= T) & ((ns > 0) | (nt == 0))
+    capacity_ok = (
+        (ns >= 0)
+        & (ns <= S)
+        & (nt >= 0)
+        & (nt <= T)
+        & (nt <= prepared_tokens)
+        & ((ns > 0) | (nt == 0))
+    )
     if i == 0:
         tl.atomic_or(error, tl.where(capacity_ok, 0, 1))
     live_seq = (i < S) & (i < ns) & capacity_ok
@@ -63,7 +71,7 @@ def _compress_validate(
     tl.atomic_or(error, tl.where(live & ~valid, 4, 0))
     included = tl.load(token_mask + i, live, 0)
     value = tl.load(token_map + raw, live & valid & included, -1)
-    tl.store(compressed + i, value, i < T)
+    tl.store(compressed + i, value, i < prepared_tokens)
 
 
 @triton.jit
@@ -164,10 +172,14 @@ def hash_op(
     max_requests: int,
     compressed_vocab_size: int,
     pad: int,
+    prepared_tokens: int = -1,
 ) -> None:
     t, s = ids.numel(), starts.numel() - 1
+    prepared = t if prepared_tokens < 0 else prepared_tokens
+    if not 0 <= prepared <= t:
+        raise ValueError("prepared_tokens must be within the hash capacity")
     _reset_error_kernel[(1,)](error, num_warps=1)
-    _compress_validate[(max(t, s),)](
+    _compress_validate[(max(prepared, s),)](
         ids,
         token_mask,
         token_map,
@@ -178,6 +190,7 @@ def hash_op(
         num_tokens,
         compressed,
         error,
+        prepared,
         t,
         s,
         max_requests,
@@ -185,24 +198,25 @@ def hash_op(
         compressed_vocab_size,
         num_warps=1,
     )
-    _request_ids_kernel[(t,)](
-        starts, num_seqs, num_tokens, request_ids, error, MAX_TOKENS=t, num_warps=1
-    )
-    _hash[(t, 24)](
-        compressed,
-        starts,
-        slots,
-        history,
-        num_tokens,
-        request_ids,
-        multipliers,
-        primes,
-        offsets,
-        hashes,
-        error,
-        pad,
-        num_warps=1,
-    )
+    if prepared:
+        _request_ids_kernel[(prepared,)](
+            starts, num_seqs, num_tokens, request_ids, error, MAX_TOKENS=t, num_warps=1
+        )
+        _hash[(prepared, 24)](
+            compressed,
+            starts,
+            slots,
+            history,
+            num_tokens,
+            request_ids,
+            multipliers,
+            primes,
+            offsets,
+            hashes,
+            error,
+            pad,
+            num_warps=1,
+        )
 
 
 @hash_op.register_fake
@@ -225,6 +239,7 @@ def _hash_fake(
     max_requests,
     compressed_vocab_size,
     pad,
+    prepared_tokens=-1,
 ):
     return None
 
@@ -241,22 +256,28 @@ def lookup_op(
     shard_end: int,
     compact_rows: bool = False,
     prepared_tokens: int = -1,
+    clear_tail: bool = True,
 ) -> None:
     capacity = hashes.shape[0] if prepared_tokens < 0 else prepared_tokens
-    _lookup[(hashes.shape[0], 24)](
-        weight,
-        scale_bytes,
-        hashes,
-        num_tokens,
-        out,
-        capacity,
-        hashes.shape[0],
-        table_rows,
-        shard_start,
-        shard_end,
-        compact_rows,
-        num_warps=4,
-    )
+    if not 0 <= capacity <= hashes.shape[0]:
+        raise ValueError("prepared_tokens must be within the lookup capacity")
+    if capacity:
+        _lookup[(capacity, 24)](
+            weight,
+            scale_bytes,
+            hashes,
+            num_tokens,
+            out,
+            capacity,
+            hashes.shape[0],
+            table_rows,
+            shard_start,
+            shard_end,
+            compact_rows,
+            num_warps=4,
+        )
+    if clear_tail and capacity < hashes.shape[0]:
+        out[capacity:].zero_()
 
 
 @lookup_op.register_fake
@@ -271,5 +292,6 @@ def _lookup_fake(
     shard_end,
     compact_rows=False,
     prepared_tokens=-1,
+    clear_tail=True,
 ):
     return None

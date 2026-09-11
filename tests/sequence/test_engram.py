@@ -543,3 +543,74 @@ def test_disk_sparse_high_global_rows_without_whole_table_staging(tmp_path):
     assert stats["cache_bytes"] == 24 * (256 + 8)
     assert stats["ids_host_bytes"] == 24 * 8
     assert stats["owned_staging_bytes"] < 1 << 20
+
+
+def test_token_bounded_hash_preserves_unowned_tail_and_reuses_kernels():
+    device = require_b12x()
+    p = _plan(device, tokens=24)
+    b = _binding(p)
+    b.token_ids.copy_(torch.arange(24, device=device))
+    b.num_seqs.fill_(1)
+    history = b.committed_history.clone()
+    b.query_start_loc[1:].fill_(6)
+    b.num_tokens.fill_(6)
+    engram.run(b, token_count=6)
+    freeze_kernel_resolution("Engram live preparation bound")
+    try:
+        for count in (1, 6, 17, 0):
+            b.num_tokens.fill_(count)
+            b.query_start_loc[1:].fill_(count)
+            b.hash_ids.fill_(777)
+            b.compressed.fill_(777)
+            b.request_ids.fill_(777)
+            engram.run(b, token_count=count)
+            expected = hash_reference(
+                list(range(count)),
+                [True] * count,
+                [0, count],
+                [2],
+                history.cpu().tolist(),
+                list(range(32)),
+                p.geometry,
+                p.caps.layer_id,
+            )
+            torch.testing.assert_close(
+                b.hash_ids[:count].cpu(), expected, rtol=0, atol=0
+            )
+            assert b.hash_ids[count:].eq(777).all()
+            assert b.compressed[count:].eq(777).all()
+            assert b.request_ids[count:].eq(777).all()
+            assert b.error_code.item() == 0
+        b.num_tokens.fill_(7)
+        b.query_start_loc[1:].fill_(7)
+        engram.run(b, token_count=6)
+        assert b.error_code.item() != 0
+        assert b.hash_ids[:6].eq(-1).all()
+        torch.testing.assert_close(b.committed_history, history, rtol=0, atol=0)
+    finally:
+        unfreeze_kernel_resolution()
+
+
+@torch.inference_mode()
+def test_lookup_prefix_ownership_and_default_tail_clearing(tmp_path):
+    device = require_b12x()
+    p = _plan(device, tokens=24)
+    resident, disk = _disk_lookup_pair(p, tmp_path)
+    disk.hash_ids.fill_(p.shard_start)
+    disk.num_tokens.fill_(3)
+    engram.run_lookup(resident, token_count=6)
+    disk.out.fill_(7)
+    engram.run_lookup(disk, token_count=6, clear_tail=False)
+    torch.testing.assert_close(disk.out[:6], resident.out[:6], rtol=0, atol=0)
+    assert disk.out[6:].eq(7).all()
+    engram.run_lookup(disk, token_count=0)
+    assert disk.out.eq(0).all()
+    resident.out.fill_(7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        engram.run_lookup(resident, token_count=6, clear_tail=False)
+    resident.out.fill_(7)
+    resident.num_tokens.fill_(1)
+    graph.replay()
+    assert resident.out[1:6].eq(0).all()
+    assert resident.out[6:].eq(7).all()

@@ -838,7 +838,10 @@ def _nvfp4_pair_bfloat2_mg(
     """
     if cutlass.const_expr(kv_smem_stride == 544):
         return _nvfp4_pair_bfloat2(
-            kv_fp4_base_addr, entry, dim_even, Float32(1.0),
+            kv_fp4_base_addr,
+            entry,
+            dim_even,
+            Float32(1.0),
             kv_smem_stride=kv_smem_stride,
         )
     data_byte = _ld_u8_zext(
@@ -3935,7 +3938,10 @@ def _sparse_mla_prefill_mg_flat_launch(
         # v5: latent_scale_per_token joins the key (per-candidate fp32 scale
         # read from kv_sc smem). In that mode the launch scalar is dead, so the
         # identity fold is forced ON -- no per-scalar variants get compiled.
-        5,
+        # v6: paired-lane NVFP4/V4.1 PV dequantization.
+        # v7: one packed load/conversion per V4.1 SWA pair.
+        # v8: native shared byte loads for packed dequantization.
+        8,
         key_field(
             "latent_scale_identity",
             int(float(latent_scale) == 1.0 or bool(latent_scale_per_token)),
@@ -4294,7 +4300,9 @@ def run_unified_prefill_mg(
         pbs_extra = int(extra_page_block_size)
         if stride_extra_kv_block is None:
             if model_type == ModelType.DSV41:
-                stride_extra_kv_block = int(extra_kv_cache.stride(0)) * extra_kv_cache.element_size()
+                stride_extra_kv_block = (
+                    int(extra_kv_cache.stride(0)) * extra_kv_cache.element_size()
+                )
             else:
                 stride_extra_kv_block = _cache_block_stride_bytes(
                     extra_kv_cache,
