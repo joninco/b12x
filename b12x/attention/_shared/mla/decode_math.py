@@ -78,6 +78,8 @@ from b12x._lib.intrinsics import (
     mma_m16n8k16_f32_bf16,
     mma_m16n8k32_f32_e4m3,
     mxfp8_mma_m16n8k32_f32_e4m3,
+    mxfp8_pair_to_bf16x2_sm120,
+    nvfp4_pair_to_bf16x2_sm120,
     pack_f32x2_to_bfloat2,
     pow2_ceil_ue8m0,
     rcp_approx_ftz,
@@ -1422,10 +1424,7 @@ def _fp32_to_ue8m0_byte(scale: Float32) -> Uint32:
 @cute.jit
 def _ld_u8_zext(base_addr: Int32, byte_off: Int32) -> Uint32:
     """Load one u8 from smem (base+byte_off), zero-extended to u32."""
-    word = byte_off & ~Int32(3)
-    sh = (byte_off & Int32(3)) * Int32(8)
-    val = ld_shared_u32(base_addr + word)
-    return (val >> sh.to(Uint32)) & Uint32(0xFF)
+    return ld_shared_u8_offset(base_addr + byte_off, 0)
 
 
 @cute.jit
@@ -1509,23 +1508,44 @@ def _nvfp4_pair_bfloat2(
     ``latent_scale_per_token`` -- the record's own fp32 second-level scale,
     staged per candidate into the contiguous kv_sc buffer by the IO gather
     (record bytes [292, 296)).
+
+    The 544-byte mixed-source staging layout uses native SM120 packed
+    conversion with no outer scale: full-post-RoPE MXFP8 for SWA and NVFP4
+    for indexed candidates. UE8M0 byte zero represents 2**-127, not zero;
+    byte 255 represents NaN. Invalid source tags produce zero.
     """
     swa = Int32(0)
     if cutlass.const_expr(kv_smem_stride == 544):
         # DSV41's sources share a staging layout, never a cache ABI.
-        swa = ld_shared_u32(
-            kv_fp4_base_addr + entry * Int32(544) + Int32(528)
-        ).to(Int32)
+        swa = ld_shared_u32(kv_fp4_base_addr + entry * Int32(544) + Int32(528)).to(
+            Int32
+        )
+        result = Uint32(0)
+        if swa == Int32(1):
+            packed = _ld_u16_zext(kv_fp4_base_addr, entry * Int32(544) + dim_even)
+            scale = _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(544) + Int32(512) + dim_even // Int32(32),
+            )
+            result = mxfp8_pair_to_bf16x2_sm120(packed, scale)
+        elif swa == Int32(0):
+            packed = _ld_u8_zext(
+                kv_fp4_base_addr, entry * Int32(544) + dim_even // Int32(2)
+            )
+            scale = _ld_u8_zext(
+                kv_fp4_base_addr,
+                entry * Int32(544) + Int32(256) + dim_even // Int32(16),
+            )
+            result = nvfp4_pair_to_bf16x2_sm120(packed, scale)
+        return result
     v0 = Float32(0.0)
     v1 = Float32(0.0)
     scale_f = Float32(0.0)
     if swa == Int32(1):
-        v0 = cvt_e4m3_to_f32_via_f16(
-            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even)
+        packed = _ld_u16_zext(
+            kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even
         )
-        v1 = cvt_e4m3_to_f32_via_f16(
-            _ld_u8_zext(kv_fp4_base_addr, entry * Int32(kv_smem_stride) + dim_even + Int32(1))
-        )
+        v0, v1 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(packed))
         scale_f = _ue8m0_byte_to_fp32(
             _ld_u8_zext(
                 kv_fp4_base_addr,
@@ -2387,13 +2407,15 @@ def s6_xv_nope_nvfp4_bf16(
 ):
     """S6 (NVFP4): BF16 P.V over in-register dequantized E2M1 V.
 
-    V is the same 512-dim MLA latent as K-NoPE. The BF16 probabilities staged by
-    S5 are used directly as the A operand; each B scalar is dequantized from the
-    packed E2M1 byte and its E4M3 group-16 scale.
+    V is the same 512-dim MLA latent as K-NoPE. Adjacent output-column lanes
+    exchange decoded pairs, so each pair is dequantized once rather than once
+    per scalar consumer. MMA operands and their BF16 rounding remain unchanged.
     """
     p_stride = cutlass.const_expr(sm_p_stride if sm_p_stride else bi)
     gid = lane >> Int32(2)
     tid = lane & Int32(3)
+    entry_parity = gid & Int32(1)
+    pair_selector = Int32(0x5410 if entry_parity == Int32(0) else 0x3276)
     a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
     a_col = (lane >> Int32(4)) * Int32(8)
 
@@ -2413,44 +2435,28 @@ def s6_xv_nope_nvfp4_bf16(
                 a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(sm_p_full_addr + a_byte)
 
                 ent0 = k_base + tid * Int32(2)
-                v0 = _nvfp4_scalar_bf16_u16(
+                pair0 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
-                    ent0,
-                    col,
+                    ent0 + entry_parity,
+                    col & ~Int32(1),
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )
-                v1 = _nvfp4_scalar_bf16_u16(
+                pair8 = _nvfp4_pair_bfloat2(
                     kv_fp4_base_addr,
-                    ent0 + Int32(1),
-                    col,
+                    ent0 + Int32(8) + entry_parity,
+                    col & ~Int32(1),
                     latent_scale,
                     kv_smem_stride=kv_smem_stride,
                     latent_scale_per_token=latent_scale_per_token,
                     kv_sc_base_addr=kv_sc_base_addr,
                 )
-                v8 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(8),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                v9 = _nvfp4_scalar_bf16_u16(
-                    kv_fp4_base_addr,
-                    ent0 + Int32(9),
-                    col,
-                    latent_scale,
-                    kv_smem_stride=kv_smem_stride,
-                    latent_scale_per_token=latent_scale_per_token,
-                    kv_sc_base_addr=kv_sc_base_addr,
-                )
-                b0 = v0 | (v1 << Uint32(16))
-                b1 = v8 | (v9 << Uint32(16))
+                peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
+                peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
+                b0 = byte_perm(pair0, peer0, pair_selector)
+                b1 = byte_perm(pair8, peer8, pair_selector)
                 xv0, xv1, xv2, xv3 = mma_m16n8k16_f32_bf16(
                     xv0,
                     xv1,

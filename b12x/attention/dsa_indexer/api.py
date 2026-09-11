@@ -179,8 +179,15 @@ def bind(
     candidate_lengths: torch.Tensor | None = None,
     candidate_output: torch.Tensor | None = None,
     candidate_output_lengths: torch.Tensor | None = None,
+    score_width: int | None = None,
 ) -> Binding:
-    """Bind every live tensor to a paged DSA plan without launching work."""
+    """Bind live tensors without launching work.
+
+    ``score_width`` optionally bounds MXFP4 full-scan columns using a CPU-known
+    upper bound on visible compressed states. It must cover this invocation's
+    cache lengths; captured calls must cover the whole replay context range.
+    Scratch capacity and compiled kernels remain unchanged.
+    """
 
     if not isinstance(plan, Plan):
         raise TypeError("plan must be dsa_indexer.Plan")
@@ -206,7 +213,10 @@ def bind(
             candidate_lengths=candidate_lengths,
             candidate_output=candidate_output,
             candidate_output_lengths=candidate_output_lengths,
+            score_width=score_width,
         )
+    if score_width is not None:
+        raise ValueError("score_width requires an MXFP4 plan")
     if any(
         x is not None
         for x in (
