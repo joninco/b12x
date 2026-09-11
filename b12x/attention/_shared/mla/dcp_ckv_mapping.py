@@ -5,6 +5,13 @@ import triton
 import triton.language as tl
 
 
+# One program maps one query row over a single power-of-two tile, so the
+# accepted width is bounded by the largest tile the scan handles in one
+# program. 4096 covers the 2048-token DSA selection and the GLM5-Next
+# selection with its pooled tail (2048 + 4 - 1 columns).
+_MAX_WIDTH = 4096
+
+
 @triton.jit(
     do_not_specialize=[
         "requests",
@@ -111,7 +118,7 @@ def map_global_topk_to_gathered_ckv(
     cp_kv_cache_interleave_size: int,
     padded_rank_tokens: int,
 ) -> None:
-    """Map and stably compact up to 2048 selected IDs per query row.
+    """Map and stably compact up to 4096 selected IDs per query row.
 
     Metadata and outputs are int32; pointer arithmetic is int64. Invalid request
     IDs, negative tokens, missing local positions and rank-padding addresses are
@@ -129,8 +136,10 @@ def map_global_topk_to_gathered_ckv(
     )
     if any(t.dtype != torch.int32 for t in tensors):
         raise TypeError("CKV gather index metadata must be int32")
-    if token_indices.ndim != 2 or not 1 <= token_indices.shape[1] <= 2048:
-        raise ValueError("CKV selected indices require a matrix with width 1..2048")
+    if token_indices.ndim != 2 or not 1 <= token_indices.shape[1] <= _MAX_WIDTH:
+        raise ValueError(
+            f"CKV selected indices require a matrix with width 1..{_MAX_WIDTH}"
+        )
     if out.shape != token_indices.shape:
         raise ValueError("CKV gather index output shape does not match top-k input")
     rows = token_indices.shape[0]

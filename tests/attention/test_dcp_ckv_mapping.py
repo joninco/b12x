@@ -83,7 +83,7 @@ def test_mapping_rejects_invalid_cpu_contract(case):
     elif case == "shape":
         args[4] = args[4][:, :-1]
     elif case == "width":
-        args[1] = torch.zeros((3, 2049), dtype=torch.int32)
+        args[1] = torch.zeros((3, 4097), dtype=torch.int32)
     elif case == "req_shape":
         args[0] = args[0][:1]
     elif case == "rank_shape":
@@ -98,7 +98,7 @@ def test_mapping_rejects_invalid_cpu_contract(case):
         )
 
 
-@pytest.mark.parametrize("width", [1, 127, 128, 129, 2047, 2048])
+@pytest.mark.parametrize("width", [1, 127, 128, 129, 2047, 2048, 2051, 4096])
 @pytest.mark.parametrize("interleave", [1, 4])
 def test_mapping_stable_full_row_scan_matches_oracle(width, interleave):
     require_b12x()
