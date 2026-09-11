@@ -38,6 +38,7 @@ _QUERY_FIELDS = (
     "quant_mode",
     "source_format",
     "activation",
+    "numerical_recipe",
     "num_experts",
     "hidden_size",
     "intermediate_size",
@@ -207,6 +208,7 @@ def _config_covers_query(
         top_k=top_k,
         num_tokens=num_tokens,
         routed_rows=routed_rows,
+        numerical_recipe=str(query.get("numerical_recipe", "default")),
     )
     try:
         parsed_config = MoeDecodeConfig.from_profile(FrozenMapping(config))
@@ -509,7 +511,7 @@ class MoeDecodeGenerator:
     """Generate a broad MoE planner from staged per-geometry GPU races."""
 
     component_id = MOE_DECODE
-    query_schema_version = 4
+    query_schema_version = 5
     config_schema_version = 3
 
     def __init__(
