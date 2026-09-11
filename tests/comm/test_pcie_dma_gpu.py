@@ -72,6 +72,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
     hidden = 6144
     max_rows = 512
     row_multiple = (world_size * 8) // gcd(hidden, world_size * 8)
+    max_rows -= max_rows % row_multiple
 
     def valid_rows(rows: int) -> int:
         return ((rows + row_multiple - 1) // row_multiple) * row_multiple
@@ -88,7 +89,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         explicit_ref = _reference(explicit_inp)
         explicit_out = torch.empty_like(explicit_inp)
         with pytest.raises(ValueError, match="device"):
-            ring.all_reduce(explicit_inp, out=torch.empty_like(explicit_inp, device="cpu"))
+            ring.all_reduce(
+                explicit_inp, out=torch.empty_like(explicit_inp, device="cpu")
+            )
         with pytest.raises(ValueError, match="device"):
             ring.all_reduce(
                 explicit_inp,
@@ -123,35 +126,106 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     _assert_close(retained, retained_ref, world_size)
 
         if ring.wire_mode == "bf16":
-            ring.prepare_eager_replay(torch.bfloat16)
-            # Capacity is fixed while live prefixes shrink/grow. Later calls
-            # must not overwrite retained outputs through private graph buffers.
-            for iteration, requested_rows in enumerate((512, 8, 256, 64), 1):
-                rows = valid_rows(requested_rows)
-                inp = _make_input(rows, hidden, torch.bfloat16, device, rank, iteration)
-                ref = _reference(inp)
-                out = ring.all_reduce(inp)
-                torch.cuda.synchronize(device)
-                _assert_close(out, ref, world_size)
-                retained_outputs.append(out)
-                retained_refs.append(ref)
-                for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
-                    _assert_close(retained, retained_ref, world_size)
+            alignment = world_size * 8
+            planned_rows = valid_rows(256)
+            planned_elements = planned_rows * hidden
+            with pytest.raises(TypeError):
+                ring.prepare_eager_replay(torch.int32)
+            with pytest.raises(TypeError):
+                ring.prepare_eager_replay(torch.bfloat16, max_elements=1.5)
+            for dtype in (torch.bfloat16, torch.float32):
+                for invalid_bound in (
+                    -1,
+                    0,
+                    alignment - 1,
+                    ring.max_bytes // dtype.itemsize + 1,
+                ):
+                    with pytest.raises(ValueError):
+                        ring.prepare_eager_replay(dtype, max_elements=invalid_bound)
+                # Equivalent rounded bounds are idempotent. Overflow is rejected
+                # above even when rounding down would have made it fit.
+                ring.prepare_eager_replay(
+                    dtype, max_elements=planned_elements + alignment - 1
+                )
+                ring.prepare_eager_replay(dtype, max_elements=planned_elements)
+                ring.prepare_eager_replay(dtype, max_elements=planned_elements)
+                replays = ring._eager_replays[dtype]
+                assert replays[-1][0].numel() == planned_elements
+                assert (
+                    len({item[0].untyped_storage().data_ptr() for item in replays}) == 1
+                )
+                capacities = [item[0].numel() * dtype.itemsize for item in replays]
+                assert capacities == (
+                    [1 << 20, 2 << 20, 3 << 20]
+                    if dtype.itemsize == 2
+                    else [1 << 20, 2 << 20, 4 << 20, 6 << 20]
+                )
+                with pytest.raises(ValueError):
+                    ring.prepare_eager_replay(
+                        dtype, max_elements=planned_elements + alignment
+                    )
+                with pytest.raises(ValueError):
+                    ring.prepare_eager_replay(dtype)
 
-        # Captured callers provide stable output storage explicitly.
-        rows = valid_rows(256)
-        dtype = torch.bfloat16
-        inp = _make_input(rows, hidden, dtype, device, rank, 0)
-        out = torch.empty_like(inp)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            ring.all_reduce(inp, out=out)
-        for iteration in range(1, 4):
-            inp.copy_(_make_input(rows, hidden, dtype, device, rank, iteration))
+            # Legacy None still prepares the dtype's entire byte capacity.
+            ring.prepare_eager_replay(torch.float16)
+            ring.prepare_eager_replay(
+                torch.float16, max_elements=ring.max_bytes // torch.float16.itemsize
+            )
+            inp = _make_input(max_rows * 2, hidden, torch.float16, device, rank, 1)
             ref = _reference(inp)
-            graph.replay()
-            torch.cuda.synchronize(device)
-            _assert_close(out, ref, world_size)
+            retained_outputs.append(ring.all_reduce(inp))
+            retained_refs.append(ref)
+
+            # Both dtypes share an element cap, not a byte cap. Interleave
+            # shrinking/growing prefixes with raw calls above that cap, keeping
+            # every result alive across both replay buffers and shared epochs.
+            for iteration, requested_rows in enumerate(
+                (planned_rows, 8, 128, max_rows, 64), 1
+            ):
+                rows = valid_rows(requested_rows)
+                for dtype in (torch.bfloat16, torch.float32):
+                    inp = _make_input(rows, hidden, dtype, device, rank, iteration)
+                    ref = _reference(inp)
+                    retained_outputs.append(ring.all_reduce(inp))
+                    retained_refs.append(ref)
+
+        # Captured callers bypass private eager graphs and use stable outputs.
+        # Their graphs still share the channel's stream/flag epochs with eager
+        # graph replays and raw calls, including a different piece count.
+        rows = valid_rows(256)
+        capture_dtypes = (
+            (torch.bfloat16, torch.float32)
+            if ring.wire_mode == "bf16"
+            else (torch.bfloat16,)
+        )
+        captured = []
+        for dtype in capture_dtypes:
+            inp = _make_input(rows, hidden, dtype, device, rank, 0)
+            out = torch.empty_like(inp)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                ring.all_reduce(inp, out=out)
+            captured.append((inp, out, graph))
+        for iteration in range(1, 4):
+            for inp, out, graph in captured:
+                inp.copy_(_make_input(rows, hidden, inp.dtype, device, rank, iteration))
+                ref = _reference(inp)
+                graph.replay()
+                retained_outputs.append(out.clone())
+                retained_refs.append(ref)
+
+                eager_rows = max_rows if iteration == 2 else valid_rows(8)
+                eager_inp = _make_input(
+                    eager_rows, hidden, inp.dtype, device, rank, iteration + 3
+                )
+                eager_ref = _reference(eager_inp)
+                retained_outputs.append(ring.all_reduce(eager_inp))
+                retained_refs.append(eager_ref)
+
+        torch.cuda.synchronize(device)
+        for retained, retained_ref in zip(retained_outputs, retained_refs, strict=True):
+            _assert_close(retained, retained_ref, world_size)
 
         dist.barrier()
     finally:
@@ -276,9 +350,7 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     absolute_bits = bit_patterns.to(torch.int32) & 0x7FFF
     exponent = absolute_bits >> 7
     fraction = absolute_bits & 0x7F
-    expected_scales = torch.clamp(
-        exponent - 8 + (fraction > 96).to(torch.int32), min=0
-    )
+    expected_scales = torch.clamp(exponent - 8 + (fraction > 96).to(torch.int32), min=0)
     expected_scales = torch.where(
         absolute_bits == 0, torch.full_like(expected_scales, 127), expected_scales
     )
@@ -301,8 +373,8 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
         expected_scales == 255, torch.tensor(float("nan")), scale_values
     )
     expected_payload = (
-        source_values.float() / scale_values
-    ).to(torch.float8_e4m3fn).view(torch.uint8)
+        (source_values.float() / scale_values).to(torch.float8_e4m3fn).view(torch.uint8)
+    )
     is_inf = (exponent == 255) & (fraction == 0)
     is_nan = (exponent == 255) & (fraction != 0)
     expected_payload = torch.where(
@@ -319,6 +391,4 @@ def test_pcie_dma_mxfp8_quantize_is_exact_for_every_bf16_bit_pattern() -> None:
     )
 
     assert torch.equal(scales.cpu(), expected_scales)
-    assert torch.equal(
-        payload.cpu(), expected_payload.repeat_interleave(32)
-    )
+    assert torch.equal(payload.cpu(), expected_payload.repeat_interleave(32))

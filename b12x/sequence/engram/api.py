@@ -394,13 +394,21 @@ def bind_lookup(
     )
 
 
-def run(binding: Binding) -> torch.Tensor:
-    """Hash immutable committed context plus speculative query, without commits."""
+def run(binding: Binding, token_count: int | None = None) -> torch.Tensor:
+    """Hash immutable history/query without commits.
+
+    ``token_count`` is a host-known upper bound, never a read of the device
+    live-count scalar. Only that prefix is written; later output rows remain
+    untouched. The bound changes launch grids, not compiled capacity.
+    """
     from ._kernels import hash_op
 
     p, b = binding.plan, binding
     if p.caps.device.type != "cuda":
         raise ValueError("Engram run requires CUDA")
+    prepared = p.caps.max_tokens if token_count is None else operator.index(token_count)
+    if not 0 <= prepared <= p.caps.max_tokens:
+        raise ValueError("token_count must be within the planned token capacity")
     hash_op(
         b.token_ids,
         b.token_mask,
@@ -420,17 +428,22 @@ def run(binding: Binding) -> torch.Tensor:
         p.caps.max_requests,
         p.geometry.compressed_vocab_size,
         p.pad_id,
+        prepared,
     )
     return b.hash_ids
 
 
-def run_lookup(binding: LookupBinding, token_count: int | None = None) -> torch.Tensor:
+def run_lookup(
+    binding: LookupBinding, token_count: int | None = None, *, clear_tail: bool = True
+) -> torch.Tensor:
     """Prepare local rows; the caller performs its existing b12x all-reduce.
 
     ``token_count`` is a host-known padded preparation capacity, defaulting to
     max_tokens, never a host read of the GPU live-count scalar. Tokens outside
     that capacity are zero. Disk reads and dequantization run eagerly before
     any downstream graph replay; resident lookup remains capture-compatible.
+    ``clear_tail=False`` leaves rows beyond the preparation bound untouched;
+    callers using it must own initialization and retired-row clearing.
     """
     from ._kernels import lookup_op
 
@@ -451,6 +464,7 @@ def run_lookup(binding: LookupBinding, token_count: int | None = None) -> torch.
             p.shard_start,
             p.shard_end,
             prepared_tokens=prepared,
+            clear_tail=clear_tail,
         )
     else:
         _require_disk_eager(p.caps.device)
@@ -468,6 +482,7 @@ def run_lookup(binding: LookupBinding, token_count: int | None = None) -> torch.
                 p.shard_end,
                 compact_rows=True,
                 prepared_tokens=prepared,
+                clear_tail=clear_tail,
             )
     return b.out
 
