@@ -148,3 +148,20 @@ def test_query_bmm_graph_replay_uses_changed_inputs_and_stable_output():
         graph.replay()
         _assert_fp32_accumulation_bound(query, weight, out)
         assert out.data_ptr() == pointer
+
+
+def test_query_bmm_is_registered_with_lazy_entry_points():
+    import b12x
+
+    meta = b12x.find_op("gemm.mla_query_bmm")
+    assert meta is mla_query_bmm.META
+    assert set(mla_query_bmm.__all__) == set(meta.entry_points) | {"META"}
+    for name in meta.entry_points:
+        assert getattr(mla_query_bmm, name) is getattr(api, name)
+
+
+def test_query_bmm_clear_caches_drops_compiled_launches(monkeypatch):
+    launches = {0: object()}
+    monkeypatch.setattr(api, "_LAUNCHES", launches)
+    mla_query_bmm.clear_caches()
+    assert launches == {}

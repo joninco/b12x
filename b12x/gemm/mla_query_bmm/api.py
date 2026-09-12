@@ -9,6 +9,7 @@ from b12x._lib.compiler import KernelCompileSpec, compile as compile_kernel
 from b12x._lib.gating import default_is_supported
 from b12x._lib.utils import current_cuda_stream, make_ptr
 
+from . import META
 from ._kernel import QueryBmmKernel
 
 _LAUNCHES: dict[int, object] = {}
@@ -22,8 +23,13 @@ def can_implement(
         num_heads == 8
         and 1 <= max_m <= 8192
         and (k, n) == (192, 512)
-        and default_is_supported(device, requires=("cutlass",))
+        and is_supported(device)
     )
+
+
+def is_supported(device=None) -> bool:
+    """True when an SM120/SM121 target and the CUTLASS DSL are available."""
+    return default_is_supported(device, requires=META.requires)
 
 
 def _span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -142,3 +148,11 @@ def run(lhs: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> torch.Ten
 def prewarm(lhs: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
     """Compile and first-launch using caller-provided buffers before capture."""
     run(lhs, weight, out)
+
+
+def clear_caches() -> None:
+    """Drop the compiled launches; the next call outside capture recompiles."""
+    _LAUNCHES.clear()
+
+
+__all__ = list(META.entry_points)
