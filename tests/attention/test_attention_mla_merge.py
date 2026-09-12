@@ -432,3 +432,39 @@ def test_single_active_split_reuses_different_capacity_strides() -> None:
             )
     finally:
         unfreeze_kernel_resolution()
+
+
+@torch.inference_mode()
+def test_static_chunk_count_merge_ignores_the_device_word() -> None:
+    """A merge bound with ``num_chunks`` never reads ``num_chunks_ptr``.
+
+    The unified decode path relies on this: it binds the planned split count
+    as a static kernel constant and does not write the workspace word per
+    launch. A merge that silently fell back to the word would read the stale
+    value planted here and merge the wrong number of splits.
+    """
+    device = require_b12x()
+    rows, heads, chunks = 2, 16, 4
+    problem = _make_fixed_merge_problem(
+        rows=rows, heads=heads, chunks=chunks, device=device
+    )
+    (partials, lse), _ = _make_merge_scenarios(
+        rows=rows, heads=heads, chunks=chunks, device=device
+    )
+    expected = _split_merge_fp32_oracle(partials, lse, chunks=chunks, attn_sink=None)
+    for stale in (1, chunks + 3, 0):
+        problem.num_chunks_ptr.fill_(stale)
+        _install_scenario(
+            problem, partials=partials, lse=lse, live_sink=None, source_sink=None
+        )
+        mla_merge.run_sparse_mla_split_decode_merge(
+            tmp_output=problem.tmp_output,
+            tmp_lse=problem.tmp_lse,
+            num_chunks_ptr=problem.num_chunks_ptr,
+            num_chunks=chunks,
+            output=problem.output,
+        )
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            problem.output.float(), expected, atol=1.5e-2, rtol=1.5e-2
+        )
