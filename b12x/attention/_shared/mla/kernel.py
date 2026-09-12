@@ -2685,9 +2685,13 @@ def run_unified_decode(
         extra_topk=extra_topk,
         preferred_num_splits=preferred_num_splits,
     )
-    # Binding only maps caller-owned views; initialize stream-ordered control
-    # words here so freshly bound storage is valid in eager and graph launches.
-    workspace.num_chunks_ptr.fill_(num_splits)
+    # No launch on this path reads ``workspace.num_chunks_ptr``: the merge
+    # binding below carries ``num_chunks=num_splits`` as a static kernel
+    # constant, and the final-LSE reconstruction takes the count as an
+    # integer. A per-launch fill of the word would add one kernel per
+    # attention layer to every forward and every captured graph. Merges bound
+    # without a static count read the word written by
+    # ``workspace.set_split_chunk_config``.
     # Side-channel record of the chosen split plan (benchmarks / AutoTuner read
     # LAST_DECODE_PLAN["num_splits"]). Informational only.
     native_glm_h8 = bool(
