@@ -67,6 +67,7 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     ld_global_nc_v2_u32,
     ld_global_nc_v4_u32,
+    ld_global_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
     ld_shared_f32,
@@ -550,6 +551,34 @@ def s0_load_q_bf16_to_smem(
 
 
 @cute.jit
+def _query_vector_address(
+    q_token: cute.Tensor,
+    head: Int32,
+    dimension: Int32,
+    peer_pointers: tuple,
+    token: Int64,
+    local_heads: cutlass.Constexpr,
+    head_dim: cutlass.Constexpr,
+) -> Int64:
+    """Address a local or published peer query vector using 64-bit offsets."""
+    if cutlass.const_expr(len(peer_pointers) == 0):
+        offset = cute.crd2idx((head, dimension), q_token.layout)
+        return get_ptr_as_int64(q_token, offset)
+    else:
+        peer = head // Int32(local_heads)
+        address = Int64(peer_pointers[0].toint())
+        for rank in cutlass.range_constexpr(1, len(peer_pointers)):
+            if peer == Int32(rank):
+                address = Int64(peer_pointers[rank].toint())
+        offset = (
+            token * Int64(local_heads * head_dim)
+            + Int64(head % Int32(local_heads)) * Int64(head_dim)
+            + Int64(dimension)
+        )
+        return address + offset * Int64(2)
+
+
+@cute.jit
 def s0_quantize_q_vec(
     q_token: cute.Tensor,  # (NUM_HEADS, D_QK) bf16 view for this token; dim stride 1
     q_fp8_base_addr: Int32,  # u32 smem addr of q_fp8 (rows of q_nope_stride bytes)
@@ -568,6 +597,9 @@ def s0_quantize_q_vec(
     num_threads: cutlass.Constexpr,  # 128 or 256 math threads
     barrier_id: cutlass.Constexpr,
     hpb_local: cutlass.Constexpr = 8,  # heads staged by this CTA (8 or 16)
+    peer_query_pointers: tuple = (),
+    query_token: Int64 = Int64(0),
+    peer_local_heads: cutlass.Constexpr = 8,
 ):
     """S0 with 16-byte global loads for the 8- and 16-head decode paths.
 
@@ -605,8 +637,20 @@ def s0_quantize_q_vec(
             w2 = Uint32(0)
             w3 = Uint32(0)
             if slot < Int32(slots) and h < valid_hpb:
-                q_off = cute.crd2idx((head_base + h, d), q_token.layout)
-                w0, w1, w2, w3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+                address = _query_vector_address(
+                    q_token,
+                    head_base + h,
+                    d,
+                    peer_query_pointers,
+                    query_token,
+                    peer_local_heads,
+                    d_nope + d_rope,
+                )
+                # PCIe peer payloads require ordinary global loads.
+                if cutlass.const_expr(len(peer_query_pointers)):
+                    w0, w1, w2, w3 = ld_global_v4_u32(address)
+                else:
+                    w0, w1, w2, w3 = ld_global_nc_v4_u32(address)
             q_words.append((w0, w1, w2, w3))
 
     rope_groups = d_rope // 8
@@ -620,10 +664,19 @@ def s0_quantize_q_vec(
             rh = tid // Int32(rope_groups)
             rg = tid - rh * Int32(rope_groups)
             if rh < valid_hpb:
-                q_off = cute.crd2idx(
-                    (head_base + rh, Int32(d_nope) + rg * Int32(8)), q_token.layout
+                address = _query_vector_address(
+                    q_token,
+                    head_base + rh,
+                    Int32(d_nope) + rg * Int32(8),
+                    peer_query_pointers,
+                    query_token,
+                    peer_local_heads,
+                    d_nope + d_rope,
                 )
-                r0, r1, r2, r3 = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, q_off))
+                if cutlass.const_expr(len(peer_query_pointers)):
+                    r0, r1, r2, r3 = ld_global_v4_u32(address)
+                else:
+                    r0, r1, r2, r3 = ld_global_nc_v4_u32(address)
 
     # ── Phase B: Q-RoPE row copy (bf16 pass-through; zero-filled invalid heads). ──
     if cutlass.const_expr(d_rope > 0):
