@@ -120,6 +120,61 @@ def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(monkey
     channel.close()
 
 
+@pytest.mark.parametrize("max_rows", [1, 16, 24, 32, 64])
+def test_channel_capacity_sizes_the_pool_and_rejects_no_positive_value(
+    monkeypatch, max_rows
+):
+    """Any positive capacity reaches the pool as its batch size."""
+    requested = {}
+
+    class Runtime:
+        rank = 0
+        _signal_ptrs = [100]
+        _staging1_ptrs = [200]
+        _slot_bytes = 100
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            requested["gather_threads"] = kwargs["threads"]
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            requested["reduce_threads"] = kwargs["threads"]
+
+    class Pool:
+        _logical_channels = {"target": Runtime()}
+
+        def prepare_channels(self, ids):
+            pass
+
+        def close(self):
+            pass
+
+    def from_process_group(**kwargs):
+        requested.update(kwargs)
+        return Pool()
+
+    monkeypatch.setattr(module.PCIeDCPA2APool, "from_process_group", from_process_group)
+    monkeypatch.setattr(module.dist, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(module, "_normalize_device", lambda device: torch.device("cpu"))
+    monkeypatch.setattr(module, "precompile_local_lse_mask", lambda *args: None)
+    monkeypatch.setattr(
+        module,
+        "_tensor_from_cuda_pointer",
+        lambda *a, **kw: torch.zeros(4, dtype=torch.uint8),
+    )
+    channel = module.PCIeDCPAttention(
+        process_group=object(), device="cpu", channel_id="target", max_rows=max_rows
+    )
+    assert requested["max_batch_size"] == max_rows
+    assert channel.max_rows == max_rows
+    assert (channel.threads, channel.block_limit) == (512, 16)
+    assert requested["gather_threads"] == requested["reduce_threads"] == 512
+    channel.close()
+    with pytest.raises(ValueError, match="positive row capacity"):
+        module.PCIeDCPAttention(
+            process_group=object(), device="cpu", channel_id="target", max_rows=0
+        )
+
+
 @pytest.mark.parametrize("masked", [False, True])
 def test_compiled_attention_calls_keep_channel_identity_and_lifetime(
     monkeypatch, masked
@@ -127,18 +182,23 @@ def test_compiled_attention_calls_keep_channel_identity_and_lifetime(
     channel = object.__new__(module.PCIeDCPAttention)
     channel.device = torch.device("cpu")
     channel.channel_id = "target-attention"
+    channel.threads, channel.block_limit = 512, 16
     channel._closed = False
     channel._state = torch.zeros(4, dtype=torch.uint8)
     channel._handle = next(module._HANDLES)
     module._CHANNELS[channel._handle] = channel
     calls = []
 
-    def gather(query, out, *, channel_id):
+    def gather(query, out, *, channel_id, threads, block_limit):
+        assert (threads, block_limit) == (512, 16)
         calls.append(("query", channel_id))
         out.copy_(query.repeat(1, 4, 1))
 
-    def combine(partial, lse, out, *, channel_id, is_lse_base_on_e):
+    def combine(
+        partial, lse, out, *, channel_id, is_lse_base_on_e, threads, block_limit
+    ):
         assert is_lse_base_on_e
+        assert (threads, block_limit) == (512, 16)
         calls.append(("combine", channel_id))
         out.copy_(partial[:, :1])
 
@@ -187,19 +247,22 @@ def test_local_lse_mask_uses_each_query_length_under_frozen_graph_replay():
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
-    lse = torch.randn((16, 64), device=device)[:, ::2]
-    lengths = torch.empty(16, dtype=torch.int32, device=device)
-    output = torch.empty((16, 32), device=device)
+    capacity = 64
+    lse = torch.randn((capacity, 64), device=device)[:, ::2]
+    lengths = torch.empty(capacity, dtype=torch.int32, device=device)
+    output = torch.empty((capacity, 32), device=device)
     kernel = precompile_local_lse_mask(32, device.index)
     freeze_kernel_resolution("Per-query LSE mask reuses one static head geometry")
     try:
-        for rows in range(1, 17):
+        # Rows 1 through 16 plus the larger uniform decode graph sizes up to
+        # the 64-row transport capacity.
+        for rows in (*range(1, 17), 24, 32, 40, 48, 56, 64):
             assert precompile_local_lse_mask(32, device.index) is kernel
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 mask_local_lse(lse[:rows], lengths[:rows], output[:rows])
             for version in range(2):
-                lengths.copy_((torch.arange(16, device=device) + version) % 4)
+                lengths.copy_((torch.arange(capacity, device=device) + version) % 4)
                 lse.normal_()
                 lse[lengths == 0] = float("nan")
                 expected = lse.masked_fill(lengths[:, None] == 0, -torch.inf)

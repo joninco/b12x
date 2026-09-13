@@ -63,7 +63,7 @@ def _merge_op(
         or len(peer_slabs) != 4
         or rank not in range(4)
         or state.numel() < PAYLOAD_OFFSET + packed.numel() * packed.element_size()
-        or not 1 <= packed.shape[0] <= max_rows <= 16
+        or not 1 <= packed.shape[0] <= max_rows
         or topk not in (512, 1024, 2048)
         or state.numel() != PAYLOAD_OFFSET + max_rows * topk * 8
     ):
@@ -103,6 +103,9 @@ class PCIeDCPTopKPull(_IPCChannel):
 
     Construct collectively on a CPU process group before graph capture. The
     capacity is fixed, while live rows 1 through capacity remain launch arguments.
+    The capacity sizes this rank's published slab (max_rows x K score/id pairs);
+    publication strides 16 CTAs over the live rows and selection runs one block
+    per live row, so every positive capacity shares one compiled geometry.
     Keep the channel alive while its graph exists; close collectively only after
     all graph work has completed. Independent graphs require independent channels.
     No allocation, peer mapping, or compiler resolution occurs during replay.
@@ -112,9 +115,10 @@ class PCIeDCPTopKPull(_IPCChannel):
         device = _normalize_device(device)
         if dist.get_world_size(process_group) != 4:
             raise ValueError("DCP candidate pull requires a four-rank process group")
-        if not 1 <= max_rows <= 16 or topk not in (512, 1024, 2048):
+        if max_rows < 1 or topk not in (512, 1024, 2048):
             raise ValueError(
-                "DCP candidate pull requires capacity 1..16 and K=512/1024/2048"
+                "DCP candidate pull requires a positive row capacity and "
+                "K=512/1024/2048"
             )
         if _is_current_stream_capturing(device):
             raise RuntimeError("Construct DCP candidate channels before graph capture")

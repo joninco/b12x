@@ -44,7 +44,13 @@ def _query_op(
     channel = _channel(handle, state)
     if query.dtype != torch.bfloat16 or torch._C._overlaps(query, out):
         raise ValueError("DCP query requires BF16 input and disjoint output storage")
-    channel._pool.all_gather_heads(query, out, channel_id=channel.channel_id)
+    channel._pool.all_gather_heads(
+        query,
+        out,
+        channel_id=channel.channel_id,
+        threads=channel.threads,
+        block_limit=channel.block_limit,
+    )
 
 
 @_query_op.register_fake
@@ -68,7 +74,13 @@ def _combine_op(
             "DCP combine requires BF16 partials and disjoint output storage"
         )
     channel._pool.lse_reduce_scatter(
-        partial, lse, out, channel_id=channel.channel_id, is_lse_base_on_e=True
+        partial,
+        lse,
+        out,
+        channel_id=channel.channel_id,
+        is_lse_base_on_e=True,
+        threads=channel.threads,
+        block_limit=channel.block_limit,
     )
 
 
@@ -111,9 +123,22 @@ class PCIeDCPAttention:
 
     Construct collectively on a four-rank CPU group with a semantic channel id
     shared by all ranks. Geometry and capacity are fixed; live rows are runtime
-    launch arguments. Enter capture() before torch.cuda.graph(). Different
-    graphs require different instances even if they use the same CUDA stream.
-    Query and combine outputs are caller-owned and must not alias inputs.
+    launch arguments. The capacity max_rows sizes the two staging slots (rows x
+    4*local_heads x max(query_dim, output_dim) BF16 values plus one float32 LSE
+    per head) and bounds the rows a call may exchange; the kernels stride their
+    warps over rows x heads, so any positive capacity uses the same compiled
+    geometry. Enter capture() before torch.cuda.graph(). Different graphs
+    require different instances even if they use the same CUDA stream. Query and
+    combine outputs are caller-owned and must not alias inputs.
+
+    threads and block_limit are the launch geometry of both exchange kernels.
+    The defaults (512 threads, at most 16 blocks) are the fastest setting of a
+    sweep over 128 to 512 threads and 16 to 64 blocks on four PCIe 5.0 RTX PRO
+    6000 ranks (benchmarks/benchmark_pcie_dcp_a2a.py, world size 4): against
+    256 threads with 16 blocks the paired gather and reduce take 9 % less at
+    4 rows, 11 % less at 16, 15 % less at 32 and 17 % less at 64 rows. Larger
+    block limits did not improve any row count. The environment overrides
+    B12X_PCIE_DCP_THREADS and B12X_PCIE_DCP_BLOCK_LIMIT still take precedence.
     """
 
     def __init__(
@@ -126,13 +151,18 @@ class PCIeDCPAttention:
         local_heads: int = 8,
         query_dim: int = 576,
         output_dim: int = 512,
+        threads: int = 512,
+        block_limit: int = 16,
     ):
         self.device = _normalize_device(device)
-        if dist.get_world_size(process_group) != 4 or not 1 <= max_rows <= 16:
+        if dist.get_world_size(process_group) != 4 or max_rows < 1:
             raise ValueError(
-                "DCP attention requires four ranks and capacity 1 through 16"
+                "DCP attention requires four ranks and a positive row capacity"
             )
         self.channel_id = channel_id
+        self.max_rows = int(max_rows)
+        self.threads = int(threads)
+        self.block_limit = int(block_limit)
         self._closed = False
         self._pool = PCIeDCPA2APool.from_process_group(
             process_group=process_group,
@@ -147,8 +177,10 @@ class PCIeDCPAttention:
             # Preparation compiles geometry without assigning an execution
             # stream. The model-loading stream need not own the captured graph.
             runtime = self._pool._logical_channels[channel_id]
-            runtime.prepare_graph_all_gather_heads()
-            runtime.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16)
+            runtime.prepare_graph_all_gather_heads(threads=self.threads)
+            runtime.prepare_graph_lse_reduce_scatter(
+                dtype=torch.bfloat16, threads=self.threads
+            )
             precompile_local_lse_mask(local_heads * 4, self.device.index)
             self.allocated_bytes = (
                 runtime._staging1_ptrs[runtime.rank]

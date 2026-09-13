@@ -41,6 +41,47 @@ def test_compiled_candidate_merge_enforces_planned_geometry(monkeypatch, mismatc
         compiled(packed, out)
 
 
+@pytest.mark.parametrize("rows", [17, 32, 64])
+def test_compiled_candidate_merge_accepts_capacities_above_sixteen_rows(
+    monkeypatch, rows
+):
+    """A 64-row channel publishes and selects live rows up to its capacity."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from b12x.comm.pcie import pcie_dcp_topk_pull as module
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    channel = object.__new__(module.PCIeDCPTopKPull)
+    channel.device, channel.rank = device, 0
+    channel.topk, channel.max_rows = 2048, 64
+    channel._state = torch.empty(
+        module.PAYLOAD_OFFSET + 64 * 2048 * 8, dtype=torch.uint8, device=device
+    )
+    channel._peer_slabs = [channel._state.data_ptr()] * 4
+    packed = torch.empty((rows, 2048, 2), device=device)
+    out = torch.empty((rows, 2048), dtype=torch.int32, device=device)
+    launches = []
+
+    def publication(rank, topk, device_index):
+        return lambda signals, source, destination, live_rows, stream: launches.append(
+            ("publish", live_rows)
+        )
+
+    def selection(pointers, output, row_stride):
+        launches.append(("select", output.shape[0]))
+
+    monkeypatch.setattr(module, "precompile_candidate_publication", publication)
+    monkeypatch.setattr(module, "select_peer_topk", selection)
+    compiled = torch.compile(channel.merge, backend="eager", fullgraph=True)
+    compiled(packed, out)
+    assert launches == [("publish", rows), ("select", rows)]
+    with pytest.raises(ValueError, match="geometry are incompatible"):
+        compiled(
+            torch.empty((65, 2048, 2), device=device),
+            torch.empty((65, 2048), dtype=torch.int32, device=device),
+        )
+
+
 def test_peer_selector_ties_signed_zero_by_token_id():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -64,14 +105,17 @@ def test_peer_selector_exact_repeatable_all_live_rows(topk):
         pytest.skip("CUDA required")
     device = torch.device("cuda", torch.cuda.current_device())
     compiled = precompile_peer_topk(topk, 4, device.index)
-    slabs = torch.empty((4, 16, topk + 8, 2), device=device)
+    capacity = 64
+    slabs = torch.empty((4, capacity, topk + 8, 2), device=device)
     pointers = tuple(slabs[r].data_ptr() for r in range(4))
-    output = torch.full((16, topk + 8), -7, dtype=torch.int32, device=device)
+    output = torch.full((capacity, topk + 8), -7, dtype=torch.int32, device=device)
     freeze_kernel_resolution(
-        "Peer top-k reuses static geometry across rows 1 through 16"
+        "Peer top-k reuses static geometry across rows 1 through 64"
     )
     try:
-        for rows in range(1, 17):
+        # Rows 1 through 16 plus the larger uniform decode graph sizes up to
+        # the 64-row transport capacity.
+        for rows in (*range(1, 17), 24, 32, 40, 48, 56, 64):
             assert precompile_peer_topk(topk, 4, device.index) is compiled
             out = output[:rows, :topk]
             graph = torch.cuda.CUDAGraph()

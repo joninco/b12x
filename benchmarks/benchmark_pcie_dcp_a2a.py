@@ -1,3 +1,22 @@
+"""Graph-replay latency of the PCIe DCP query gather and LSE reduce-scatter.
+
+One PCIeDCPA2APool per rank serves every measured batch and launch geometry;
+each (batch, threads, block limit) triple captures its own reduce, gather and
+paired graphs and reports the median of three 2,000-replay timings, maximum
+over ranks. Environment variables select the sweep:
+
+  B12X_PCIE_DCP_A2A_WORLD_SIZE  ranks and GPUs (default 8; the serving DCP
+                                group is 4)
+  B12X_PCIE_DCP_A2A_MAX_BATCH   pool row capacity (default 64)
+  B12X_PCIE_DCP_A2A_BATCHES     live row counts (default 1,2,4,8,16,32,64)
+  B12X_PCIE_DCP_A2A_LAUNCHES    THREADSxBLOCKS tuples (default 256x16, the
+                                kernels' launch default)
+  B12X_PCIE_DCP_A2A_QUERY_DTYPE bf16 or fp8 query storage (default bf16)
+
+The production geometry overrides B12X_PCIE_DCP_THREADS and
+B12X_PCIE_DCP_BLOCK_LIMIT must be unset so the sweep measures what it names.
+"""
+
 from __future__ import annotations
 
 import json
@@ -23,7 +42,7 @@ from b12x.comm.pcie.pcie_dcp_a2a import (
 TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
 HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_HEAD_DIM", "512"))
 QUERY_HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
-MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "8"))
+MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "64"))
 GEOMETRY_OVERRIDE_ENVS = (
     "B12X_PCIE_DCP_THREADS",
     "B12X_PCIE_DCP_BLOCK_LIMIT",
@@ -46,10 +65,11 @@ def _launches(world_size: int) -> tuple[tuple[int, int], ...]:
                 "B12X_PCIE_DCP_A2A_LAUNCHES must contain "
                 "comma-separated THREADSxBLOCKS tuples"
             ) from exc
-        if not world_size <= threads <= 1024 or threads % 32 != 0:
+        # PCIeDCPA2A accepts block sizes that are multiples of 32 up to 512.
+        if not world_size <= threads <= 512 or threads % 32 != 0:
             raise ValueError(
                 f"invalid launch {raw!r}: threads must be a multiple of 32 "
-                f"in [{world_size}, 1024]"
+                f"in [{world_size}, 512]"
             )
         if not 1 <= blocks <= 64:
             raise ValueError(f"invalid launch {raw!r}: blocks must be in [1, 64]")
@@ -69,7 +89,7 @@ def _reject_production_geometry_overrides() -> None:
 
 
 def _batches() -> tuple[int, ...]:
-    batches = _csv_ints("B12X_PCIE_DCP_A2A_BATCHES", "1,2,4,8")
+    batches = _csv_ints("B12X_PCIE_DCP_A2A_BATCHES", "1,2,4,8,16,32,64")
     invalid = tuple(batch for batch in batches if not 1 <= batch <= MAX_BATCH)
     if invalid:
         raise ValueError(
