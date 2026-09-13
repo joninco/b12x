@@ -752,6 +752,36 @@ def _exchange_setup_failures(
     return tuple(statuses)
 
 
+def _visible_sm_count(device: torch.device) -> Optional[int]:
+    """SMs the residency checks may count on, or None off CUDA devices."""
+
+    try:
+        visible_sms = int(
+            torch.cuda.get_device_properties(device).multi_processor_count
+        )
+    except Exception:
+        return None
+    test_visible_sms = int(os.getenv("B12X_PCIE_TEST_VISIBLE_SM_COUNT", "0") or "0")
+    if test_visible_sms > 0:
+        visible_sms = min(visible_sms, test_visible_sms)
+    return visible_sms
+
+
+def fused_row_capacity(visible_sms: Optional[int], max_concurrent_channels: int) -> int:
+    """Rows one fused all-reduce + RMSNorm launch may carry on a pool.
+
+    The fused kernel runs at least one peer-waiting CTA per row, so the rows
+    of every channel that may launch concurrently must fit the visible SMs
+    (`_require_full_grid_residency`), and a launch never exceeds the
+    _MAX_BLOCKS barrier records of the signal layout. Off CUDA devices the
+    layout capacity is returned.
+    """
+
+    if visible_sms is None:
+        return _MAX_BLOCKS
+    return max(1, min(_MAX_BLOCKS, visible_sms // max(1, int(max_concurrent_channels))))
+
+
 def _require_full_grid_residency(
     *,
     owner: str,
@@ -763,10 +793,13 @@ def _require_full_grid_residency(
 
     The PCIe worker kernels use ``__launch_bounds__(512, 1)`` and zero dynamic
     shared memory, so every visible SM can host at least one worker CTA.  A
-    device with at least the extension's maximum block count can therefore
-    make the complete grid resident regardless of block scheduling order.  We
-    intentionally reject smaller/MIG-like slices instead of assuming CUDA
-    schedules matching block indices in the same order on every rank.
+    device with at least ONESHOT_REQUIRED_SMS SMs per concurrent channel can
+    therefore make a plain all-reduce grid resident regardless of block
+    scheduling order; fused all-reduce + RMSNorm launches, which may run up to
+    _MAX_BLOCKS CTAs, are bounded per pool by ``fused_row_capacity`` so that
+    every concurrent launch still fits the visible SMs.  We intentionally
+    reject smaller/MIG-like slices instead of assuming CUDA schedules matching
+    block indices in the same order on every rank.
     """
 
     local_error: BaseException | None = None
@@ -1400,15 +1433,20 @@ def _load_extension():
     return _CuTeOneshotBackend()
 
 
-_SIGNAL_BYTES = 150_528
+# Signal buffer bytes per rank and the CTA capacity of one launch; both must
+# equal _oneshot_cute.SIGNAL_BYTES and _oneshot_cute._MAX_BLOCKS, which derive
+# the barrier layout from them (kept literal here so that importing this
+# module does not load the CuTe DSL).
+_SIGNAL_BYTES = 267_264
 _POINTER_TABLE_BYTES = 16 * 8
-_MAX_BLOCKS = 36
+_MAX_BLOCKS = 64
 _MAX_RANKS = 16
 _REG_PACKS = 3
-# Fused kernel geometry for small row counts: one CTA of _WIDE_CTA_THREADS
-# threads per row, one pack per thread (hidden 6144 = 768 packs).
+# Fused kernel geometry: one CTA of _WIDE_CTA_THREADS threads per row, one
+# pack per thread (hidden 6144 = 768 packs), for every row count the kernel
+# accepts; the reduce-scatter / all-gather transport requires this geometry.
 _WIDE_CTA_THREADS = 768
-_WIDE_CTA_MAX_ROWS = 16
+_WIDE_CTA_MAX_ROWS = _MAX_BLOCKS
 # From this row count on the reduce-scatter / all-gather transport gathers the
 # reduced rows in the activation dtype (16 bytes per pack) instead of fp32; below
 # it the fp32 gather keeps the RMS-norm input unrounded.
@@ -1643,10 +1681,12 @@ class _CuTeOneshotBackend:
     def _launch_geometry(size_packs: int) -> tuple[int, int]:
         threads = int(os.getenv("B12X_PCIE_ONESHOT_THREADS", "256"))
         threads = min(512, max(64, (threads // 32) * 32))
+        # Plain launches stay within the per-channel residency requirement
+        # (ONESHOT_REQUIRED_SMS CTAs) that the pool checks at construction.
         block_limit = int(os.getenv("B12X_PCIE_ONESHOT_BLOCK_LIMIT", "8"))
-        if block_limit <= 0 or block_limit > _MAX_BLOCKS:
+        if block_limit <= 0 or block_limit > ONESHOT_REQUIRED_SMS:
             raise ValueError(
-                f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {_MAX_BLOCKS}]"
+                f"B12X_PCIE_ONESHOT_BLOCK_LIMIT must be in [1, {ONESHOT_REQUIRED_SMS}]"
             )
         blocks = max(1, min(block_limit, (size_packs + threads - 1) // threads))
         return threads, blocks
@@ -1774,16 +1814,20 @@ class _CuTeOneshotBackend:
     def _fused_geometry(row_capacity: int) -> tuple[int, int]:
         """Threads per CTA and 16-byte packs per thread of the fused kernel.
 
-        Up to _WIDE_CTA_MAX_ROWS rows each row is reduced by one CTA of 768
-        threads holding one pack each: every peer load of a thread is
-        independent, the RMS square sum needs no cross-CTA exchange, and the
-        kernel variant carries no unused pack slots (TP8, hidden 6144:
-        13.5 -> 11.4 us at 1 row, 25.0 -> 23.7 us at 4 rows). With the
-        reduce-scatter / all-gather transport the wide geometry stays ahead
-        of the 256-thread geometry and of NCCL up to 16 rows (22.8 us at 8
-        rows, 31.8 us at 16 against 36.6 / 65.1 us for the pull transport).
-        Above _WIDE_CTA_MAX_ROWS the 256-thread geometry with up to
-        _REG_PACKS packs per thread is used.
+        Up to _WIDE_CTA_MAX_ROWS rows (every row count the kernel accepts)
+        each row is reduced by one CTA of 768 threads holding one pack each:
+        every peer load of a thread is independent, the RMS square sum needs
+        no cross-CTA exchange, and the kernel variant carries no unused pack
+        slots (TP8, hidden 6144: 13.5 -> 11.4 us at 1 row, 25.0 -> 23.7 us
+        at 4 rows). With the reduce-scatter / all-gather transport the wide
+        geometry stays ahead of the 256-thread pull geometry and of NCCL at
+        every row count (TP8, hidden 6144, bf16, graph replay: 25.1 us at 16
+        rows, 38.0 at 32, 59.7 at 64 against 95.6 / 123.3 us for the pull
+        geometry at 24 / 32 rows and 65.4 / 74.1 / 120.6 us for NCCL plus a
+        separate RMSNorm at 16 / 32 / 64 rows; TP4: 26.7 / 41.4 us at 32 / 64
+        rows against 37.1 us for the pull geometry at 32 rows and 49.5 / 91.9
+        us for NCCL). Above _WIDE_CTA_MAX_ROWS the 256-thread geometry with up
+        to _REG_PACKS packs per thread is used.
         B12X_PCIE_FUSED_THREADS overrides the thread count for every row
         count and keeps _REG_PACKS packs per thread.
         """
@@ -2249,6 +2293,12 @@ def _compute_crossover_size(
 
 class PCIeOneshotAllReduce:
     """Standalone unfused PCIe oneshot allreduce runtime."""
+
+    # Layout capacity of all_reduce_fused_add_rms_norm: the fused kernel runs
+    # at least one CTA per row and a launch owns at most _MAX_BLOCKS barrier
+    # records. Pools narrow this to the rows whose CTAs stay resident on the
+    # device (fused_row_capacity); callers route larger inputs elsewhere.
+    fused_max_rows = _MAX_BLOCKS
 
     def __init__(
         self,
@@ -3729,6 +3779,11 @@ class PCIeOneshotAllReducePool:
             self.world_size,
             self._transport_policy,
         )
+        # Rows per fused all-reduce + RMSNorm launch on this pool: every
+        # concurrent channel's CTAs must stay resident (one CTA per row).
+        self.fused_max_rows = fused_row_capacity(
+            _visible_sm_count(self.device), self.max_concurrent_channels
+        )
         self.exchange_group = resolved_group
         self.process_group = self.exchange_group
         self._channel_factory = channel_factory
@@ -4123,6 +4178,15 @@ class PCIeOneshotAllReducePool:
             else:
                 channel.prepare_graph_all_reduce(inp, peer_input_ptrs=peer_input_ptrs)
 
+    def _check_fused_rows(self, inp: torch.Tensor) -> None:
+        rows = inp.numel() // int(inp.shape[-1]) if inp.ndim > 0 else 1
+        if rows > self.fused_max_rows:
+            raise ValueError(
+                f"fused allreduce RMSNorm supports at most {self.fused_max_rows} "
+                f"rows on this pool ({self.max_concurrent_channels} concurrent "
+                f"channels on {_visible_sm_count(self.device)} SMs); got {rows}"
+            )
+
     def prepare_graph_fused_add_rms_norm(
         self,
         inp: torch.Tensor,
@@ -4132,6 +4196,7 @@ class PCIeOneshotAllReducePool:
     ) -> None:
         """Prepare the fused graph specialization on an eager channel."""
 
+        self._check_fused_rows(inp)
         with _device_guard(self.device):
             channel = self.for_stream(stream)
             if stream is not None and self.device.type == "cuda":
@@ -4216,6 +4281,7 @@ class PCIeOneshotAllReducePool:
         stream: object = None,
         channel_id: Optional[str] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._check_fused_rows(inp)
         channel = self.for_stream(stream, channel_id=channel_id)
 
         def run() -> tuple[torch.Tensor, torch.Tensor]:

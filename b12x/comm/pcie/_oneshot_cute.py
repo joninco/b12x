@@ -51,7 +51,12 @@ from ._cute_intrinsics import (
 )
 
 
-_MAX_BLOCKS = 36
+# Barrier capacity of one signal buffer: every CTA of a launch owns one
+# self counter and one flag record per rank in each of the two barrier slots.
+# The fused kernel's reduce-scatter / all-gather transport runs one CTA per
+# row, so this is also its row capacity (64 rows of hidden 6144 in bf16 is the
+# 768 KB fused all-reduce of a 64-row decode step).
+_MAX_BLOCKS = 64
 _MAX_RANKS = 16
 _FLAG_STRIDE = 32
 _SELF_COUNTER_BYTES = _MAX_BLOCKS * _MAX_RANKS * 4
@@ -65,14 +70,20 @@ _GRAPH_ARRIVED_OFFSET = _SELF_COUNTER_BYTES + 8
 _PLAIN_GRAPH_EPOCH_OFFSET = _SELF_COUNTER_BYTES + 12
 _PLAIN_GRAPH_ARRIVED_OFFSET = _SELF_COUNTER_BYTES + 16
 _PLAIN_GRAPH_LAST_EPOCH = 0xFFFFFFFD
+# Multi-CTA rows of the fused kernel exchange their RMS square sums through
+# the signal buffer: one arrive counter and one generation word per row (up to
+# _RMS_MAX_ROWS rows), then one fp32 partial per CTA.
+_RMS_MAX_ROWS = 64
 _RMS_ARRIVE_OFFSET = _SELF_COUNTER_BYTES + _PEER_COUNTER_BYTES
-_RMS_GEN_OFFSET = 150_016
-_RMS_PARTIAL_OFFSET = 150_272
+_RMS_GEN_OFFSET = _RMS_ARRIVE_OFFSET + _RMS_MAX_ROWS * 4
+_RMS_PARTIAL_OFFSET = _RMS_GEN_OFFSET + _RMS_MAX_ROWS * 4
 # One device-scope arrive counter and one generation word per signal buffer for the
-# fused kernel's leader barrier; they follow the per-block RMS partials and stay
-# inside the 150528-byte signal allocation.
+# fused kernel's leader barrier; they follow the per-block RMS partials.
 _LEADER_ARRIVE_OFFSET = _RMS_PARTIAL_OFFSET + _MAX_BLOCKS * 4
 _LEADER_GEN_OFFSET = _LEADER_ARRIVE_OFFSET + 4
+# Size of one signal buffer, padded to 256 bytes; PCIeOneshotAllReducePool
+# allocates this many bytes per rank (see pcie_oneshot._SIGNAL_BYTES).
+SIGNAL_BYTES = (_LEADER_GEN_OFFSET + 4 + 255) // 256 * 256
 _REG_PACKS = 3
 
 _DTYPE_PACK_ELEMS = {"float32": 4, "float16": 8, "bfloat16": 8}

@@ -625,6 +625,64 @@ def test_fused_launch_plan_groups_live_rows_by_capacity_variant(monkeypatch) -> 
     assert {plan.ctas_per_row for plan in plans.values()} == {1}
 
 
+def test_fused_launch_plan_runs_one_wide_cta_per_row_up_to_sixty_four_rows(
+    monkeypatch,
+) -> None:
+    """Rows 17 to 64 keep the 768-thread single-CTA geometry, so the
+    reduce-scatter / all-gather transport covers every row count the fused
+    kernel accepts (the launch rejects more rows than _MAX_BLOCKS)."""
+
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    state = _make_cute_state(8)
+
+    for rows in (17, 24, 32, 36, 40, 48, 56, 64):
+        plan = _CuTeOneshotBackend._fused_launch_plan(
+            state, torch.empty((rows, 6144), dtype=torch.bfloat16)
+        )
+        assert plan.rows == rows
+        assert plan.ctas_per_row == 1
+        assert plan.variant.threads == 768
+        assert plan.variant.reg_packs == 1
+        assert plan.variant.mode == "stage_scatter_gather_packed", rows
+
+
+@pytest.mark.parametrize(
+    ("visible_sms", "channels", "expected"),
+    (
+        (188, 1, 64),  # RTX PRO 6000 Blackwell, the vLLM communicator's single channel
+        (188, 2, 64),
+        (188, 6, 31),
+        (72, 2, 36),  # the 36-SM-per-channel residency minimum
+        (48, 1, 48),
+        (None, 3, 64),  # no CUDA device: layout capacity
+    ),
+)
+def test_fused_row_capacity_keeps_every_concurrent_launch_resident(
+    visible_sms, channels: int, expected: int
+) -> None:
+    from b12x.comm.pcie.pcie_oneshot import fused_row_capacity
+
+    assert fused_row_capacity(visible_sms, channels) == expected
+
+
+def test_signal_layout_matches_the_cute_backend() -> None:
+    """The pool allocates pcie_oneshot._SIGNAL_BYTES per rank without loading
+    the CuTe DSL; the backend derives the barrier and RMS layout from the same
+    capacity and must fit inside that allocation."""
+
+    from b12x.comm.pcie import _oneshot_cute, pcie_oneshot
+
+    assert pcie_oneshot._SIGNAL_BYTES == _oneshot_cute.SIGNAL_BYTES
+    assert pcie_oneshot._MAX_BLOCKS == _oneshot_cute._MAX_BLOCKS == 64
+    assert pcie_oneshot.PCIeOneshotAllReduce.fused_max_rows == pcie_oneshot._MAX_BLOCKS
+    assert pcie_oneshot._WIDE_CTA_MAX_ROWS == pcie_oneshot._MAX_BLOCKS
+    assert _oneshot_cute._RMS_MAX_ROWS >= pcie_oneshot._MAX_BLOCKS
+    assert _oneshot_cute._RMS_GEN_OFFSET > _oneshot_cute._GRAPH_ARRIVED_OFFSET
+    assert _oneshot_cute._LEADER_GEN_OFFSET + 4 <= _oneshot_cute.SIGNAL_BYTES
+    assert _oneshot_cute.SIGNAL_BYTES % 256 == 0
+
+
 @pytest.mark.parametrize(
     (
         "world_size",
@@ -645,7 +703,7 @@ def test_fused_launch_plan_groups_live_rows_by_capacity_variant(monkeypatch) -> 
             4,
             "B12X_PCIE_TP4_REMOTE_PUSH",
             (32, 6144),
-            "stage_pull",
+            "stage_scatter_gather_packed",
             "stage_remote_push",
         ),
     ),

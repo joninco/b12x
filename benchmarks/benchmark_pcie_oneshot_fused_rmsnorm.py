@@ -80,11 +80,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         128 * 1024,
         max(rows_to_benchmark) * hidden_size * dtype.itemsize,
     )
+    # One channel shared by every captured graph, as the vLLM communicator
+    # constructs the pool; graph replays select their slot on the device.
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
         max_input_bytes=max_bytes,
         max_size=max_bytes,
+        single_channel=True,
+        max_concurrent_channels=1,
     )
     pool.for_stream()
     try:
@@ -101,18 +105,22 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             fused_residual = torch.randn(shape, dtype=dtype, device=device)
             fused_out = torch.empty_like(fused_in)
             fused_residual_out = torch.empty_like(fused_in)
-            pool.prepare_graph_fused_add_rms_norm(fused_in)
-            fused_graph = _capture(
-                lambda: pool.all_reduce_fused_add_rms_norm(
-                    fused_in,
-                    fused_residual,
-                    weight,
-                    epsilon,
-                    out=fused_out,
-                    residual_out=fused_residual_out,
-                ),
-                pool,
-            )
+            # Row counts above the fused kernel's CTA capacity report NaN for
+            # the fused column so that the NCCL reference still prints.
+            fused_graph = None
+            if rows <= getattr(pool, "fused_max_rows", rows):
+                pool.prepare_graph_fused_add_rms_norm(fused_in)
+                fused_graph = _capture(
+                    lambda: pool.all_reduce_fused_add_rms_norm(
+                        fused_in,
+                        fused_residual,
+                        weight,
+                        epsilon,
+                        out=fused_out,
+                        residual_out=fused_residual_out,
+                    ),
+                    pool,
+                )
 
             bare_in = torch.randn(shape, dtype=dtype, device=device) * 0.01
             bare_residual = torch.randn(shape, dtype=dtype, device=device)
@@ -143,7 +151,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 )
 
             nccl_graph = _capture(nccl_then_rms)
-            fused_us = _median_latency(fused_graph, device)
+            fused_us = (
+                _median_latency(fused_graph, device)
+                if fused_graph is not None
+                else float("nan")
+            )
             bare_us = _median_latency(bare_graph, device)
             nccl_us = _median_latency(nccl_graph, device)
             if rank == 0:

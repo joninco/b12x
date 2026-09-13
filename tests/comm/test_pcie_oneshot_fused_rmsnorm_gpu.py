@@ -624,7 +624,16 @@ def _run_pdl_dependent(
             dist.barrier()
 
 
+# Graph-replayed row counts. The first pool holds one eager channel and three
+# graph channels (four concurrent channels: 47 rows per launch on 188 SMs) and
+# covers the 16-row limit of a 192 KB fused launch; the second pool holds one
+# eager and one graph channel (64 rows per launch) and covers the 64-row step
+# of a 768 KB limit, one CTA per row up to _MAX_BLOCKS.
 _GRAPH_SCATTER_GATHER_ROWS = (4, 8, 16)
+_GRAPH_SCATTER_GATHER_WIDE_ROWS = (64,)
+_SCATTER_GATHER_POOL_BYTES = 64 * 6144 * 2
+_EAGER_SCATTER_GATHER_ROWS = (2, 3, 4, 5, 6, 8, 16, 24, 32)
+_EAGER_SCATTER_GATHER_WIDE_ROWS = (48, 64)
 
 
 def _graph_scatter_gather_channel(rows: int) -> str:
@@ -635,18 +644,25 @@ def _run_scatter_gather_modes(
     pool: PCIeOneshotAllReducePool,
     device: torch.device,
     rank: int,
+    *,
+    eager_channel_id: str,
+    eager_rows: tuple[int, ...],
+    graph_rows: tuple[int, ...],
+    expected_modes: set[str],
 ) -> None:
-    """Execute both scatter-gather kernel modes eagerly and under graph
+    """Execute the scatter-gather kernel modes eagerly and under graph
     replay. The pool must hold scatter-gather eager storage (at world size
     8 this needs ``B12X_PCIE_TP8_OWNER_REDUCE=0``), so that rows from
     ``_SCATTER_GATHER_MIN_ROWS`` below ``_PACKED_GATHER_MIN_ROWS`` plan
     ``stage_scatter_gather`` (fp32 gather region) and rows from
-    ``_PACKED_GATHER_MIN_ROWS`` plan ``stage_scatter_gather_packed``."""
+    ``_PACKED_GATHER_MIN_ROWS`` plan ``stage_scatter_gather_packed``, each
+    with one CTA per row."""
 
     world_size = dist.get_world_size()
     hidden_size = 6144
     epsilon = 1e-6
     assert _eager_payload_shards(world_size) == _SCATTER_GATHER_SLOT_MULTIPLIER
+    assert max(*eager_rows, *graph_rows) <= pool.fused_max_rows
 
     def expected_mode(rows: int) -> str:
         if rows >= _PACKED_GATHER_MIN_ROWS:
@@ -655,17 +671,19 @@ def _run_scatter_gather_modes(
             return "stage_scatter_gather"
         return "stage_pull"
 
-    eager_channel = pool.for_stream(channel_id="eager:scatter-gather")
+    eager_channel = pool.for_stream(channel_id=eager_channel_id)
     eager_state = eager_channel._ext._state(eager_channel._ptr)
     assert eager_state.scatter_gather_storage
     modes_seen = set()
     for dtype in (torch.bfloat16, torch.float16):
-        for rows in (2, 3, 4, 5, 6, 8, 16):
+        for rows in eager_rows:
             inp, residual, weight = _make_inputs(
                 rows, hidden_size, dtype, device, rank, iteration=200 + rows
             )
-            mode = _CuTeOneshotBackend._fused_launch_plan(eager_state, inp).variant.mode
+            plan = _CuTeOneshotBackend._fused_launch_plan(eager_state, inp)
+            mode = plan.variant.mode
             assert mode == expected_mode(rows), (rows, mode)
+            assert plan.ctas_per_row == 1, (rows, plan.ctas_per_row)
             modes_seen.add(mode)
             expected_out, expected_residual = _reference(inp, residual, weight, epsilon)
             out, residual_out = pool.all_reduce_fused_add_rms_norm(
@@ -673,19 +691,27 @@ def _run_scatter_gather_modes(
                 residual,
                 weight,
                 epsilon,
-                channel_id="eager:scatter-gather",
+                channel_id=eager_channel_id,
             )
             torch.cuda.synchronize(device)
             _assert_close(out, expected_out, dtype)
             _assert_close(residual_out, expected_residual, dtype)
-    assert modes_seen == {
-        "stage_pull",
-        "stage_scatter_gather",
-        "stage_scatter_gather_packed",
-    }
+    assert modes_seen == expected_modes
+
+    # Rows above the pool's capacity are rejected before any launch.
+    too_many = pool.fused_max_rows + 1
+    inp, residual, weight = _make_inputs(
+        too_many, hidden_size, torch.bfloat16, device, rank, iteration=199
+    )
+    with pytest.raises(ValueError, match="rows on this pool"):
+        pool.all_reduce_fused_add_rms_norm(
+            inp, residual, weight, epsilon, channel_id=eager_channel_id
+        )
+    torch.cuda.synchronize(device)
+    dist.barrier()
 
     dtype = torch.bfloat16
-    for rows in _GRAPH_SCATTER_GATHER_ROWS:
+    for rows in graph_rows:
         # Each independently replayable graph needs its own logical channel,
         # bound to its own stream.
         channel_id = _graph_scatter_gather_channel(rows)
@@ -751,22 +777,47 @@ def _scatter_gather_worker(rank: int, world_size: int, port: int) -> None:
         world_size=world_size,
         timeout=timedelta(seconds=TEST_TIMEOUT_SECONDS),
     )
-    graph_channels = tuple(
-        _graph_scatter_gather_channel(rows) for rows in _GRAPH_SCATTER_GATHER_ROWS
-    )
-    pool = PCIeOneshotAllReducePool.from_process_group(
-        process_group=dist.group.WORLD,
-        device=device,
-        max_input_bytes=192 * 1024,
-        max_size=192 * 1024,
-        max_concurrent_channels=1 + len(graph_channels),
-    )
     try:
-        pool.prepare_channels(("eager:scatter-gather", *graph_channels))
-        _run_scatter_gather_modes(pool, device, rank)
-        torch.cuda.synchronize(device)
+        for eager_channel_id, eager_rows, graph_rows, expected_modes in (
+            (
+                "eager:scatter-gather",
+                _EAGER_SCATTER_GATHER_ROWS,
+                _GRAPH_SCATTER_GATHER_ROWS,
+                {"stage_pull", "stage_scatter_gather", "stage_scatter_gather_packed"},
+            ),
+            (
+                "eager:scatter-gather-wide",
+                _EAGER_SCATTER_GATHER_WIDE_ROWS,
+                _GRAPH_SCATTER_GATHER_WIDE_ROWS,
+                {"stage_scatter_gather_packed"},
+            ),
+        ):
+            graph_channels = tuple(
+                _graph_scatter_gather_channel(rows) for rows in graph_rows
+            )
+            pool = PCIeOneshotAllReducePool.from_process_group(
+                process_group=dist.group.WORLD,
+                device=device,
+                max_input_bytes=_SCATTER_GATHER_POOL_BYTES,
+                max_size=_SCATTER_GATHER_POOL_BYTES,
+                max_concurrent_channels=1 + len(graph_channels),
+            )
+            try:
+                pool.prepare_channels((eager_channel_id, *graph_channels))
+                _run_scatter_gather_modes(
+                    pool,
+                    device,
+                    rank,
+                    eager_channel_id=eager_channel_id,
+                    eager_rows=eager_rows,
+                    graph_rows=graph_rows,
+                    expected_modes=expected_modes,
+                )
+                torch.cuda.synchronize(device)
+            finally:
+                pool.close()
+            dist.barrier()
     finally:
-        pool.close()
         dist.destroy_process_group()
 
 
