@@ -295,6 +295,7 @@ def _trellis256_execution_lut(
 # _TC_DECODE_M is retained for callers and tests that enumerate the range.
 _TC_DECODE_MAX_M = _W4A16_SMALL_M_DIRECT_MAX_M
 _TC_DECODE_M = tuple(range(1, _TC_DECODE_MAX_M + 1))
+_PACKED_DECODE_WIDE_FC2_MAX_M = 64
 
 
 def _w4a16_tc_decode_preferred(
@@ -9321,21 +9322,14 @@ def compile_w4a16_fused_moe(
             fc1_tile_n = 256
             fc1_tile_k = wide_fc1_tile_k
             fc1_cta_threads = 256
-    # Packed decode FC2 wide-N override: the direct path right-sizes grid_x to
-    # the FC1 mn-tile count, while the expert-packed path uses the same
-    # persistent cap with a device-known live block count. FC2
-    # (N=hidden_size, K=intermediate_size) with the default tile_n=128 produces
-    # route_blocks*(hidden_size/128) mn-tiles -- roughly double FC1's count --
-    # so FC2 would need ~2 persistent waves while FC1 fits in 1; that second
-    # FC2 wave is pure serialized tail latency on the bandwidth-bound decode.
-    # Selecting tile_n=256 for FC2 (a 256-wide N slab per CTA over full K)
-    # halves FC2's mn-tile count so it also fits one wave. Guarded by smem-fit,
-    # hidden_size%256==0, and matching cta_threads so the fused single
-    # thread-geometry contract is preserved.
+    # A 256-column FC2 tile halves the number of output tiles per expert.
+    # Packed decode supports this geometry through 64 planned token rows;
+    # its capacity limit is independent of direct routing's 16-row limit.
+    # Keep the shared-memory fit and common FC1/FC2 thread count checks.
     if (
         weight_layout == "packed"
         and int(moe_block_size) == 8
-        and int(size_m) <= _TC_DECODE_MAX_M
+        and int(size_m) <= _PACKED_DECODE_WIDE_FC2_MAX_M
         and int(hidden_size) % 256 == 0
         and fc2_tile_n == 128
         and fc1_cta_threads == 256

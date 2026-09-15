@@ -3454,6 +3454,102 @@ def test_w4a16_moe_swiglu_limit_matches_oracle_under_cuda_graph() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_w4a16_wide_fc2_reuses_capacity_kernel_with_changing_routes() -> None:
+    """Packed decode must keep its oracle and allocation contract on replay."""
+    import b12x
+    from b12x.moe import fused_moe
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    torch.manual_seed(20260915)
+    experts, hidden, intermediate, topk = 128, 512, 256, 8
+    counts = (17, 32, 33, 63, 64)
+    weights = _make_weights(
+        experts=experts, hidden_size=hidden,
+        intermediate_size=intermediate, activation="silu",
+    )
+    w13, s13, g13, w2, s2, g2 = weights
+    weight_plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16, nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=experts, hidden_size=hidden,
+            intermediate_size=intermediate,
+        ),
+        constraints=fused_moe.WeightPlanConstraints(
+            required_packing=fused_moe.WeightPacking.MMA_PACKED,
+        ),
+    )
+    prepared = fused_moe.prepare_weights(
+        plan=weight_plan,
+        weights=fused_moe.PackedWeights(
+            w13=w13.clone(), w2=w2.clone(), w13_block_scales=s13,
+            w2_block_scales=s2, w13_global_scales=g13, w2_global_scales=g2,
+        ),
+    )
+    plan = fused_moe.plan_execution(
+        experts=prepared,
+        capacity=fused_moe.ExecutionCapacity(
+            max_tokens=64, top_k=topk, warmup_token_counts=counts,
+        ),
+    )
+    fused_moe.prewarm(plan)
+    spec, = plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device="cuda")
+    bindings = []
+    for m in counts:
+        x = (torch.randn(m, hidden, device="cuda") * 0.25).bfloat16()
+        ids = torch.randint(experts, (m, topk), device="cuda", dtype=torch.int32)
+        route_weights = torch.softmax(torch.randn(m, topk, device="cuda"), -1)
+        output = torch.empty_like(x)
+        binding = fused_moe.bind(
+            plan, scratch=scratch, a=x, experts=prepared, topk_ids=ids,
+            topk_weights=route_weights, output=output, input_scales_static=True,
+        )
+        fused_moe.run(binding=binding)
+        bindings.append((x, ids, route_weights, output, binding))
+    launches = [
+        value for value in w4a16_kernel._FUSED_CACHE.values()
+        if value.hidden_size == hidden and value.intermediate_size == intermediate
+        and value.weight_layout == "packed" and value.moe_block_size == 8
+        and not value.direct_topk_routes
+    ]
+    assert launches, [
+        (value.hidden_size, value.intermediate_size, value.weight_layout,
+         value.moe_block_size, value.direct_topk_routes)
+        for value in w4a16_kernel._FUSED_CACHE.values()
+    ]
+    assert all(value.fc2_tile_n == 256 for value in launches)
+    assert len({id(value.compiled) for value in launches}) == 1
+    cache_keys = set(w4a16_kernel._FUSED_CACHE)
+    for x, ids, route_weights, output, binding in bindings:
+        graph = torch.cuda.CUDAGraph()
+        b12x.freeze_kernel_resolution("packed decode capacity replay")
+        try:
+            with torch.cuda.graph(graph):
+                fused_moe.run(binding=binding)
+            for routing in ("independent", "shared"):
+                if routing == "shared":
+                    ids.fill_(experts - 1)
+                expected = _reference_w4a16(
+                    x, *weights, ids, route_weights, activation="silu",
+                )
+                output.fill_(float("nan"))
+                allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+                assert bool(torch.isfinite(output).all())
+                assert bool(output.count_nonzero())
+                _assert_matches_oracle(output, expected, activation="silu")
+        finally:
+            b12x.unfreeze_kernel_resolution()
+    assert set(w4a16_kernel._FUSED_CACHE) == cache_keys
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_w4a16_preplanned_capacity_launch_accepts_smaller_live_m() -> None:
     torch.manual_seed(20260522)
     experts, hidden_size, intermediate_size = 8, 128, 128
