@@ -25,10 +25,12 @@ from b12x.comm.pcie.pcie_oneshot import (
     _RETAINED_FAILED_IPC_EXPORTS,
     _CuTeOneshotBackend,
     _CuTeOneshotState,
+    _eager_payload_shards,
     _eager_storage_shards,
     _enable_device_slot_selection,
     _tp2_plain_remote_push_enabled,
     _transport_policy_contract,
+    _uses_scatter_gather_storage,
     _uses_sharded_eager_storage,
     parse_pcie_oneshot_max_size,
 )
@@ -150,6 +152,44 @@ def _make_runtime(
         stream_affine=stream_affine,
         **kwargs,
     )
+
+
+
+@pytest.fixture
+def prepared_plan(monkeypatch):
+    """Supply prepared CPU arithmetic while testing public runtime guards."""
+    plans = {}
+
+    def require(plan, component, device):
+        state = plans[plan]
+        assert component == "comm.pcie" and device == state.runtime.device
+        return state
+
+    monkeypatch.setattr("b12x.comm.pcie.pcie_oneshot.require_prepared", require)
+
+    def prepare(runtime, inp):
+        runtime._prepare_input(inp, None)
+
+        def require_runtime(owner):
+            assert owner is runtime
+
+        state = SimpleNamespace(
+            runtime=runtime,
+            require_runtime=require_runtime,
+            run_plain=lambda inp, out: runtime._ext.all_reduce(
+                runtime._ptr, inp, out, 0, 0,
+            ),
+            run_fused=lambda inp, residual, weight, out, residual_out, epsilon:
+                runtime._ext.all_reduce_fused_add_rms_norm(
+                    runtime._ptr, inp, residual, weight, out, residual_out,
+                    epsilon, 0, 0,
+                ),
+        )
+        plan = object()
+        plans[plan] = state
+        return plan
+
+    return prepare
 
 
 def test_parse_pcie_oneshot_max_size_accepts_auto_and_suffixes():
@@ -308,7 +348,7 @@ def _make_cute_state(
         else None
     )
     plain_remote_push_region_packs = (
-        (world_size if sharded_eager_storage else 1) * eager_buffer_bytes // 16
+        _eager_payload_shards(world_size, transport_policy) * eager_buffer_bytes // 16
         if eager and world_size == 2 and transport_policy[2]
         else 0
     )
@@ -325,6 +365,10 @@ def _make_cute_state(
         eager_buffer_bytes=eager_buffer_bytes if eager else None,
         transport_policy=transport_policy,
         sharded_eager_storage=sharded_eager_storage,
+        scatter_gather_storage=_uses_scatter_gather_storage(
+            world_size,
+            transport_policy,
+        ),
         plain_remote_push_region_packs=plain_remote_push_region_packs,
     )
 
@@ -585,19 +629,99 @@ def test_tp8_owner_reduce_default_has_a_bounded_shape_contract(
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.delenv("B12X_PCIE_TP8_OWNER_REDUCE", raising=False)
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(8), torch.empty((rows, hidden), dtype=dtype)
-    )
+    ).variant.mode
     assert mode == expected
 
 
 def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(8), torch.empty((4, 6144), dtype=torch.bfloat16)
+    ).variant.mode
+    assert mode == "stage_scatter_gather"
+
+
+def test_fused_launch_plan_groups_live_rows_by_capacity_variant(monkeypatch) -> None:
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    state = _make_cute_state(8)
+
+    plans = {
+        rows: _CuTeOneshotBackend._fused_launch_plan(
+            state,
+            torch.empty((rows, 6144), dtype=torch.bfloat16),
+        )
+        for rows in (1, 2, 3, 4, 5, 6, 8, 12, 16)
+    }
+
+    assert plans[1].variant == plans[2].variant
+    assert plans[3].variant == plans[4].variant == plans[5].variant
+    assert (
+        plans[6].variant == plans[8].variant == plans[12].variant == plans[16].variant
     )
-    assert mode == "stage_pull"
+    assert {plan.rows for plan in plans.values()} == set(plans)
+    assert {plan.ctas_per_row for plan in plans.values()} == {1}
+
+
+def test_fused_launch_plan_runs_one_wide_cta_per_row_up_to_sixty_four_rows(
+    monkeypatch,
+) -> None:
+    """Rows 17 to 64 keep the 768-thread single-CTA geometry, so the
+    reduce-scatter / all-gather transport covers every row count the fused
+    kernel accepts (the launch rejects more rows than _MAX_BLOCKS)."""
+
+    monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
+    monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
+    state = _make_cute_state(8)
+
+    for rows in (17, 24, 32, 36, 40, 48, 56, 64):
+        plan = _CuTeOneshotBackend._fused_launch_plan(
+            state, torch.empty((rows, 6144), dtype=torch.bfloat16)
+        )
+        assert plan.rows == rows
+        assert plan.ctas_per_row == 1
+        assert plan.variant.threads == 768
+        assert plan.variant.reg_packs == 1
+        assert plan.variant.mode == "stage_scatter_gather_packed", rows
+
+
+@pytest.mark.parametrize(
+    ("visible_sms", "channels", "expected"),
+    (
+        (188, 1, 64),  # RTX PRO 6000 Blackwell, the vLLM communicator's single channel
+        (188, 2, 64),
+        (188, 6, 31),
+        (72, 2, 36),  # the 36-SM-per-channel residency minimum
+        (48, 1, 48),
+        (None, 3, 64),  # no CUDA device: layout capacity
+    ),
+)
+def test_fused_row_capacity_keeps_every_concurrent_launch_resident(
+    visible_sms, channels: int, expected: int
+) -> None:
+    from b12x.comm.pcie.pcie_oneshot import fused_row_capacity
+
+    assert fused_row_capacity(visible_sms, channels) == expected
+
+
+def test_signal_layout_matches_the_cute_backend() -> None:
+    """The pool allocates pcie_oneshot._SIGNAL_BYTES per rank without loading
+    the CuTe DSL; the backend derives the barrier and RMS layout from the same
+    capacity and must fit inside that allocation."""
+
+    from b12x.comm.pcie import _oneshot_cute, pcie_oneshot
+
+    assert pcie_oneshot._SIGNAL_BYTES == _oneshot_cute.SIGNAL_BYTES
+    assert pcie_oneshot._MAX_BLOCKS == _oneshot_cute._MAX_BLOCKS == 64
+    assert pcie_oneshot.PCIeOneshotAllReduce.fused_max_rows == pcie_oneshot._MAX_BLOCKS
+    assert pcie_oneshot._WIDE_CTA_MAX_ROWS == pcie_oneshot._MAX_BLOCKS
+    assert _oneshot_cute._RMS_MAX_ROWS >= pcie_oneshot._MAX_BLOCKS
+    assert _oneshot_cute._RMS_GEN_OFFSET > _oneshot_cute._GRAPH_ARRIVED_OFFSET
+    assert _oneshot_cute._LEADER_GEN_OFFSET + 4 <= _oneshot_cute.SIGNAL_BYTES
+    assert _oneshot_cute.SIGNAL_BYTES % 256 == 0
 
 
 @pytest.mark.parametrize(
@@ -613,14 +737,14 @@ def test_tp8_owner_reduce_can_be_disabled(monkeypatch) -> None:
             2,
             "B12X_PCIE_TP2_REMOTE_PUSH",
             (4, 4096),
-            "stage_pull",
+            "stage_scatter_gather",
             "stage_remote_push",
         ),
         (
             4,
             "B12X_PCIE_TP4_REMOTE_PUSH",
             (32, 6144),
-            "stage_pull",
+            "stage_scatter_gather_packed",
             "stage_remote_push",
         ),
     ),
@@ -636,21 +760,21 @@ def test_tp2_tp4_remote_push_defaults_and_overrides(
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.delenv(env_name, raising=False)
     inp = torch.empty(shape, dtype=torch.bfloat16)
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size), inp
-    )
+    ).variant.mode
     assert mode == expected_by_default
 
     monkeypatch.setenv(env_name, "0")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size), inp
-    )
-    assert mode == "stage_pull"
+    ).variant.mode
+    assert mode == expected_by_default
 
     monkeypatch.setenv(env_name, "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size), inp
-    )
+    ).variant.mode
     assert mode == expected_when_enabled
 
 
@@ -660,10 +784,10 @@ def test_topology_policy_is_immutable_after_channel_setup(monkeypatch) -> None:
     state = _make_cute_state(4)
 
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         state,
         torch.empty((4, 6144), dtype=torch.bfloat16),
-    )
+    ).variant.mode
 
     assert mode == "stage_remote_push"
 
@@ -685,10 +809,10 @@ def test_tp2_tp4_remote_push_falls_back_outside_qualified_shapes(
 ) -> None:
     monkeypatch.delenv("B12X_PCIE_ONESHOT_PUSH", raising=False)
     monkeypatch.setenv(env_name, "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(world_size),
         torch.empty(shape, dtype=torch.bfloat16),
-    )
+    ).variant.mode
     assert mode == "stage_pull"
 
 
@@ -696,10 +820,10 @@ def test_registered_fused_input_never_selects_topology_transport(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
-    mode, _, _, _ = _CuTeOneshotBackend._fused_launch_config(
+    mode = _CuTeOneshotBackend._fused_launch_plan(
         _make_cute_state(4, eager=False),
         torch.empty((4, 6144), dtype=torch.bfloat16),
-    )
+    ).variant.mode
     assert mode == "registered"
 
 
@@ -708,6 +832,7 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
 ) -> None:
     for name in (
         "B12X_PCIE_ONESHOT_PUSH",
+        "B12X_PCIE_SCATTER_GATHER",
         "B12X_PCIE_TP2_REMOTE_PUSH",
         "B12X_PCIE_TP2_PLAIN_REMOTE_PUSH",
         "B12X_PCIE_TP4_REMOTE_PUSH",
@@ -715,24 +840,43 @@ def test_topology_transport_storage_policy_matches_opt_in_defaults(
     ):
         monkeypatch.delenv(name, raising=False)
 
+    # Defaults: scatter-gather storage (three payload shards) at TP2 and TP4,
+    # owner-reduce shards at TP8, plus the two plain peer-push shards at TP2.
     assert not _uses_sharded_eager_storage(2)
     assert not _uses_sharded_eager_storage(4)
     assert _uses_sharded_eager_storage(8)
+    assert _uses_scatter_gather_storage(2)
+    assert _uses_scatter_gather_storage(4)
+    assert not _uses_scatter_gather_storage(8)
+    assert _eager_payload_shards(2) == 3
+    assert _eager_payload_shards(4) == 3
+    assert _eager_payload_shards(8) == 8
+    assert _eager_storage_shards(2) == 5
+    assert _eager_storage_shards(4) == 3
+    assert _eager_storage_shards(8) == 8
+    assert _transport_policy_contract() == (False, False, True, False, True)
+
+    monkeypatch.setenv("B12X_PCIE_SCATTER_GATHER", "0")
+    assert not _uses_scatter_gather_storage(2)
     assert _eager_storage_shards(2) == 3
     assert _eager_storage_shards(4) == 1
     assert _eager_storage_shards(8) == 8
-    assert _transport_policy_contract() == (False, False, True, False, True)
+    monkeypatch.delenv("B12X_PCIE_SCATTER_GATHER")
 
     monkeypatch.setenv("B12X_PCIE_TP8_OWNER_REDUCE", "0")
     monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "0")
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "1")
     assert _uses_sharded_eager_storage(4)
     assert not _uses_sharded_eager_storage(8)
+    assert not _uses_scatter_gather_storage(4)
+    assert _uses_scatter_gather_storage(8)
     assert _eager_storage_shards(4) == 4
+    assert _eager_storage_shards(8) == 3
     assert _transport_policy_contract() == (False, False, False, True, False)
 
     monkeypatch.setenv("B12X_PCIE_TP4_REMOTE_PUSH", "0")
     monkeypatch.setenv("B12X_PCIE_TP2_REMOTE_PUSH", "1")
+    assert not _uses_scatter_gather_storage(2)
     assert _eager_storage_shards(2) == 4
 
 
@@ -767,34 +911,26 @@ def test_register_buffer_rejects_mismatched_mapping_for_same_local_ptr():
         runtime.register_buffer((111, 333))
 
 
-def test_all_reduce_registers_explicit_peer_ptrs_once():
-    runtime = _make_runtime()
-    ext = runtime._ext
-    inp = torch.arange(8, dtype=torch.bfloat16)
-
-    out0 = runtime.all_reduce(inp, peer_input_ptrs=(inp.data_ptr(), 222))
-    out1 = runtime.all_reduce(inp, peer_input_ptrs=(inp.data_ptr(), 222))
-
-    assert torch.equal(out0, inp)
-    assert torch.equal(out1, inp)
-    assert ext.register_buffer_calls == [(12345, (inp.data_ptr(), 222))]
-    assert len(ext.all_reduce_calls) == 2
-
-
-def test_all_reduce_requires_registration_without_eager_buffers():
+def test_input_preparation_registers_explicit_peer_ptrs_once():
     runtime = _make_runtime()
     inp = torch.arange(8, dtype=torch.bfloat16)
+    runtime._prepare_input(inp, (inp.data_ptr(), 222))
+    runtime._prepare_input(inp, (inp.data_ptr(), 222))
+    assert runtime._ext.register_buffer_calls == [(12345, (inp.data_ptr(), 222))]
 
+
+def test_input_preparation_requires_registration_without_eager_buffers():
+    runtime = _make_runtime()
     with pytest.raises(ValueError, match="peer_input_ptrs are required"):
-        runtime.all_reduce(inp)
+        runtime._prepare_input(torch.arange(8, dtype=torch.bfloat16), None)
 
 
-def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
+def test_eager_buffers_allow_all_reduce_without_peer_ptrs(prepared_plan):
     runtime = _make_runtime(eager=True)
     ext = runtime._ext
     inp = torch.arange(8, dtype=torch.bfloat16)
 
-    out = runtime.all_reduce(inp)
+    out = runtime.all_reduce(inp, plan=prepared_plan(runtime, inp))
 
     assert torch.equal(out, inp)
     assert ext.register_pcie_buffers_calls == [(12345, (200, 201), (300, 301))]
@@ -802,7 +938,7 @@ def test_eager_buffers_allow_all_reduce_without_peer_ptrs():
     assert len(ext.all_reduce_calls) == 1
 
 
-def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
+def test_fused_add_rms_norm_returns_norm_and_residual_outputs(prepared_plan):
     runtime = _make_runtime(eager=True)
     ext = runtime._ext
     inp = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8) / 8
@@ -813,7 +949,7 @@ def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
         inp,
         residual,
         weight,
-        1e-6,
+        1e-6, plan=prepared_plan(runtime, inp),
     )
 
     expected_residual = inp + residual
@@ -826,7 +962,7 @@ def test_fused_add_rms_norm_returns_norm_and_residual_outputs():
     assert len(ext.all_reduce_fused_add_rms_norm_calls) == 1
 
 
-def test_fused_add_rms_norm_supports_inplace_residual_output():
+def test_fused_add_rms_norm_supports_inplace_residual_output(prepared_plan):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
     residual = torch.ones_like(inp)
@@ -836,7 +972,7 @@ def test_fused_add_rms_norm_supports_inplace_residual_output():
         inp,
         residual,
         torch.ones(8, dtype=torch.bfloat16),
-        1e-6,
+        1e-6, plan=prepared_plan(runtime, inp),
         residual_out=residual,
     )
 
@@ -844,7 +980,84 @@ def test_fused_add_rms_norm_supports_inplace_residual_output():
     torch.testing.assert_close(residual_out, inp + 1)
 
 
-def test_fused_add_rms_norm_requires_pack_aligned_rows():
+@pytest.mark.parametrize("rows", [4, 8, 16])
+def test_fused_add_rms_norm_supports_split_view_residual(prepared_plan, rows):
+    runtime = _make_runtime(eager=True)
+    hidden_size = 8
+    combined = torch.arange(rows * hidden_size * 2, dtype=torch.bfloat16).reshape(
+        rows, hidden_size * 2
+    )
+    _, residual = combined.split(hidden_size, dim=-1)
+    inp = torch.full_like(residual, 0.25).contiguous()
+    original = residual.clone()
+
+    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp,
+        residual,
+        torch.ones(hidden_size, dtype=torch.bfloat16),
+        1e-6, plan=prepared_plan(runtime, inp),
+        residual_out=residual,
+    )
+
+    assert residual.stride() == (hidden_size * 2, 1)
+    assert residual_out.data_ptr() == residual.data_ptr()
+    torch.testing.assert_close(residual_out, inp + original)
+    variance = residual_out.float().square().mean(dim=-1, keepdim=True)
+    expected = residual_out.float() * torch.rsqrt(variance + 1e-6)
+    torch.testing.assert_close(out, expected.to(torch.bfloat16))
+
+
+def test_fused_add_rms_norm_rejects_noncontiguous_rows(prepared_plan):
+    runtime = _make_runtime(eager=True)
+    inp = torch.ones((4, 8), dtype=torch.bfloat16)
+    residual = torch.ones((4, 16), dtype=torch.bfloat16)[:, ::2]
+
+    with pytest.raises(ValueError, match="pack-aligned contiguous rows"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp,
+            residual,
+            torch.ones(8, dtype=torch.bfloat16),
+            1e-6, plan=prepared_plan(runtime, inp),
+        )
+
+
+def test_fused_add_rms_norm_requires_dense_output_rows(prepared_plan):
+    """The kernel writes the output at (row * hidden_packs + column): a
+    permuted layout that covers its storage, or a wider row stride, is
+    refused for ``out`` while the residual output keeps its row stride."""
+    runtime = _make_runtime(eager=True)
+    inp = torch.ones((4, 8), dtype=torch.bfloat16)
+    weight = torch.ones(8, dtype=torch.bfloat16)
+    permuted = torch.empty((8, 4), dtype=torch.bfloat16).t()
+    assert permuted.shape == inp.shape and permuted.stride() == (1, 4)
+    with pytest.raises(ValueError, match="output tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp, torch.zeros_like(inp), weight, 1e-6, plan=prepared_plan(runtime, inp), out=permuted
+        )
+    wide = torch.empty((4, 16), dtype=torch.bfloat16)[:, :8]
+    with pytest.raises(ValueError, match="output tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            inp, torch.zeros_like(inp), weight, 1e-6, plan=prepared_plan(runtime, inp), out=wide
+        )
+    out, residual_out = runtime.all_reduce_fused_add_rms_norm(
+        inp, torch.zeros_like(inp), weight, 1e-6, plan=prepared_plan(runtime, inp), residual_out=wide
+    )
+    assert out.is_contiguous() and residual_out.data_ptr() == wide.data_ptr()
+
+
+def test_fused_add_rms_norm_requires_dense_input_rows(prepared_plan):
+    runtime = _make_runtime(eager=True)
+    permuted = torch.ones((8, 4), dtype=torch.bfloat16).t()
+    with pytest.raises(ValueError, match="input tensor must have dense"):
+        runtime.all_reduce_fused_add_rms_norm(
+            permuted,
+            torch.zeros((4, 8), dtype=torch.bfloat16),
+            torch.ones(8, dtype=torch.bfloat16),
+            1e-6, plan=prepared_plan(runtime, permuted),
+        )
+
+
+def test_fused_add_rms_norm_requires_pack_aligned_rows(prepared_plan):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
 
@@ -853,11 +1066,11 @@ def test_fused_add_rms_norm_requires_pack_aligned_rows():
             inp,
             torch.zeros_like(inp),
             torch.ones(4, dtype=torch.bfloat16),
-            1e-6,
+            1e-6, plan=prepared_plan(runtime, inp),
         )
 
 
-def test_fused_add_rms_norm_validates_weight():
+def test_fused_add_rms_norm_validates_weight(prepared_plan):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16).reshape(1, 8)
 
@@ -866,7 +1079,7 @@ def test_fused_add_rms_norm_validates_weight():
             inp,
             torch.zeros_like(inp),
             torch.ones(8, dtype=torch.float32),
-            1e-6,
+            1e-6, plan=prepared_plan(runtime, inp),
         )
 
 
@@ -901,7 +1114,7 @@ def test_world_size_10_is_supported_by_eager_pool():
     assert created == [(None, runtime)]
 
 
-def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
+def test_runtime_rejects_reuse_from_another_stream_key(prepared_plan, monkeypatch):
     runtime = _make_runtime(eager=True)
     inp = torch.arange(8, dtype=torch.bfloat16)
     state = {"stream_key": 11}
@@ -911,14 +1124,14 @@ def test_runtime_rejects_reuse_from_another_stream_key(monkeypatch):
         lambda device, stream=None: state["stream_key"],
     )
 
-    runtime.all_reduce(inp)
+    runtime.all_reduce(inp, plan=prepared_plan(runtime, inp))
     state["stream_key"] = 22
 
     with pytest.raises(RuntimeError, match="stream-affine"):
-        runtime.all_reduce(inp)
+        runtime.all_reduce(inp, plan=prepared_plan(runtime, inp))
 
 
-def test_runtime_can_disable_stream_affinity(monkeypatch):
+def test_runtime_can_disable_stream_affinity(prepared_plan, monkeypatch):
     runtime = _make_runtime(eager=True, stream_affine=False)
     inp = torch.arange(8, dtype=torch.bfloat16)
     state = {"stream_key": 11}
@@ -928,9 +1141,9 @@ def test_runtime_can_disable_stream_affinity(monkeypatch):
         lambda device, stream=None: state["stream_key"],
     )
 
-    runtime.all_reduce(inp)
+    runtime.all_reduce(inp, plan=prepared_plan(runtime, inp))
     state["stream_key"] = 22
-    runtime.all_reduce(inp)
+    runtime.all_reduce(inp, plan=prepared_plan(runtime, inp))
 
 
 def test_should_allreduce_checks_device_dtype_size_alignment_and_contiguity():
@@ -1084,23 +1297,6 @@ def test_process_group_max_input_sets_threshold_and_capacity(
     assert captured["eager_buffer_bytes"] == 1 << 20
     assert captured["max_size"] == 1 << 20
 
-
-def test_autotune_never_benchmarks_past_eager_capacity(monkeypatch):
-    runtime = _make_runtime(eager=True, max_size=4096)
-    runtime.device = torch.device("cuda:0")
-    observed = {}
-
-    def fake_compute(benchmark, *, ceiling_bytes, fine_step_bytes):
-        observed["ceiling_bytes"] = ceiling_bytes
-        return ceiling_bytes, []
-
-    monkeypatch.setattr(
-        "b12x.comm.pcie.pcie_oneshot._compute_crossover_size", fake_compute
-    )
-    monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: object())
-
-    assert runtime.find_crossover_size(object(), ceiling_bytes=1 << 20) == 4096
-    assert observed["ceiling_bytes"] == 4096
 
 
 def test_graph_buffer_api_exposes_explicit_registration_hooks():
@@ -2805,3 +3001,40 @@ def test_pool_rejects_channel_rollback_during_capture():
 
     with pool.capture(7), pytest.raises(RuntimeError, match="during capture"):
         pool.rollback_channels(checkpoint)
+
+
+@pytest.mark.parametrize("launch_cls", [_OneshotLaunch, _FusedOneshotLaunch])
+def test_oneshot_kernels_trigger_dependents_first(launch_cls):
+    """Both one-shot kernels execute ``griddepcontrol.launch_dependents``
+    before any other statement, so a dependent launched with the
+    programmatic-stream-serialization attribute (the weight-first projection)
+    can stage its weights while the allreduce waits on the fabric. The
+    trigger must precede the thread-index reads and every peer wait."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(launch_cls.kernel))
+    tree = ast.parse(source)
+    function = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    )
+    body = [
+        node
+        for node in function.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ]
+    first = body[0]
+    assert isinstance(first, ast.Expr)
+    assert isinstance(first.value, ast.Call)
+    assert ast.unparse(first.value.func) == "cute.arch.griddepcontrol_launch_dependents"
+    assert first.value.args == []
+    assert (
+        sum(
+            1
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cute.arch.griddepcontrol_launch_dependents"
+        )
+        == 1
+    )

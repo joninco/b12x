@@ -1,3 +1,22 @@
+"""Graph-replay latency of the PCIe DCP query gather and LSE reduce-scatter.
+
+One PCIeDCPA2APool per rank serves every measured batch and launch geometry;
+each (batch, threads, block limit) triple captures its own reduce, gather and
+paired graphs and reports the median of three 2,000-replay timings, maximum
+over ranks. Environment variables select the sweep:
+
+  B12X_PCIE_DCP_A2A_WORLD_SIZE  ranks and GPUs (default 8; the serving DCP
+                                group is 4)
+  B12X_PCIE_DCP_A2A_MAX_BATCH   pool row capacity (default 64)
+  B12X_PCIE_DCP_A2A_BATCHES     live row counts (default 1,2,4,8,16,32,64)
+  B12X_PCIE_DCP_A2A_LAUNCHES    THREADSxBLOCKS tuples (default 256x16, the
+                                kernels' launch default)
+  B12X_PCIE_DCP_A2A_QUERY_DTYPE bf16 or fp8 query storage (default bf16)
+
+The production geometry overrides B12X_PCIE_DCP_THREADS and
+B12X_PCIE_DCP_BLOCK_LIMIT must be unset so the sweep measures what it names.
+"""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +30,7 @@ import time
 from collections.abc import Callable
 
 import torch
+from b12x.comm.pcie._dcp_preparation import _prepare_transport_calls
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -23,7 +43,7 @@ from b12x.comm.pcie.pcie_dcp_a2a import (
 TOTAL_HEADS = int(os.getenv("B12X_PCIE_DCP_A2A_TOTAL_HEADS", "32"))
 HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_HEAD_DIM", "512"))
 QUERY_HEAD_DIM = int(os.getenv("B12X_PCIE_DCP_A2A_QUERY_HEAD_DIM", "576"))
-MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "8"))
+MAX_BATCH = int(os.getenv("B12X_PCIE_DCP_A2A_MAX_BATCH", "64"))
 GEOMETRY_OVERRIDE_ENVS = (
     "B12X_PCIE_DCP_THREADS",
     "B12X_PCIE_DCP_BLOCK_LIMIT",
@@ -46,10 +66,11 @@ def _launches(world_size: int) -> tuple[tuple[int, int], ...]:
                 "B12X_PCIE_DCP_A2A_LAUNCHES must contain "
                 "comma-separated THREADSxBLOCKS tuples"
             ) from exc
-        if not world_size <= threads <= 1024 or threads % 32 != 0:
+        # PCIeDCPA2A accepts block sizes that are multiples of 32 up to 512.
+        if not world_size <= threads <= 512 or threads % 32 != 0:
             raise ValueError(
                 f"invalid launch {raw!r}: threads must be a multiple of 32 "
-                f"in [{world_size}, 1024]"
+                f"in [{world_size}, 512]"
             )
         if not 1 <= blocks <= 64:
             raise ValueError(f"invalid launch {raw!r}: blocks must be in [1, 64]")
@@ -69,7 +90,7 @@ def _reject_production_geometry_overrides() -> None:
 
 
 def _batches() -> tuple[int, ...]:
-    batches = _csv_ints("B12X_PCIE_DCP_A2A_BATCHES", "1,2,4,8")
+    batches = _csv_ints("B12X_PCIE_DCP_A2A_BATCHES", "1,2,4,8,16,32,64")
     invalid = tuple(batch for batch in batches if not 1 <= batch <= MAX_BATCH)
     if invalid:
         raise ValueError(
@@ -296,17 +317,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             for operation in ("reduce", "gather", "pair")
         )
         pool.prepare_channels(channel_ids)
-        preparation_channel_id = channel_ids[0]
-        for threads in sorted({threads for threads, _ in launches}):
-            pool.prepare_graph_lse_reduce_scatter(
-                dtype=dtype,
-                threads=threads,
-                channel_id=preparation_channel_id,
-            )
-            pool.prepare_graph_all_gather_heads(
-                threads=threads,
-                channel_id=preparation_channel_id,
-            )
         if rank == 0:
             print(f"# metadata={json.dumps(_metadata(world_size, query_dtype_name))}")
             print(
@@ -337,11 +347,35 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
             for threads, block_limit in launches:
                 channel_prefix = f"benchmark:{batch}:{threads}:{block_limit}"
+                sessions = []
+                plans = {}
+                gather_call = {
+                    "local_input": gather_in, "out": gather_out,
+                    "threads": threads, "block_limit": block_limit,
+                }
+                reduce_call = {
+                    "partial_output": reduce_out, "partial_lse": reduce_lse,
+                    "out": reduce_result, "is_lse_base_on_e": True,
+                    "threads": threads, "block_limit": block_limit,
+                }
+                for label, calls in (
+                    ("reduce", {"lse_reduce_scatter": reduce_call}),
+                    ("gather", {"all_gather_heads": gather_call}),
+                    ("pair", {"all_gather_heads": gather_call, "lse_reduce_scatter": reduce_call}),
+                ):
+                    channel_id = f"{channel_prefix}:{label}"
+                    session, declarations = _prepare_transport_calls(
+                        pool._logical_channels[channel_id], calls,
+                        channel_id=channel_id, ranks=tuple(range(world_size)),
+                    )
+                    sessions.append(session)
+                    plans[label] = declarations
                 reduce_graph = _capture(
                     lambda: pool.lse_reduce_scatter(
                         reduce_out,
                         reduce_lse,
                         reduce_result,
+                        plan=plans["reduce"]["lse_reduce_scatter"],
                         threads=threads,
                         block_limit=block_limit,
                     ),
@@ -352,6 +386,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     lambda: pool.all_gather_heads(
                         gather_in,
                         gather_out,
+                        plan=plans["gather"]["all_gather_heads"],
                         threads=threads,
                         block_limit=block_limit,
                     ),
@@ -363,6 +398,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     pool.all_gather_heads(
                         gather_in,
                         gather_out,
+                        plan=plans["pair"]["all_gather_heads"],
                         threads=threads,
                         block_limit=block_limit,
                     )
@@ -370,6 +406,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         reduce_out,
                         reduce_lse,
                         reduce_result,
+                        plan=plans["pair"]["lse_reduce_scatter"],
                         threads=threads,
                         block_limit=block_limit,
                     )
@@ -409,6 +446,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     )
                 del reduce_graph, gather_graph, pair_graph
                 torch.cuda.synchronize(device)
+                for session in sessions:
+                    session.close()
     finally:
         if pool is not None:
             pool.close()

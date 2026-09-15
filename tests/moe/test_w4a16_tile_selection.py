@@ -1,4 +1,7 @@
+import pytest
+
 from b12x.moe._shared.kernels.w4a16.kernel import (
+    MoEMicroKernelW4A16SmallMDirect,
     _TC_DECODE_MAX_M,
     _TC_DECODE_PACK_COLLIDING_PAIRS,
     _TC_DECODE_PACK_SM_COVERAGE_CAP,
@@ -139,3 +142,11 @@ def test_tc_decode_planner_keeps_lower_coverage_direct_route() -> None:
 
 def test_tc_decode_planner_keeps_low_collision_direct_route() -> None:
     assert _w4a16_tc_decode_preferred(m=8, topk=6, num_experts=512, sms=48)
+
+
+@pytest.mark.parametrize(("rows", "supported"), ((8, True), (9, True), (16, True), (17, False)))
+def test_glm53_modelopt_micro_capacity_stops_at_sixteen_rows(rows, supported):
+    """GLM-5.3 TP8 native ModelOpt micro execution accepts 1 through 16 rows."""
+    assert MoEMicroKernelW4A16SmallMDirect.is_supported(
+        m=rows, hidden_size=6144, intermediate_size=256, num_experts=256, topk=8,
+    ) is supported

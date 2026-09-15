@@ -73,6 +73,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+import triton
+import triton.language as tl
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
@@ -1347,3 +1349,806 @@ def _compressed_cache_writer_launch(kv, cache, slot_mapping, page_size, cache_ki
 
 
 
+
+
+# Native GLM DSA FP8 records match concat_and_cache_ds_mla_kernel in vLLM:
+# four independently scaled 128-value latent groups, followed by raw BF16 RoPE.
+
+
+@triton.jit(
+    do_not_specialize=["rows", "requests", "padded", "rank_stride", "request_stride"]
+)
+def _map_ckv_chunk_slots_kernel(
+    starts,
+    request_ids,
+    lengths,
+    rank_starts,
+    output,
+    rows,
+    requests,
+    padded,
+    rank_stride,
+    request_stride,
+    DCP: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.load(request_ids + row, row < rows, other=-1).to(tl.int64)
+    valid = (row < rows) & (req >= 0) & (req < requests)
+    begin = tl.load(starts + req, valid, other=0).to(tl.int64)
+    end = tl.load(starts + req + 1, valid, other=0).to(tl.int64)
+    length = tl.load(lengths + req, valid, other=0).to(tl.int64)
+    pos = length - (end - begin) + row - begin
+    valid = valid & (row >= begin) & (row < end) & (pos >= 0) & (pos < length)
+    owner = (pos // INTERLEAVE) % DCP
+    local = (pos // (DCP * INTERLEAVE)) * INTERLEAVE + pos % INTERLEAVE
+    rank_start = tl.load(
+        rank_starts + owner * rank_stride + req * request_stride, valid, other=0
+    ).to(tl.int64)
+    local = rank_start + local
+    slot = owner * padded + local
+    valid = valid & (rank_start >= 0) & (local >= 0) & (local < padded)
+    tl.store(output + row, tl.where(valid, slot, -1), row < rows)
+
+
+def map_ckv_current_chunk_slots(
+    query_start_loc: torch.Tensor,
+    request_ids: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    rank_req_starts: torch.Tensor,
+    *,
+    padded_tokens: int,
+    dcp_world_size: int,
+    interleave: int,
+    out: torch.Tensor,
+    num_tokens: int,
+) -> None:
+    """Map request-local current positions into rank-major gathered records.
+
+    Invalid request IDs, positions and rank spans produce -1. Output entries
+    beyond num_tokens are untouched. Metadata must describe disjoint valid
+    request ranges; the caller owns the int64 output and its lifetime.
+    """
+    vectors = (query_start_loc, request_ids, global_seq_lens)
+    if any(
+        t.ndim != 1
+        or not t.is_contiguous()
+        or t.dtype not in (torch.int32, torch.int64)
+        for t in vectors
+    ):
+        raise ValueError("CKV query metadata requires contiguous integer vectors")
+    requests = global_seq_lens.numel()
+    if (
+        dcp_world_size < 1
+        or interleave < 1
+        or padded_tokens < 0
+        or query_start_loc.numel() < requests + 1
+    ):
+        raise ValueError("CKV mapping requires valid DCP geometry and query boundaries")
+    if (
+        rank_req_starts.ndim != 2
+        or rank_req_starts.shape != (dcp_world_size, requests)
+        or rank_req_starts.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "CKV rank starts must have shape (DCP, requests) and integer dtype"
+        )
+    if out.ndim != 1 or out.dtype != torch.int64 or not out.is_contiguous():
+        raise ValueError("CKV output slots require a contiguous int64 vector")
+    if not 0 <= num_tokens <= min(out.numel(), request_ids.numel()):
+        raise ValueError("CKV live rows exceed metadata or output capacity")
+    if any(t.device != out.device for t in (*vectors, rank_req_starts)):
+        raise ValueError("CKV mapping tensors must share one device")
+    if out.device.type != "cuda":
+        raise ValueError("CKV mapping requires CUDA tensors")
+    if num_tokens:
+        _map_ckv_chunk_slots_kernel[(triton.cdiv(num_tokens, 128),)](
+            query_start_loc,
+            request_ids,
+            global_seq_lens,
+            rank_req_starts,
+            out,
+            num_tokens,
+            requests,
+            padded_tokens,
+            rank_req_starts.stride(0),
+            rank_req_starts.stride(1),
+            dcp_world_size,
+            interleave,
+            128,
+        )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "rows",
+        "slots_count",
+        "block_size",
+        "block_stride",
+        "entry_stride",
+        "latent_stride",
+        "rope_stride",
+    ]
+)
+def _concat_and_cache_fp8_ds_mla_kernel(
+    latent,
+    rope,
+    cache,
+    slots,
+    rows,
+    slots_count,
+    block_size,
+    block_stride,
+    entry_stride,
+    latent_stride,
+    rope_stride,
+):
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(slots + row).to(tl.int64)
+    if (row < rows) & (slot >= 0) & (slot < slots_count):
+        address = (slot // block_size) * block_stride + (
+            slot % block_size
+        ) * entry_stride
+        group = tl.arange(0, 4)
+        col = tl.arange(0, 128)
+        values = tl.load(
+            latent + row * latent_stride + group[:, None] * 128 + col[None, :]
+        ).to(tl.float32)
+        scale = tl.maximum(
+            tl.div_rn(tl.max(tl.abs(values), axis=1), 448.0), 1.1754943508222875e-38
+        )
+        quantized = tl.div_rn(values, scale[:, None]).to(tl.float8e4nv)
+        tl.store(
+            (cache + address).to(tl.pointer_type(tl.float8e4nv))
+            + group[:, None] * 128
+            + col[None, :],
+            quantized,
+        )
+        tl.store((cache + address + 512).to(tl.pointer_type(tl.float32)) + group, scale)
+        rope_col = tl.arange(0, 64)
+        rope_values = tl.load(rope + row * rope_stride + rope_col)
+        tl.store(
+            (cache + address + 528).to(tl.pointer_type(tl.bfloat16)) + rope_col,
+            rope_values,
+        )
+
+
+def concat_and_cache_fp8_ds_mla(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    num_tokens: int | None = None,
+) -> None:
+    """Write native 656-byte GLM DSA FP8 records into caller-owned slots.
+
+    The latent uses group-128 absmax/448 scales with an FP32 minimum-normal
+    floor. RoPE stays BF16. Native FP8 records do not use a layer outer scale.
+    Negative or out-of-capacity slots are skipped. Rows may have padded strides;
+    input features and cache records must have unit inner stride.
+    """
+    if (
+        kv_c.ndim != 2
+        or kv_c.shape[1] != 512
+        or k_pe.ndim != 2
+        or k_pe.shape[1] != 64
+        or kv_c.dtype != torch.bfloat16
+        or k_pe.dtype != torch.bfloat16
+        or kv_c.stride(1) != 1
+        or k_pe.stride(1) != 1
+    ):
+        raise ValueError("FP8 DSA writer requires BF16 latent[:,512] and RoPE[:,64]")
+    if (
+        kv_cache.ndim != 3
+        or kv_cache.shape[2] != 656
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.stride(2) != 1
+        or kv_cache.shape[0] < 1
+        or kv_cache.shape[1] < 1
+        or kv_cache.stride(1) < 656
+        or kv_cache.stride(0) < kv_cache.shape[1] * kv_cache.stride(1)
+        or kv_cache.stride(0) % 4
+        or kv_cache.stride(1) % 4
+        or kv_cache.data_ptr() % 4
+    ):
+        raise ValueError(
+            "FP8 DSA cache requires non-overlapping aligned 656-byte records"
+        )
+    if (
+        slot_mapping.ndim != 1
+        or slot_mapping.dtype != torch.int64
+        or not slot_mapping.is_contiguous()
+    ):
+        raise ValueError("FP8 DSA slot mapping requires a contiguous int64 vector")
+    rows = slot_mapping.numel() if num_tokens is None else num_tokens
+    if not 0 <= rows <= min(kv_c.shape[0], k_pe.shape[0], slot_mapping.numel()):
+        raise ValueError("FP8 DSA live rows exceed input or slot capacity")
+    if any(t.device != kv_cache.device for t in (kv_c, k_pe, slot_mapping)):
+        raise ValueError("FP8 DSA writer tensors must share one device")
+    if kv_cache.device.type != "cuda":
+        raise ValueError("FP8 DSA writer requires CUDA tensors")
+    if rows:
+        _concat_and_cache_fp8_ds_mla_kernel[(rows,)](
+            kv_c,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            rows,
+            kv_cache.shape[0] * kv_cache.shape[1],
+            kv_cache.shape[1],
+            kv_cache.stride(0),
+            kv_cache.stride(1),
+            kv_c.stride(0),
+            k_pe.stride(0),
+        )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "requests",
+        "padded",
+        "pages",
+        "page_size",
+        "page_stride",
+        "entry_stride",
+        "dst_stride",
+        "table_width",
+        "table_row_stride",
+        "table_col_stride",
+        "starts_rank_stride",
+        "starts_req_stride",
+        "lens_rank_stride",
+        "lens_req_stride",
+    ]
+)
+def _gather_ckv_history_kernel(
+    source,
+    destination,
+    block_table,
+    rank_starts,
+    rank_lengths,
+    global_lengths,
+    query_starts,
+    requests,
+    padded,
+    pages,
+    page_size,
+    page_stride,
+    entry_stride,
+    dst_stride,
+    table_width,
+    table_row_stride,
+    table_col_stride,
+    starts_rank_stride,
+    starts_req_stride,
+    lens_rank_stride,
+    lens_req_stride,
+    RANK: tl.constexpr,
+    DCP: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    RECORD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    # Upper-bound handles equal starts from requests with empty local shards.
+    low, high = 0, requests
+    while low < high:
+        mid = (low + high) // 2
+        start = tl.load(
+            rank_starts
+            + RANK * starts_rank_stride
+            + mid.to(tl.int64) * starts_req_stride
+        ).to(tl.int64)
+        before = start <= row
+        low = tl.where(before, mid + 1, low)
+        high = tl.where(before, high, mid)
+    request = (low - 1).to(tl.int64)
+    valid = (row < padded) & (request >= 0) & (request < requests)
+    start = tl.load(
+        rank_starts + RANK * starts_rank_stride + request * starts_req_stride,
+        valid,
+        other=0,
+    ).to(tl.int64)
+    length = tl.load(
+        rank_lengths + RANK * lens_rank_stride + request * lens_req_stride,
+        valid,
+        other=0,
+    ).to(tl.int64)
+    global_length = tl.load(global_lengths + request, valid, other=0).to(tl.int64)
+    begin = tl.load(query_starts + request, valid, other=0).to(tl.int64)
+    end = tl.load(query_starts + request + 1, valid, other=0).to(tl.int64)
+    history = tl.maximum(global_length - (end - begin), 0)
+    history_local = (history // (DCP * INTERLEAVE)) * INTERLEAVE + tl.minimum(
+        tl.maximum(history % (DCP * INTERLEAVE) - RANK * INTERLEAVE, 0), INTERLEAVE
+    )
+    position = row - start
+    page_column = position // page_size
+    read_history = (
+        valid
+        & (position >= 0)
+        & (position < length)
+        & (position < history_local)
+        & (page_column < table_width)
+    )
+    page = tl.load(
+        block_table + request * table_row_stride + page_column * table_col_stride,
+        read_history,
+        other=-1,
+    ).to(tl.int64)
+    read_history = read_history & (page >= 0) & (page < pages)
+    byte = tl.arange(0, BLOCK)
+    source_offset = page * page_stride + (position % page_size) * entry_stride + byte
+    value = tl.load(source + source_offset, read_history & (byte < RECORD), other=0)
+    tl.store(
+        destination + row * dst_stride + byte, value, (row < padded) & (byte < RECORD)
+    )
+
+
+def gather_ckv_history(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    rank_req_starts: torch.Tensor,
+    rank_req_lens: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    dcp_rank: int,
+    dcp_world_size: int,
+    interleave: int,
+    num_reqs: int,
+    padded_tokens: int,
+) -> None:
+    """Gather only produced native history, zeroing unwritten chunks and padding.
+
+    Request starts/lengths describe the full sequence in rank-local coordinates.
+    Metadata starts must be nondecreasing. History is global sequence length
+    minus the request's query chunk, converted to interleaved rank ownership.
+    Current-chunk rows never load source cache bytes or their block-table entry.
+    Output retains full-sequence request offsets; records are never requantized.
+    """
+    if (
+        src_cache.ndim != 3
+        or src_cache.dtype != torch.uint8
+        or src_cache.stride(2) != 1
+        or min(src_cache.shape) < 1
+        or dst.ndim != 2
+        or dst.dtype != torch.uint8
+        or dst.shape[1] != src_cache.shape[2]
+        or dst.stride(1) != 1
+        or dst.stride(0) < dst.shape[1]
+    ):
+        raise ValueError(
+            "CKV history gather requires native byte pages and record output"
+        )
+    if src_cache.stride(1) < src_cache.shape[2] or src_cache.stride(
+        0
+    ) < src_cache.shape[1] * src_cache.stride(1):
+        raise ValueError("CKV source pages and records must not overlap")
+    if (
+        not 0 <= dcp_rank < dcp_world_size
+        or interleave < 1
+        or num_reqs < 0
+        or not 0 <= padded_tokens <= dst.shape[0]
+    ):
+        raise ValueError("CKV history gather has invalid rank or live capacity")
+    for tensor in (rank_req_starts, rank_req_lens):
+        if (
+            tensor.ndim != 2
+            or tensor.shape[0] != dcp_world_size
+            or tensor.shape[1] < num_reqs
+            or tensor.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "CKV rank metadata requires integer (DCP, requests) tables"
+            )
+    if (
+        block_table.ndim != 2
+        or block_table.shape[0] < num_reqs
+        or block_table.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("CKV block table requires an integer request/page matrix")
+    for tensor, minimum in (
+        (global_seq_lens, num_reqs),
+        (query_start_loc, num_reqs + 1),
+    ):
+        if (
+            tensor.ndim != 1
+            or not tensor.is_contiguous()
+            or tensor.numel() < minimum
+            or tensor.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "CKV history query metadata requires contiguous integer vectors"
+            )
+    tensors = (
+        src_cache,
+        block_table,
+        rank_req_starts,
+        rank_req_lens,
+        global_seq_lens,
+        query_start_loc,
+    )
+    if any(t.device != dst.device for t in tensors):
+        raise ValueError("CKV history gather tensors must share one device")
+    if src_cache.untyped_storage().data_ptr() == dst.untyped_storage().data_ptr():
+        raise ValueError("CKV history output must not alias the source cache")
+    if dst.device.type != "cuda":
+        raise ValueError("CKV history gather requires CUDA tensors")
+    if padded_tokens:
+        _gather_ckv_history_kernel[(padded_tokens,)](
+            src_cache,
+            dst,
+            block_table,
+            rank_req_starts,
+            rank_req_lens,
+            global_seq_lens,
+            query_start_loc,
+            num_reqs,
+            padded_tokens,
+            src_cache.shape[0],
+            src_cache.shape[1],
+            src_cache.stride(0),
+            src_cache.stride(1),
+            dst.stride(0),
+            block_table.shape[1],
+            block_table.stride(0),
+            block_table.stride(1),
+            rank_req_starts.stride(0),
+            rank_req_starts.stride(1),
+            rank_req_lens.stride(0),
+            rank_req_lens.stride(1),
+            dcp_rank,
+            dcp_world_size,
+            interleave,
+            src_cache.shape[2],
+            triton.next_power_of_2(src_cache.shape[2]),
+        )
+
+
+@triton.jit
+def _ckv_chunk_position(
+    row, lengths, starts, requests, rank, DCP: tl.constexpr, INTERLEAVE: tl.constexpr
+):
+    request = tl.full((), 0, tl.int64)
+    remaining = row.to(tl.int64)
+    local_history = tl.full((), 0, tl.int64)
+    found = tl.full((), False, tl.int1)
+    while (request < requests) & ~found:
+        full = tl.load(lengths + request).to(tl.int64)
+        begin = tl.load(starts + request).to(tl.int64)
+        end = tl.load(starts + request + 1).to(tl.int64)
+        history = tl.maximum(full - (end - begin), 0)
+        local_full = (full // (DCP * INTERLEAVE)) * INTERLEAVE + tl.minimum(
+            tl.maximum(full % (DCP * INTERLEAVE) - rank * INTERLEAVE, 0), INTERLEAVE
+        )
+        local_history = (history // (DCP * INTERLEAVE)) * INTERLEAVE + tl.minimum(
+            tl.maximum(history % (DCP * INTERLEAVE) - rank * INTERLEAVE, 0), INTERLEAVE
+        )
+        count = tl.maximum(local_full - local_history, 0)
+        found = remaining < count
+        remaining = tl.where(found, remaining, remaining - count)
+        request = tl.where(found, request, request + 1)
+    return request, local_history + remaining, found
+
+
+@triton.jit(
+    do_not_specialize=[
+        "requests",
+        "capacity",
+        "pages",
+        "page_size",
+        "page_stride",
+        "entry_stride",
+        "dst_stride",
+        "table_width",
+        "table_row_stride",
+        "table_col_stride",
+    ]
+)
+def _gather_ckv_current_chunk_kernel(
+    source,
+    destination,
+    table,
+    lengths,
+    starts,
+    requests,
+    capacity,
+    pages,
+    page_size,
+    page_stride,
+    entry_stride,
+    dst_stride,
+    table_width,
+    table_row_stride,
+    table_col_stride,
+    RANK: tl.constexpr,
+    DCP: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    RECORD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    request, position, valid = _ckv_chunk_position(
+        row, lengths, starts, requests, RANK, DCP, INTERLEAVE
+    )
+    page_column = position // page_size
+    valid = valid & (row < capacity) & (page_column < table_width)
+    page = tl.load(
+        table + request * table_row_stride + page_column * table_col_stride,
+        valid,
+        other=-1,
+    ).to(tl.int64)
+    valid = valid & (page >= 0) & (page < pages)
+    byte = tl.arange(0, BLOCK)
+    value = tl.load(
+        source + page * page_stride + (position % page_size) * entry_stride + byte,
+        valid & (byte < RECORD),
+        other=0,
+    )
+    tl.store(
+        destination + row * dst_stride + byte, value, (row < capacity) & (byte < RECORD)
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "requests",
+        "capacity",
+        "padded",
+        "source_stride",
+        "full_capacity",
+        "page_size",
+        "page_stride",
+        "entry_stride",
+        "rank_stride",
+        "request_stride",
+    ]
+)
+def _insert_ckv_current_chunk_kernel(
+    source,
+    destination,
+    rank_starts,
+    lengths,
+    starts,
+    requests,
+    capacity,
+    padded,
+    source_stride,
+    full_capacity,
+    page_size,
+    page_stride,
+    entry_stride,
+    rank_stride,
+    request_stride,
+    DCP: tl.constexpr,
+    INTERLEAVE: tl.constexpr,
+    RECORD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rank = tl.program_id(1).to(tl.int64)
+    request, position, valid = _ckv_chunk_position(
+        row, lengths, starts, requests, rank, DCP, INTERLEAVE
+    )
+    request_start = tl.load(
+        rank_starts + rank * rank_stride + request * request_stride, valid, other=0
+    ).to(tl.int64)
+    local = request_start + position
+    slot = rank * padded + local
+    valid = (
+        valid
+        & (row < capacity)
+        & (local >= 0)
+        & (local < padded)
+        & (slot < full_capacity)
+    )
+    byte = tl.arange(0, BLOCK)
+    value = tl.load(
+        source + (rank * capacity + row) * source_stride + byte,
+        valid & (byte < RECORD),
+        other=0,
+    )
+    destination_offset = (slot // page_size) * page_stride + (
+        slot % page_size
+    ) * entry_stride
+    tl.store(destination + destination_offset + byte, value, valid & (byte < RECORD))
+
+
+def _validate_chunk_metadata(global_seq_lens, query_start_loc, num_reqs):
+    if num_reqs < 0:
+        raise ValueError("CKV current-chunk request count must be non-negative")
+    for tensor, minimum in (
+        (global_seq_lens, num_reqs),
+        (query_start_loc, num_reqs + 1),
+    ):
+        if (
+            tensor.ndim != 1
+            or not tensor.is_contiguous()
+            or tensor.numel() < minimum
+            or tensor.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "CKV current-chunk metadata requires contiguous integer vectors"
+            )
+
+
+def gather_ckv_current_chunk(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    dcp_rank: int,
+    dcp_world_size: int,
+    interleave: int,
+    num_reqs: int,
+    current_capacity: int,
+) -> None:
+    """Pack this rank's produced native chunk records in request order.
+
+    The caller must reserve capacity for the maximum number of chunk tokens
+    owned by any rank, including per-request interleave imbalance. Tail records
+    are zeroed. Input records must have completed production on the launch
+    stream; this copy does not reconstruct quantized records from BF16 values.
+    """
+    _validate_chunk_metadata(global_seq_lens, query_start_loc, num_reqs)
+    if (
+        src_cache.ndim != 3
+        or src_cache.dtype != torch.uint8
+        or src_cache.stride(2) != 1
+        or min(src_cache.shape) < 1
+        or src_cache.stride(1) < src_cache.shape[2]
+        or src_cache.stride(0) < src_cache.shape[1] * src_cache.stride(1)
+        or dst.ndim != 2
+        or dst.dtype != torch.uint8
+        or dst.shape[1] != src_cache.shape[2]
+        or dst.stride(1) != 1
+        or dst.stride(0) < dst.shape[1]
+    ):
+        raise ValueError(
+            "CKV current-chunk gather requires native byte pages and record output"
+        )
+    if (
+        not 0 <= dcp_rank < dcp_world_size
+        or interleave < 1
+        or not 0 <= current_capacity <= dst.shape[0]
+    ):
+        raise ValueError("CKV current-chunk gather has invalid rank or capacity")
+    if (
+        block_table.ndim != 2
+        or block_table.shape[0] < num_reqs
+        or block_table.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "CKV current-chunk block table must be an integer request/page matrix"
+        )
+    if any(
+        t.device != dst.device
+        for t in (src_cache, block_table, global_seq_lens, query_start_loc)
+    ):
+        raise ValueError("CKV current-chunk gather tensors must share one device")
+    if src_cache.untyped_storage().data_ptr() == dst.untyped_storage().data_ptr():
+        raise ValueError("CKV current-chunk output must not alias source cache")
+    if dst.device.type != "cuda":
+        raise ValueError("CKV current-chunk gather requires CUDA tensors")
+    if current_capacity:
+        _gather_ckv_current_chunk_kernel[(current_capacity,)](
+            src_cache,
+            dst,
+            block_table,
+            global_seq_lens,
+            query_start_loc,
+            num_reqs,
+            current_capacity,
+            src_cache.shape[0],
+            src_cache.shape[1],
+            src_cache.stride(0),
+            src_cache.stride(1),
+            dst.stride(0),
+            block_table.shape[1],
+            block_table.stride(0),
+            block_table.stride(1),
+            dcp_rank,
+            dcp_world_size,
+            interleave,
+            src_cache.shape[2],
+            triton.next_power_of_2(src_cache.shape[2]),
+        )
+
+
+def insert_ckv_current_chunk(
+    gathered_current: torch.Tensor,
+    full_gathered: torch.Tensor,
+    rank_req_starts: torch.Tensor,
+    global_seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    interleave: int,
+    num_reqs: int,
+    current_capacity: int,
+    padded_tokens: int,
+) -> None:
+    """Insert all ranks' compact native chunk records into a full gathered cache.
+
+    Full-sequence request offsets and the live padded rank span determine slots.
+    History and padding remain unchanged. All source and history gather producers
+    must be joined on the launch stream before insertion.
+    """
+    _validate_chunk_metadata(global_seq_lens, query_start_loc, num_reqs)
+    if (
+        gathered_current.ndim != 2
+        or gathered_current.dtype != torch.uint8
+        or gathered_current.stride(1) != 1
+        or gathered_current.stride(0) < gathered_current.shape[1]
+        or full_gathered.ndim not in (2, 3)
+        or full_gathered.dtype != torch.uint8
+        or full_gathered.shape[-1] != gathered_current.shape[1]
+        or full_gathered.stride(-1) != 1
+        or full_gathered.stride(-2) < full_gathered.shape[-1]
+    ):
+        raise ValueError("CKV insertion requires native byte record buffers")
+    if full_gathered.ndim == 2:
+        full_capacity = full_gathered.shape[0]
+        page_size = 1
+        entry_stride = page_stride = full_gathered.stride(0)
+    else:
+        full_capacity = full_gathered.shape[0] * full_gathered.shape[1]
+        page_size = full_gathered.shape[1]
+        page_stride, entry_stride = full_gathered.stride()[:2]
+        if page_size < 1 or page_stride < page_size * entry_stride:
+            raise ValueError("CKV insertion pages must not overlap")
+    if (
+        dcp_world_size < 1
+        or interleave < 1
+        or current_capacity < 0
+        or padded_tokens < 0
+        or dcp_world_size * current_capacity > gathered_current.shape[0]
+        or dcp_world_size * padded_tokens > full_capacity
+    ):
+        raise ValueError("CKV insertion live rank spans exceed reserved capacity")
+    if (
+        rank_req_starts.ndim != 2
+        or rank_req_starts.shape[0] != dcp_world_size
+        or rank_req_starts.shape[1] < num_reqs
+        or rank_req_starts.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "CKV insertion rank starts require an integer (DCP, requests) table"
+        )
+    tensors = (gathered_current, rank_req_starts, global_seq_lens, query_start_loc)
+    if any(t.device != full_gathered.device for t in tensors):
+        raise ValueError("CKV insertion tensors must share one device")
+    if (
+        gathered_current.untyped_storage().data_ptr()
+        == full_gathered.untyped_storage().data_ptr()
+    ):
+        raise ValueError("CKV insertion source must not alias the gathered cache")
+    if full_gathered.device.type != "cuda":
+        raise ValueError("CKV insertion requires CUDA tensors")
+    if current_capacity:
+        _insert_ckv_current_chunk_kernel[(current_capacity, dcp_world_size)](
+            gathered_current,
+            full_gathered,
+            rank_req_starts,
+            global_seq_lens,
+            query_start_loc,
+            num_reqs,
+            current_capacity,
+            padded_tokens,
+            gathered_current.stride(0),
+            full_capacity,
+            page_size,
+            page_stride,
+            entry_stride,
+            rank_req_starts.stride(0),
+            rank_req_starts.stride(1),
+            dcp_world_size,
+            interleave,
+            full_gathered.shape[-1],
+            triton.next_power_of_2(full_gathered.shape[-1]),
+        )

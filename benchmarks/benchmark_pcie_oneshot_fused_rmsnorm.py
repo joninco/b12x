@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 from vllm import _custom_ops as ops
+from benchmarks.common import prepare_oneshot_benchmark
 
 
 def _free_port() -> int:
@@ -80,13 +81,18 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         128 * 1024,
         max(rows_to_benchmark) * hidden_size * dtype.itemsize,
     )
+    # One channel shared by every captured graph, as the vLLM communicator
+    # constructs the pool; graph replays select their slot on the device.
     pool = PCIeOneshotAllReducePool.from_process_group(
         process_group=dist.group.WORLD,
         device=device,
         max_input_bytes=max_bytes,
         max_size=max_bytes,
+        single_channel=True,
+        max_concurrent_channels=1,
     )
-    pool.for_stream()
+    channel = pool.for_stream()
+    sessions = []
     try:
         if rank == 0:
             print(
@@ -101,26 +107,39 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             fused_residual = torch.randn(shape, dtype=dtype, device=device)
             fused_out = torch.empty_like(fused_in)
             fused_residual_out = torch.empty_like(fused_in)
-            pool.prepare_graph_fused_add_rms_norm(fused_in)
-            fused_graph = _capture(
-                lambda: pool.all_reduce_fused_add_rms_norm(
-                    fused_in,
-                    fused_residual,
-                    weight,
-                    epsilon,
-                    out=fused_out,
-                    residual_out=fused_residual_out,
-                ),
-                pool,
-            )
+            # Row counts above the fused kernel's CTA capacity report NaN for
+            # the fused column so that the NCCL reference still prints.
+            fused_graph = None
+            if rows <= getattr(pool, "fused_max_rows", rows):
+                session, fused_plan = prepare_oneshot_benchmark(
+                    channel, fused_in, fused_out, name=f"fused-rows-{rows}",
+                    residual=fused_residual, residual_out=fused_residual_out,
+                    weight=weight, epsilon=epsilon,
+                )
+                sessions.append(session)
+                fused_graph = _capture(
+                    lambda: pool.all_reduce_fused_add_rms_norm(
+                        fused_in,
+                        fused_residual,
+                        weight,
+                        epsilon,
+                        plan=fused_plan,
+                        out=fused_out,
+                        residual_out=fused_residual_out,
+                    ),
+                    pool,
+                )
 
             bare_in = torch.randn(shape, dtype=dtype, device=device) * 0.01
             bare_residual = torch.randn(shape, dtype=dtype, device=device)
             bare_out = torch.empty_like(bare_in)
-            pool.prepare_graph_all_reduce(bare_in)
+            session, bare_plan = prepare_oneshot_benchmark(
+                channel, bare_in, bare_out, name=f"plain-rows-{rows}",
+            )
+            sessions.append(session)
 
             def bare_then_rms() -> None:
-                pool.all_reduce(bare_in, out=bare_out)
+                pool.all_reduce(bare_in, plan=bare_plan, out=bare_out)
                 ops.fused_add_rms_norm(
                     bare_out,
                     bare_residual,
@@ -143,7 +162,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                 )
 
             nccl_graph = _capture(nccl_then_rms)
-            fused_us = _median_latency(fused_graph, device)
+            fused_us = (
+                _median_latency(fused_graph, device)
+                if fused_graph is not None
+                else float("nan")
+            )
             bare_us = _median_latency(bare_graph, device)
             nccl_us = _median_latency(nccl_graph, device)
             if rank == 0:
@@ -156,6 +179,8 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             del fused_graph, bare_graph, nccl_graph
             torch.cuda.synchronize(device)
     finally:
+        for session in sessions:
+            session.close()
         pool.close()
         dist.destroy_process_group()
 

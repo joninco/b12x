@@ -207,3 +207,44 @@ def prepare_call(state: _DcpExecutionState, **call):
 
 
 __all__ = ["query_from_runtime", "plan", "prepare_call"]
+
+
+def _prepare_transport_calls(runtime, calls, *, channel_id, ranks):
+    """Prepare collectives before an unowned channel claims a serving stream.
+
+    Priming completes synchronously on the preparation session's stream. Stream
+    affinity is suspended only while this unpublished channel is initialized;
+    capture or eager serving must subsequently claim its execution stream.
+    """
+    from b12x.preparation import CollectiveRequirement, PreparationSession
+
+    if runtime._owner_stream_key is not None:
+        raise ValueError("DCP transport preparation requires an unowned channel")
+    declarations = {}
+    requests = []
+    for operation, call in calls.items():
+        declaration = plan(
+            query_from_runtime(runtime, surface=f"DcpAllToAll.{operation}", call=call),
+            runtime=runtime,
+        )
+        name = f"{channel_id}:{operation}"
+        requests.append(declaration.request(
+            name=name, collective=CollectiveRequirement(key=name, ranks=tuple(ranks)),
+            prepare_call=lambda state, call=call: prepare_call(state, **call),
+        ))
+        declarations[operation] = declaration
+    session = PreparationSession(device=runtime.device, autotune=False, compile_workers=0)
+    stream_affine = runtime._stream_affine
+    runtime._stream_affine = False
+    try:
+        session.prepare(
+            tuple(requests),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+    except BaseException:
+        session.close()
+        raise
+    finally:
+        runtime._stream_affine = stream_affine
+    return session, declarations

@@ -38,7 +38,9 @@ owns declarative planning, `mm`, and `pack_weight`. The fixed
 execution. `gemm.block_fp8_linear` retains a separate interface because
 it owns caller-provided scratch and inline requantization. The fused MLA query
 projection (`gemm.mla_query_projection`) and grouped WO projection
-(`gemm.wo_projection`) are used around MLA attention.
+(`gemm.wo_projection`) are used around MLA attention;
+`gemm.mla_query_bmm` is the caller-owned strided BF16 query BMM without the
+RoPE tail for eager prefill row counts above the fused projection's limit.
 `gemm.block_fp8_linear` also accepts V4.1's 32x32 E4M3/UE8M0 weight blocks
 with per-32 activation quantization. `gemm.bf16_gemv.mm` handles unquantized
 BF16/FP32 projections, including FP32 outputs and bias before final rounding;

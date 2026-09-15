@@ -6,8 +6,6 @@ registered buffers, and resolved CuTe launchers.
 """
 from __future__ import annotations
 
-import os
-
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -122,6 +120,29 @@ def _plain_launcher_metadata(backend, native, inp):
     }
 
 
+
+def _fused_launcher_metadata(runtime, backend, native, inp):
+    """Freeze the native fused geometry for the declared tensor capacity."""
+    rows = inp.numel() // int(inp.shape[-1])
+    if not 1 <= rows <= runtime.fused_max_rows:
+        raise ValueError(
+            f"fused allreduce RMSNorm supports 1 to {runtime.fused_max_rows} rows; "
+            f"got {rows}"
+        )
+    launch = backend._fused_launch_plan(native, inp)
+    variant = launch.variant
+    return {
+        "dtype": _dtype_name(inp.dtype), "mode": variant.mode,
+        "single_cta": variant.single_cta,
+        "register_normalize": variant.register_normalize,
+        "threads": variant.threads, "reg_packs": variant.reg_packs,
+        "device_index": backend._device_index(runtime.device),
+        "hidden_packs": int(inp.shape[-1]) * inp.element_size() // 16,
+        "rows": launch.rows, "ctas_per_row": launch.ctas_per_row,
+        "blocks": launch.blocks, "stage_input": native.eager_tables is not None,
+    }
+
+
 def query_from_metadata(
     runtime, *, surface: str, shape: tuple[int, ...], dtype: torch.dtype,
     strides: tuple[int, ...] | None = None, alignment: int = 16,
@@ -148,27 +169,9 @@ def query_from_metadata(
         launcher = _plain_launcher_metadata(backend, native, tensor)
         registered = not launcher["stage_input"]
     else:
-        if tensor.ndim == 0 or tensor.shape[-1] * tensor.element_size() % 16:
+        if tensor.ndim == 0 or tensor.shape[-1] <= 0 or tensor.shape[-1] * tensor.element_size() % 16:
             raise ValueError("fused oneshot input last dimension must occupy 16-byte packs")
-        mode, single_cta, register_normalize, threads = backend._fused_launch_config(
-            native, tensor
-        )
-        pack_elems = 16 // tensor.element_size()
-        hidden_packs = int(tensor.shape[-1]) // pack_elems
-        rows = tensor.numel() // int(tensor.shape[-1])
-        if rows > 36:
-            raise ValueError("fused allreduce RMSNorm supports at most 36 rows")
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
-        launcher = {
-            "dtype": _dtype_name(dtype), "mode": mode, "single_cta": single_cta,
-            "register_normalize": register_normalize, "threads": threads,
-            "device_index": backend._device_index(runtime.device),
-            "hidden_packs": hidden_packs, "rows": rows, "ctas_per_row": ctas,
-            "blocks": rows * ctas, "stage_input": stage_input,
-        }
+        launcher = _fused_launcher_metadata(runtime, backend, native, tensor)
         registered = not stage_input
     rank_data_nbytes, slab_nbytes, owned_slab_count = _owned_resident_layout(
         runtime, native
@@ -207,7 +210,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     if not runtime.should_allreduce(inp):
         raise ValueError("input does not satisfy PCIe oneshot requirements")
     if surface in _FUSED_SURFACES and (
-        inp.ndim == 0 or inp.shape[-1] * inp.element_size() % 16
+        inp.ndim == 0 or inp.shape[-1] <= 0 or inp.shape[-1] * inp.element_size() % 16
     ):
         raise ValueError("fused oneshot input last dimension must occupy 16-byte packs")
     backend = runtime._ext
@@ -217,29 +220,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     if surface in _PLAIN_SURFACES:
         launcher = _plain_launcher_metadata(backend, native, inp)
     else:
-        mode, single_cta, register_normalize, threads = backend._fused_launch_config(native, inp)
-        pack_elems = 16 // inp.element_size()
-        hidden_packs = int(inp.shape[-1]) // pack_elems
-        rows = inp.numel() // int(inp.shape[-1])
-        if rows > 36:
-            raise ValueError("fused allreduce RMSNorm supports at most 36 rows")
-        min_ctas = (hidden_packs + threads * 3 - 1) // (threads * 3)
-        override = int(os.getenv("B12X_PCIE_FUSED_CTAS_PER_ROW", "0"))
-        ctas = override if override > 0 else max(max(1, 3 // rows), min_ctas)
-        ctas = max(1, min(ctas, 36 // rows))
-        launcher = {
-            "dtype": dtype,
-            "mode": mode,
-            "single_cta": single_cta,
-            "register_normalize": register_normalize,
-            "threads": threads,
-            "device_index": backend._device_index(inp.device),
-            "hidden_packs": hidden_packs,
-            "rows": rows,
-            "ctas_per_row": ctas,
-            "blocks": rows * ctas,
-            "stage_input": stage_input,
-        }
+        launcher = _fused_launcher_metadata(runtime, backend, native, inp)
     rank_data_nbytes, slab_nbytes, owned_slab_count = _owned_resident_layout(
         runtime, native
     )
@@ -294,7 +275,7 @@ def compile_oneshot_surface(query_payload, ordinal):
                 variant: get_fused_oneshot_launcher(
                     call["dtype"], query.world_size, query.rank, call["mode"],
                     call["single_cta"], call["register_normalize"], variant[0],
-                    variant[1], call["threads"], call["device_index"],
+                    variant[1], call["threads"], call["reg_packs"], call["device_index"],
                 )
                 for variant in variants
             }

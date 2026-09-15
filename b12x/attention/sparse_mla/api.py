@@ -10,6 +10,7 @@ import torch
 from b12x._lib.gating import default_is_supported
 from b12x.preparation import FrozenMapping, Plan
 from .._shared.mla.traits import ModelType
+from .._shared.mla.kv_cache import concat_and_cache_nvfp4_mla_fp8_rope
 from .._shared.mla.api import (
     MLASparseDecodeMetadata as DecodeMetadata,
 )
@@ -178,6 +179,7 @@ __all__ = [
     "bind",
     "run",
     "plan_cache_writer",
+    "concat_and_cache_nvfp4_mla_fp8_rope",
     "concat_and_cache_glm_next_mla",
     "concat_and_cache_glm_next_mla_fp8",
     "concat_and_cache_glm_next_mla_nvfp4",
