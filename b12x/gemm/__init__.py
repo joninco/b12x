@@ -2,9 +2,9 @@
 
 - ``mm``: block-scaled dense matrix multiplication over ``[M,K,L]`` stacks.
 - ``bmm``: dtype-dispatched batched matrix multiplication.
-- ``blockscaled``: prepared dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
+- ``blockscaled``: one-shot dense block-scaled GEMM (NVFP4 / MXFP4 / MXFP8).
 - ``block_fp8_linear``: DeepSeek-style serialized block-FP8 linear via MXFP8.
-- ``bf16_vocab_projection``: prepared decode-time BF16 vocabulary projection.
+- ``bf16_vocab_projection``: profiled decode-time BF16 vocabulary projection.
 - ``mxfp8_linear`` / ``tensor_fp8_linear``: compatibility aliases for
   ``blockscaled`` packed-weight calls.
 - ``mla_query_bmm``: caller-owned strided BF16 MLA query BMM (no RoPE tail).
@@ -34,12 +34,9 @@ _OP_MODULES = (
     "wo_projection",
 )
 _FUNCTIONS = {
-    "mm": ("._preparation", "mm"),
-    "plan": ("._preparation", "plan"),
-    "DenseGemmQuery": ("._tuning", "DenseGemmQuery"),
-    "DenseGemmConfig": ("._tuning", "DenseGemmConfig"),
+    "mm": (".._lib.dense_gemm", "dense_gemm"),
     "bmm": ("._bmm.api", "bmm"),
-    "plan_bmm": ("._bmm.api", "plan"),
+    "prewarm_bmm": ("._bmm.api", "prewarm_bmm"),
     "can_implement_bmm": ("._bmm.api", "can_implement_bmm"),
     "is_bmm_supported": ("._bmm.api", "is_bmm_supported"),
 }

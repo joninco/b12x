@@ -12,16 +12,12 @@ import pytest
 import torch
 
 from b12x._lib.utils import convert_sf_from_mma_layout
-from b12x.preparation import PreparationSession, PreparedCall
-from b12x.quantization import mxfp8 as mxfp8_quant
+from b12x.gemm import block_fp8_linear as bfl
 from b12x.gemm import blockscaled, mxfp8_linear
 from b12x.gemm._shared.wo_mxfp8 import (
     dequantize_mxfp8_rows_torch,
-    empty_mxfp8_rows_bases,
-    mxfp8_rows_from_bases,
 )
 
-from ._blockscaled import prepared
 from ..conftest import require_b12x
 
 
@@ -51,23 +47,6 @@ def _quantize_modelopt_mxfp8_rows(
     return values, scale_u8.contiguous()
 
 
-def _quantize_source(source):
-    rows, width = source.shape
-    bases = empty_mxfp8_rows_bases(rows, width, num_groups=1, device=source.device)
-    packed = mxfp8_rows_from_bases(*bases, rows, width, num_groups=1)
-    args = (source, packed.values, packed.scale_rows, packed.scale_mma)
-    plan = mxfp8_quant.plan(mxfp8_quant.query_from_call(*args))
-    with PreparationSession(device=source.device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(
-            name="reference_quantization", prepare_call=lambda state: PreparedCall(
-                run=lambda: state.run(*args),
-            ),
-        ),))
-        session.freeze()
-        mxfp8_quant.quantize_rows(*args, plan=plan)
-    return packed
-
-
 def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
     rows, width = map(int, source.shape)
     padded_width = int(packed_weight.padded_in_features)
@@ -75,7 +54,7 @@ def _reference_from_packed(source: torch.Tensor, packed_weight) -> torch.Tensor:
         padded = source.new_zeros((rows, padded_width))
         padded[:, :width] = source
         source = padded.contiguous()
-    x_q = _quantize_source(source)
+    x_q = bfl.quantize_input(source)
     x_deq = dequantize_mxfp8_rows_torch(x_q.values, x_q.scale_rows)
     w_deq = dequantize_mxfp8_rows_torch(
         packed_weight.weight.values, packed_weight.weight.scale_rows
@@ -102,15 +81,14 @@ def test_mm_matches_quantized_reference_small_n() -> None:
     torch.manual_seed(20260614)
 
     source, _, packed = _make_inputs(7, 128, 32)
+    actual = mxfp8_linear.mm(source, packed, mode="quantized")
     expected = _reference_from_packed(source, packed)
-    with prepared(source, packed, activation_mode="quantized") as plan:
-        actual = mxfp8_linear.mm(source, packed, plan=plan)
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-        assert actual.shape == (7, 32)
-        torch.testing.assert_close(
-            actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
-        )
+    assert actual.shape == (7, 32)
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
+    )
 
 
 def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
@@ -135,13 +113,12 @@ def test_mm_persistent_ctas_complete_single_stage_epilogue_stores() -> None:
     )
     packed = mxfp8_linear.pack_weight(weight, weight_scale)
 
-    with prepared((source_values, source_scale), packed, expected_m=tokens) as plan:
-        for _ in range(4):
-            actual = mxfp8_linear.mm(
-                (source_values, source_scale), packed, plan=plan
-            )
-            torch.cuda.synchronize()
-            assert torch.all(actual == in_features)
+    for _ in range(4):
+        actual = mxfp8_linear.mm(
+            (source_values, source_scale), packed, expected_m=tokens
+        )
+        torch.cuda.synchronize()
+        assert torch.all(actual == in_features)
 
 
 @pytest.mark.parametrize("tokens", (2, 3, 8, 15, 16, 17, 32, 99))
@@ -152,19 +129,18 @@ def test_mm_writes_all_rows_for_unaligned_output_width(tokens: int) -> None:
     torch.manual_seed(20260814 + tokens)
 
     source, _, packed = _make_inputs(tokens, 7168, 132)
+    actual = mxfp8_linear.mm(source, packed, mode="quantized", expected_m=tokens)
     expected = _reference_from_packed(source, packed)
-    with prepared(source, packed, activation_mode="quantized", expected_m=tokens) as plan:
-        actual = mxfp8_linear.mm(source, packed, plan=plan)
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-        assert actual.shape == (tokens, 132)
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(
-            actual.float(),
-            expected.to(actual.dtype).float(),
-            rtol=1e-2,
-            atol=2e-2,
-        )
+    assert actual.shape == (tokens, 132)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
 
 
 def test_mm_unaligned_output_stride_captures_and_replays() -> None:
@@ -174,26 +150,24 @@ def test_mm_unaligned_output_stride_captures_and_replays() -> None:
 
     source, _, packed = _make_inputs(8, 7168, 132)
     replacement = torch.randn_like(source).div_(4)
-    expected = _reference_from_packed(replacement, packed)
-    with prepared(source, packed, activation_mode="quantized") as plan:
-        mxfp8_linear.mm(source, packed, plan=plan)
-        torch.cuda.synchronize()
+    mxfp8_linear.mm(source, packed, mode="quantized")
+    torch.cuda.synchronize()
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = mxfp8_linear.mm(source, packed, plan=plan)
-        source.copy_(replacement)
-        graph.replay()
-        torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mxfp8_linear.mm(source, packed, mode="quantized")
+    source.copy_(replacement)
+    expected = _reference_from_packed(source, packed)
+    graph.replay()
+    torch.cuda.synchronize()
 
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(
-            actual.float(),
-            expected.to(actual.dtype).float(),
-            rtol=1e-2,
-            atol=2e-2,
-        )
-        graph.reset()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(),
+        expected.to(actual.dtype).float(),
+        rtol=1e-2,
+        atol=2e-2,
+    )
 
 
 def test_mm_pads_k32_to_dense_tile() -> None:
@@ -212,15 +186,14 @@ def test_mm_pads_k32_to_dense_tile() -> None:
     )
     assert torch.all(packed.weight.scale_rows.view(torch.uint8)[0, :, 5:] == 127)
 
+    actual = mxfp8_linear.mm(source, packed, mode="quantized")
     expected = _reference_from_packed(source, packed)
-    with prepared(source, packed, activation_mode="quantized") as plan:
-        actual = mxfp8_linear.mm(source, packed, plan=plan)
-        torch.cuda.synchronize()
+    torch.cuda.synchronize()
 
-        assert actual.shape == (3, 40)
-        torch.testing.assert_close(
-            actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
-        )
+    assert actual.shape == (3, 40)
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
+    )
 
 
 def test_mm_default_fused_path_captures_with_k_padding() -> None:
@@ -230,21 +203,19 @@ def test_mm_default_fused_path_captures_with_k_padding() -> None:
 
     source, _, packed = _make_inputs(1, 160, 40)
 
-    with prepared(source, packed) as plan:
-        eager = mxfp8_linear.mm(source, packed, plan=plan).clone()
-        torch.cuda.synchronize()
+    eager = mxfp8_linear.mm(source, packed).clone()
+    torch.cuda.synchronize()
 
-        mxfp8_linear.mm(source, packed, plan=plan)  # warm before capture
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = mxfp8_linear.mm(source, packed, plan=plan)
-        for _ in range(3):
-            graph.replay()
-        torch.cuda.synchronize()
+    mxfp8_linear.mm(source, packed)  # warm before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = mxfp8_linear.mm(source, packed)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
 
-        torch.testing.assert_close(actual, eager, rtol=0, atol=0)
-        graph.reset()
+    torch.testing.assert_close(actual, eager, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens,in_features", [(1, 160), (8, 256), (9, 256), (17, 160)])
@@ -255,12 +226,12 @@ def test_mm_uses_quantizer_without_scale_padding_initialization(
     require_mxf8_mma()
     torch.manual_seed(20260903)
 
-    from b12x.gemm._shared import wo_mxfp8
+    from b12x.gemm._shared import block_fp8
 
     source, _, packed = _make_inputs(tokens, in_features, 384)
     expected = _reference_from_packed(source, packed)
     allocations = []
-    original = wo_mxfp8.empty_mxfp8_rows_bases
+    original = block_fp8.empty_mxfp8_rows_bases
 
     def poison_storage(*args, **kwargs):
         allocations.append(kwargs.get("initialize_scales", True))
@@ -270,41 +241,50 @@ def test_mm_uses_quantizer_without_scale_padding_initialization(
         bases[2].fill_(255)
         return bases
 
-    monkeypatch.setattr(wo_mxfp8, "empty_mxfp8_rows_bases", poison_storage)
-    with prepared(source, packed, activation_mode="quantized", expected_m=32) as plan:
-        actual = mxfp8_linear.mm(source, packed, plan=plan)
-        torch.cuda.synchronize()
+    monkeypatch.setattr(block_fp8, "empty_mxfp8_rows_bases", poison_storage)
+    actual = mxfp8_linear.mm(source, packed, mode="quantized", expected_m=32)
+    torch.cuda.synchronize()
 
-        assert allocations == [False]
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(
-            actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
-        )
+    assert allocations == [False]
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual.float(), expected.to(actual.dtype).float(), rtol=0, atol=0
+    )
 
 
 def test_mm_quantizer_reuses_planned_capacity_under_frozen_resolution() -> None:
     require_b12x()
     require_mxf8_mma()
+    import b12x
+    from b12x._lib.quant import mxfp8_rows
 
     source, _, packed = _make_inputs(16, 384, 256)
     expected = _reference_from_packed(source, packed).to(source.dtype)
-    with prepared(source, packed, activation_mode="quantized") as plan:
+    mxfp8_rows._get_compiled_mxfp8_rows_quant.cache_clear()
+    mxfp8_linear.mm(source, packed, mode="quantized", expected_m=16)
+    torch.cuda.synchronize()
+    misses = mxfp8_rows._get_compiled_mxfp8_rows_quant.cache_info().misses
+    b12x.freeze_kernel_resolution("packed MXFP8 capacity regression")
+    try:
         for tokens in (1, 8, 9, 16):
             graph = torch.cuda.CUDAGraph()
-            try:
-                with torch.cuda.graph(graph):
-                    actual = mxfp8_linear.mm(source[:tokens], packed, plan=plan)
-                address = actual.data_ptr()
-                allocated = torch.cuda.memory_allocated()
-                for _ in range(3):
-                    actual.fill_(float("nan"))
-                    graph.replay()
-                torch.cuda.synchronize()
-                assert actual.data_ptr() == address
-                assert torch.cuda.memory_allocated() == allocated
-                torch.testing.assert_close(actual, expected[:tokens], rtol=0, atol=0)
-            finally:
-                graph.reset()
+            with torch.cuda.graph(graph):
+                actual = mxfp8_linear.mm(
+                    source[:tokens], packed, mode="quantized", expected_m=16,
+                )
+            address = actual.data_ptr()
+            allocated = torch.cuda.memory_allocated()
+            for _ in range(3):
+                actual.fill_(float("nan"))
+                graph.replay()
+            torch.cuda.synchronize()
+            assert actual.data_ptr() == address
+            assert torch.cuda.memory_allocated() == allocated
+            torch.testing.assert_close(actual, expected[:tokens], rtol=0, atol=0)
+            graph.reset()
+        assert mxfp8_rows._get_compiled_mxfp8_rows_quant.cache_info().misses == misses
+    finally:
+        b12x.unfreeze_kernel_resolution()
 
 
 def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
@@ -314,7 +294,7 @@ def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
 
     tokens, in_features, out_features = 6, 128, 64
     source, _, packed = _make_inputs(tokens, in_features, out_features)
-    source_q = _quantize_source(source)
+    source_q = bfl.quantize_input(source)
     source_scale_storage = convert_sf_from_mma_layout(
         source_q.scale_mma,
         m=tokens,
@@ -322,30 +302,41 @@ def test_blockscaled_mm_accepts_prequantized_mxfp8_and_replays() -> None:
         num_groups=1,
         sf_vec_size=32,
     )
-    with prepared(source, packed, activation_mode="quantized") as plan:
-        expected = blockscaled.mm(source, packed, plan=plan)
-    for scales in (source_q.scale_mma, source_scale_storage):
-        operands = (source_q.values, scales)
-        with prepared(operands, packed) as plan:
-            actual = blockscaled.mm(operands, packed, plan=plan, out_dtype=torch.bfloat16)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            graph = torch.cuda.CUDAGraph()
-            try:
-                with torch.cuda.graph(graph):
-                    graph_output = blockscaled.mm(
-                        operands, packed, plan=plan, out_dtype=torch.bfloat16,
-                    )
-                output_ptr = graph_output.data_ptr()
-                allocated = torch.cuda.memory_allocated()
-                for _ in range(3):
-                    graph_output.fill_(float("nan"))
-                    graph.replay()
-                torch.cuda.synchronize()
-                assert torch.cuda.memory_allocated() == allocated
-                assert graph_output.data_ptr() == output_ptr
-                torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
-            finally:
-                graph.reset()
+    expected = blockscaled.mm(source, packed, mode="quantized")
+    actual_native_scale = blockscaled.mm(
+        (source_q.values, source_q.scale_mma),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+    actual_serialized_scale = blockscaled.mm(
+        (source_q.values, source_scale_storage),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+
+    torch.testing.assert_close(actual_native_scale, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_serialized_scale, expected, rtol=0, atol=0)
+
+    blockscaled.prewarm(
+        packed,
+        [tokens],
+        input_dtype=torch.float8_e4m3fn,
+        out_dtype=torch.bfloat16,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = blockscaled.mm(
+            (source_q.values, source_scale_storage),
+            packed,
+            out_dtype=torch.bfloat16,
+        )
+    output_ptr = graph_output.data_ptr()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    assert graph_output.data_ptr() == output_ptr
+    torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
 
 
 def test_blockscaled_mm_accepts_compact_mxfp8_scales_with_k_padding() -> None:
@@ -355,11 +346,12 @@ def test_blockscaled_mm_accepts_compact_mxfp8_scales_with_k_padding() -> None:
 
     source, _, packed = _make_inputs(6, 160, 40)
     source_values, source_scale_rows = _quantize_modelopt_mxfp8_rows(source)
-    operands = (source_values, source_scale_rows)
-    with prepared(operands, packed) as plan:
-        actual = blockscaled.mm(operands, packed, plan=plan, out_dtype=torch.bfloat16)
-    with prepared(source, packed, activation_mode="quantized") as plan:
-        expected = blockscaled.mm(source, packed, plan=plan)
+    actual = blockscaled.mm(
+        (source_values, source_scale_rows),
+        packed,
+        out_dtype=torch.bfloat16,
+    )
+    expected = blockscaled.mm(source, packed, mode="quantized")
 
     assert actual.shape == (6, 40)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

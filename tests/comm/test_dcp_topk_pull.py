@@ -4,7 +4,8 @@ import pytest
 import torch
 
 from b12x._lib.runtime_control import (
-    kernel_resolution_guard,
+    freeze_kernel_resolution,
+    unfreeze_kernel_resolution,
 )
 from b12x.comm.pcie._dcp_topk_pull_cute import (
     precompile_peer_topk,
@@ -108,9 +109,10 @@ def test_peer_selector_exact_repeatable_all_live_rows(topk):
     slabs = torch.empty((4, capacity, topk + 8, 2), device=device)
     pointers = tuple(slabs[r].data_ptr() for r in range(4))
     output = torch.full((capacity, topk + 8), -7, dtype=torch.int32, device=device)
-    with kernel_resolution_guard(
+    freeze_kernel_resolution(
         "Peer top-k reuses static geometry across rows 1 through 64"
-    ):
+    )
+    try:
         # Rows 1 through 16 plus the larger uniform decode graph sizes up to
         # the 64-row transport capacity.
         for rows in (*range(1, 17), 24, 32, 40, 48, 56, 64):
@@ -137,3 +139,5 @@ def test_peer_selector_exact_repeatable_all_live_rows(topk):
                     assert out.data_ptr() == address
                     assert torch.cuda.memory_allocated() == allocated
                 assert torch.all(output[:, topk:] == -7)
+    finally:
+        unfreeze_kernel_resolution()

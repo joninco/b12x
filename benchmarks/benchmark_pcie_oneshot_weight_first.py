@@ -63,7 +63,6 @@ from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.common import (  # noqa: E402
     benchmark_provenance,
-    prepare_oneshot_benchmark,
     nvidia_smi_gpu_mode_snapshot,
 )
 
@@ -199,7 +198,6 @@ def _worker(
     norm_w = torch.ones(hidden, dtype=dtype, device=device)
     records = []
     validations = []
-    sessions = []
     try:
         if rank == 0:
             print("rows,variant,median_us_rank0,median_us_max_rank", flush=True)
@@ -209,15 +207,11 @@ def _worker(
             residual = torch.randn(shape, dtype=dtype, device=device)
             out = torch.empty_like(x_in)
             residual_out = torch.empty_like(x_in)
-            session, declaration = prepare_oneshot_benchmark(
-                pool.for_stream(), x_in, out, name=f"weight-first-rows-{rows}",
-                residual=residual, residual_out=residual_out, weight=norm_w,
-            )
-            sessions.append(session)
+            pool.prepare_graph_fused_add_rms_norm(x_in)
 
             def allreduce():
                 pool.all_reduce_fused_add_rms_norm(
-                    x_in, residual, norm_w, 1e-6, plan=declaration, out=out, residual_out=residual_out
+                    x_in, residual, norm_w, 1e-6, out=out, residual_out=residual_out
                 )
 
             # (name, projection callable returning its outputs, its weights)
@@ -374,8 +368,6 @@ def _worker(
                     indent=2,
                 )
     finally:
-        for session in sessions:
-            session.close()
         pool.close()
         dist.destroy_process_group()
 

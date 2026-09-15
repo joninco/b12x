@@ -222,15 +222,9 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_rope_bytes = hpb * q_rope_stride * 2
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
-    # V4.1's fast arm normalizes its gathered mixed source rows in place to
-    # E4M3+UE8M0, so it uses the ordinary FP8 Q stage.  The reference arm
-    # retains its BF16 Q staging.
+    # --- Q-NoPE staging. FP8 normally; BF16 for native NVFP4 cache math. ---
     q_fp8_off = off
-    q_element_bytes = (
-        1
-        if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3
-        else 2
-    )
+    q_element_bytes = 2 if traits.scale_format == ScaleFormat.NVFP4_E4M3 else 1
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
 
@@ -321,9 +315,12 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     sm_p_full_bytes = hpb * sm_p_full_stride * 2
     off = sm_p_full_off + sm_p_full_bytes
 
-    # --- native H16 group-1 tail. DSV4 and V4.1 both use two H8 groups.
-    # Group 1's V4 rope load reaches 16 rows; V4.1 has no rope but reuses this
-    # disjoint tail for its W-scale staging, keeping both groups private. ---
+    # --- native H16 group-1 w_head_sc (tail region; base offsets unchanged).
+    #     DSV4-only: GLM has no two-group H16 mode and sits near the carveout.
+    #     The extra 8*BI bf16 rows keep group 1's S6b ldmatrix.x4 A-loads (which
+    #     always touch 16 sm_p rows from the group base at +8 rows) inside the
+    #     allocation; those rows are read-garbage/compute-discarded, exactly
+    #     like the H8 kernel's rows 8-15. ---
     off = _align_up(off, 16)
     w_head_sc2_off = off
     w_head_sc2_bytes = (

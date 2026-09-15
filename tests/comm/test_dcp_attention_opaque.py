@@ -4,28 +4,10 @@ from types import SimpleNamespace
 from contextlib import contextmanager
 
 import pytest
-from b12x._lib.runtime_control import kernel_resolution_guard
-
 import torch
 
 from b12x.comm.pcie import pcie_dcp_attention as module
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2A
-
-
-@pytest.fixture
-def prepared_transport(monkeypatch):
-    observed = {}
-
-    def prepare(runtime, calls, *, channel_id, ranks):
-        observed.update(calls)
-        assert tuple(ranks) == (0, 1, 2, 3)
-        return SimpleNamespace(close=lambda: None), {name: object() for name in calls}
-
-    monkeypatch.setattr(module, "_prepare_transport_calls", prepare)
-    monkeypatch.setattr(
-        module.dist, "get_process_group_ranks", lambda group: list(range(4))
-    )
-    return observed
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -33,6 +15,10 @@ def prepared_transport(monkeypatch):
 @pytest.mark.parametrize("interleave", [1, 64])
 @pytest.mark.parametrize("inplace", [False, True])
 def test_local_lengths_reuse_compiled_geometry_and_replay(rank, interleave, inplace):
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
     from b12x.comm.pcie._dcp_attention_metadata import (
         localize_dcp_sequence_lengths,
         precompile_dcp_sequence_lengths,
@@ -40,7 +26,8 @@ def test_local_lengths_reuse_compiled_geometry_and_replay(rank, interleave, inpl
 
     device = torch.cuda.current_device()
     compiled = precompile_dcp_sequence_lengths(device)
-    with kernel_resolution_guard("DCP causal lengths must not specialize live rows"):
+    freeze_kernel_resolution("DCP causal lengths must not specialize live rows")
+    try:
         for rows in (1, 2, 3, 4, 8, 16, 127, 128, 129):
             values = torch.arange(rows, dtype=torch.int32) * 67
             seed = values.to(device)
@@ -67,11 +54,11 @@ def test_local_lengths_reuse_compiled_geometry_and_replay(rank, interleave, inpl
                 torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
                 assert out.data_ptr() == pointer
                 assert precompile_dcp_sequence_lengths(device) is compiled
+    finally:
+        unfreeze_kernel_resolution()
 
 
-def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(
-    monkeypatch, prepared_transport
-):
+def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(monkeypatch):
     class Runtime:
         _stream_affine = True
         _owner_stream_key = None
@@ -80,6 +67,12 @@ def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(
         _staging1_ptrs = [200]
         _slot_bytes = 100
         _bind_stream_key = PCIeDCPA2A._bind_stream_key
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            pass
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            pass
 
     runtime = Runtime()
 
@@ -92,6 +85,12 @@ def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(
         def for_stream(self, **kwargs):
             runtime._bind_stream_key(1)
             return runtime
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            self.for_stream().prepare_graph_all_gather_heads()
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            self.for_stream().prepare_graph_lse_reduce_scatter()
 
         @contextmanager
         def capture(self, **kwargs):
@@ -123,7 +122,7 @@ def test_model_load_preparation_leaves_stream_ownership_for_graph_capture(
 
 @pytest.mark.parametrize("max_rows", [1, 16, 24, 32, 64])
 def test_channel_capacity_sizes_the_pool_and_rejects_no_positive_value(
-    monkeypatch, max_rows, prepared_transport
+    monkeypatch, max_rows
 ):
     """Any positive capacity reaches the pool as its batch size."""
     requested = {}
@@ -133,6 +132,12 @@ def test_channel_capacity_sizes_the_pool_and_rejects_no_positive_value(
         _signal_ptrs = [100]
         _staging1_ptrs = [200]
         _slot_bytes = 100
+
+        def prepare_graph_all_gather_heads(self, **kwargs):
+            requested["gather_threads"] = kwargs["threads"]
+
+        def prepare_graph_lse_reduce_scatter(self, **kwargs):
+            requested["reduce_threads"] = kwargs["threads"]
 
     class Pool:
         _logical_channels = {"target": Runtime()}
@@ -162,8 +167,7 @@ def test_channel_capacity_sizes_the_pool_and_rejects_no_positive_value(
     assert requested["max_batch_size"] == max_rows
     assert channel.max_rows == max_rows
     assert (channel.threads, channel.block_limit) == (512, 16)
-    assert prepared_transport["all_gather_heads"]["threads"] == 512
-    assert prepared_transport["lse_reduce_scatter"]["threads"] == 512
+    assert requested["gather_threads"] == requested["reduce_threads"] == 512
     channel.close()
     with pytest.raises(ValueError, match="positive row capacity"):
         module.PCIeDCPAttention(
@@ -180,23 +184,19 @@ def test_compiled_attention_calls_keep_channel_identity_and_lifetime(
     channel.channel_id = "target-attention"
     channel.threads, channel.block_limit = 512, 16
     channel._closed = False
-    channel._session = None
-    channel._plans = {"all_gather_heads": object(), "lse_reduce_scatter": object()}
     channel._state = torch.zeros(4, dtype=torch.uint8)
     channel._handle = next(module._HANDLES)
     module._CHANNELS[channel._handle] = channel
     calls = []
 
-    def gather(query, out, *, plan, channel_id, threads, block_limit):
-        assert plan is channel._plans["all_gather_heads"]
+    def gather(query, out, *, channel_id, threads, block_limit):
         assert (threads, block_limit) == (512, 16)
         calls.append(("query", channel_id))
         out.copy_(query.repeat(1, 4, 1))
 
     def combine(
-        partial, lse, out, *, plan, channel_id, is_lse_base_on_e, threads, block_limit
+        partial, lse, out, *, channel_id, is_lse_base_on_e, threads, block_limit
     ):
-        assert plan is channel._plans["lse_reduce_scatter"]
         assert is_lse_base_on_e
         assert (threads, block_limit) == (512, 16)
         calls.append(("combine", channel_id))
@@ -237,6 +237,10 @@ def test_compiled_attention_calls_keep_channel_identity_and_lifetime(
 def test_local_lse_mask_uses_each_query_length_under_frozen_graph_replay():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    from b12x._lib.runtime_control import (
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
+    )
     from b12x.comm.pcie._dcp_attention_metadata import (
         mask_local_lse,
         precompile_local_lse_mask,
@@ -248,7 +252,8 @@ def test_local_lse_mask_uses_each_query_length_under_frozen_graph_replay():
     lengths = torch.empty(capacity, dtype=torch.int32, device=device)
     output = torch.empty((capacity, 32), device=device)
     kernel = precompile_local_lse_mask(32, device.index)
-    with kernel_resolution_guard("Per-query LSE mask reuses one static head geometry"):
+    freeze_kernel_resolution("Per-query LSE mask reuses one static head geometry")
+    try:
         # Rows 1 through 16 plus the larger uniform decode graph sizes up to
         # the 64-row transport capacity.
         for rows in (*range(1, 17), 24, 32, 40, 48, 56, 64):
@@ -269,73 +274,5 @@ def test_local_lse_mask_uses_each_query_length_under_frozen_graph_replay():
                 torch.testing.assert_close(
                     output[:rows], expected[:rows], rtol=0, atol=0
                 )
-
-
-@pytest.mark.parametrize("fail", (False, True))
-def test_transport_preparation_restores_affinity_without_claiming_a_stream(
-    monkeypatch, fail
-):
-    from b12x import preparation
-    from b12x.comm.pcie._dcp_preparation import _prepare_transport_calls
-
-    class Runtime:
-        rank, world_size = 0, 4
-        device = torch.device("cpu")
-        max_batch_size, total_heads, head_dim, query_head_dim = 64, 32, 512, 576
-        _slot_bytes, _signal_ptrs = 4096, (100, 200, 300, 400)
-        _owner_stream_key, _stream_affine = None, True
-        _bind_stream_key = PCIeDCPA2A._bind_stream_key
-
-        def _resolve_launch_config(self, *, threads, block_limit):
-            return threads, block_limit
-
-    runtime = Runtime()
-    events = []
-
-    class Session:
-        def __init__(self, **kwargs):
-            assert kwargs["compile_workers"] == 0
-
-        def prepare(self, requests, *, coordinator):
-            runtime._bind_stream_key(17)
-            assert runtime._owner_stream_key is None
-            (request,) = requests
-            assert request.plan.query.setup["max_batch_size"] == 64
-            assert request.plan.query.call["threads"] == 512
-            assert (
-                coordinator(SimpleNamespace(ready_collectives=(request.collective,)))
-                == request.collective.key
-            )
-            if fail:
-                raise RuntimeError("priming failed")
-            events.append("primed")
-
-        def close(self):
-            events.append("closed")
-
-    monkeypatch.setattr(preparation, "PreparationSession", Session)
-    calls = {
-        "all_gather_heads": {
-            "local_input": torch.empty((64, 8, 576), dtype=torch.bfloat16),
-            "out": torch.empty((64, 32, 576), dtype=torch.bfloat16),
-            "threads": 512,
-            "block_limit": 16,
-        }
-    }
-    if fail:
-        with pytest.raises(RuntimeError, match="priming failed"):
-            _prepare_transport_calls(
-                runtime, calls, channel_id="target", ranks=range(4)
-            )
-        assert events == ["closed"]
-    else:
-        session, plans = _prepare_transport_calls(
-            runtime, calls, channel_id="target", ranks=range(4)
-        )
-        assert set(plans) == {"all_gather_heads"}
-        assert events == ["primed"]
-        session.close()
-    assert runtime._stream_affine
-    assert runtime._owner_stream_key is None
-    runtime._bind_stream_key(29)
-    assert runtime._owner_stream_key == 29
+    finally:
+        unfreeze_kernel_resolution()

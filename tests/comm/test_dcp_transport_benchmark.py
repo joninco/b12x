@@ -4,7 +4,8 @@ import pytest
 import torch
 
 from b12x._lib.runtime_control import (
-    kernel_resolution_guard,
+    freeze_kernel_resolution,
+    unfreeze_kernel_resolution,
 )
 from benchmarks.dcp_transport.fixtures import rank_inputs, references
 from benchmarks.dcp_transport.selectors import precompile, select_owner, select_peers
@@ -41,7 +42,8 @@ def test_sparse_attention_peer_queries_match_local_queries(splits):
         prepare_consumer(
             splits=splits, peer_reads=peer_reads, device_index=device.index
         )
-    with kernel_resolution_guard("Sparse attention peer-query live row reuse"):
+    freeze_kernel_resolution("Sparse attention peer-query live row reuse")
+    try:
         for rows in (1, 2, 4, 8, 16):
             for peer in peers:
                 peer.copy_(torch.randn(peer.shape, generator=generator).bfloat16())
@@ -94,6 +96,8 @@ def test_sparse_attention_peer_queries_match_local_queries(splits):
             assert torch.cuda.memory_allocated() == allocated
             torch.testing.assert_close(out[:rows], expected_out[:rows], rtol=0, atol=0)
             torch.testing.assert_close(lse[:rows], expected_lse[:rows], rtol=0, atol=0)
+    finally:
+        unfreeze_kernel_resolution()
 
 
 def test_peer_lse_merge_matches_float64_with_empty_shards():
@@ -108,7 +112,8 @@ def test_peer_lse_merge_matches_float64_with_empty_shards():
         _merger(rank, device.index)
         for shape in ((2304, 0), (4096, 0), (2304, 4096), (8192, 32)):
             _publisher(rank, *shape, device.index)
-    with kernel_resolution_guard("Peer LSE merge live row counts"):
+    freeze_kernel_resolution("Peer LSE merge live row counts")
+    try:
         for rows in (1, 2, 4, 8, 16):
             ranks = [rank_inputs(rank, rows) for rank in range(4)]
             partials = [r.partial.to(device) for r in ranks]
@@ -135,6 +140,8 @@ def test_peer_lse_merge_matches_float64_with_empty_shards():
                 assert torch.cuda.memory_allocated() == allocated
                 torch.testing.assert_close(out.cpu(), expected, rtol=0.02, atol=0.02)
                 assert torch.isfinite(out).all()
+    finally:
+        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("layout", ["owner_planes", "peer_pairs"])
@@ -144,7 +151,8 @@ def test_transport_candidate_consumers_reuse_static_compile(layout, topk):
         pytest.skip("CUDA required")
     device = torch.device("cuda", torch.cuda.current_device())
     fn = precompile(topk, 4, layout, device.index)
-    with kernel_resolution_guard("DCP benchmark consumers across live row counts"):
+    freeze_kernel_resolution("DCP benchmark consumers across live row counts")
+    try:
         for rows in (1, 2, 4, 8, 16):
             ranks = [rank_inputs(rank, rows, topk=topk) for rank in range(4)]
             expected = references(ranks, 0)[2]
@@ -184,3 +192,5 @@ def test_transport_candidate_consumers_reuse_static_compile(layout, topk):
             assert torch.cuda.memory_allocated() == before
             torch.testing.assert_close(out.cpu().sort().values, expected)
             assert precompile(topk, 4, layout, device.index) is fn
+    finally:
+        unfreeze_kernel_resolution()

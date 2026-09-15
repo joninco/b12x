@@ -332,7 +332,7 @@ def _launch(binding: Binding):
     return entry, args, spec
 
 
-def _compile(*, binding: Binding) -> object:
+def compile(*, binding: Binding) -> None:
     signature = _signature(binding)
     with _LOCK:
         compiled = _CACHE.get(signature)
@@ -341,26 +341,24 @@ def _compile(*, binding: Binding) -> object:
         compiled = compile_cute(entry, *args, compile_spec=spec)
         with _LOCK:
             _CACHE[signature] = compiled
-    return compiled
-
-@dataclass(frozen=True)
-class _PreparedRemapLauncher:
-    signature: tuple[int, int, bool]
-    compiled: object
-
-    def run(self, binding: Binding):
-        if _signature(binding) != self.signature:
-            raise ValueError("sparse index remap binding differs from preparation")
-        _, args, _ = _launch(binding)
-        run_compiled(self.compiled, args)
-        return binding.physical_indices, binding.selected_counts
 
 
-def _resolve_launcher(*, binding: Binding) -> _PreparedRemapLauncher:
-    compiled = _compile(binding=binding)
-    return _PreparedRemapLauncher(_signature(binding), compiled)
-
-
+def run(*, binding: Binding) -> tuple[torch.Tensor, torch.Tensor]:
+    signature = _signature(binding)
+    with _LOCK:
+        compiled = _CACHE.get(signature)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "sparse index remap compile miss during CUDA graph capture; "
+                "call compile first"
+            )
+        compile(binding=binding)
+        with _LOCK:
+            compiled = _CACHE[signature]
+    _, args, _ = _launch(binding)
+    run_compiled(compiled, args)
+    return binding.physical_indices, binding.selected_counts
 
 
 def clear_caches() -> None:
@@ -373,4 +371,6 @@ __all__ = [
     "bind",
     "bind_physical_slots",
     "clear_caches",
+    "compile",
+    "run",
 ]

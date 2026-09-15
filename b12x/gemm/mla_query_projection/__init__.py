@@ -17,10 +17,10 @@ from ..._lib.meta import OpMeta, Provenance, install_lazy_api
 META = OpMeta(
     name="mla_query_projection",
     group="gemm",
-    api_style="prepared",
+    api_style="oneshot",
     entry_points=(
-        "plan",
         "run",
+        "prewarm",
         "can_implement",
         "is_supported",
         "clear_caches",
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
         can_implement,
         clear_caches,
         is_supported,
-        plan,
+        prewarm,
         run,
     )
 

@@ -20,10 +20,10 @@ from pathlib import Path
 import torch
 
 from b12x._lib.runtime_control import (
-    kernel_resolution_guard,
+    freeze_kernel_resolution,
+    unfreeze_kernel_resolution,
 )
 from b12x.attention import sparse_mla
-from b12x.attention.sparse_mla._scratch import plan_sparse_mla_scratch
 from b12x.attention._shared.mla.api import sparse_mla_decode_forward
 from b12x.attention._shared.mla.kernel import LAST_DECODE_PLAN
 from b12x.attention._shared.mla.reference import (
@@ -80,7 +80,7 @@ def make_case(device, rows, heads, valid, high_pages):
     # Invalid tail slots point outside the pool if the active-length mask fails.
     indices[:, valid:].fill_(2**31 - 1)
     lengths = torch.full((rows,), valid, device=device, dtype=torch.int32)
-    plan = plan_sparse_mla_scratch(
+    plan = sparse_mla.plan(
         sparse_mla.Caps(
             device=device,
             num_q_heads=heads,
@@ -103,13 +103,14 @@ def make_case(device, rows, heads, valid, high_pages):
         torch.empty(s.shape, dtype=s.dtype, device=s.device)
         for s in plan.scratch_specs()
     ]
-    binding = plan.bind(
+    binding = sparse_mla.bind(
+        plan,
         scratch=scratch,
         q=q,
         kv_cache=cache,
         selected_indices=indices,
-        cache_seqlens_int32=lengths,
-        nsa_cache_seqlens_int32=lengths,
+        cache_lengths=lengths,
+        selected_lengths=lengths,
     )
     decoded = unpack_mla_kv_cache_reference(packed).squeeze(1).double()
 
@@ -122,7 +123,7 @@ def make_case(device, rows, heads, valid, high_pages):
 
     def run(splits):
         return sparse_mla_decode_forward(
-            binding=binding,
+            binding=binding.runtime,
             kv_cache=cache,
             sm_scale=1 / math.sqrt(576),
             v_head_dim=512,
@@ -158,10 +159,13 @@ def validate_and_capture(run, reference, splits):
         raise RuntimeError("Sparse decode did not execute the unified kernel")
     expected = reference()
     check(output, expected)
-    with kernel_resolution_guard("GLM sparse-decode split benchmark capture"):
+    freeze_kernel_resolution("GLM sparse-decode split benchmark capture")
+    try:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = run(splits)
+    finally:
+        unfreeze_kernel_resolution()
     return graph, output, selected_plan
 
 

@@ -17,7 +17,6 @@ from .pcie_dcp_a2a import PCIeDCPA2APool, _SIGNAL_BYTES
 from .pcie_dcp_topk import _tensor_from_cuda_pointer
 from .pcie_oneshot import _normalize_device
 from ._dcp_attention_metadata import mask_local_lse, precompile_local_lse_mask
-from ._dcp_preparation import _prepare_transport_calls
 
 
 _HANDLES = count(1)
@@ -48,7 +47,6 @@ def _query_op(
     channel._pool.all_gather_heads(
         query,
         out,
-        plan=channel._plans["all_gather_heads"],
         channel_id=channel.channel_id,
         threads=channel.threads,
         block_limit=channel.block_limit,
@@ -56,9 +54,7 @@ def _query_op(
 
 
 @_query_op.register_fake
-def _query_fake(
-    query: torch.Tensor, out: torch.Tensor, state: torch.Tensor, handle: int
-) -> None:
+def _query_fake(query, out, state, handle) -> None:
     pass
 
 
@@ -81,7 +77,6 @@ def _combine_op(
         partial,
         lse,
         out,
-        plan=channel._plans["lse_reduce_scatter"],
         channel_id=channel.channel_id,
         is_lse_base_on_e=True,
         threads=channel.threads,
@@ -90,13 +85,7 @@ def _combine_op(
 
 
 @_combine_op.register_fake
-def _combine_fake(
-    partial: torch.Tensor,
-    lse: torch.Tensor,
-    out: torch.Tensor,
-    state: torch.Tensor,
-    handle: int,
-) -> None:
+def _combine_fake(partial, lse, out, state, handle) -> None:
     pass
 
 
@@ -124,13 +113,7 @@ def _combine_masked_op(
 
 @_combine_masked_op.register_fake
 def _combine_masked_fake(
-    partial: torch.Tensor,
-    lse: torch.Tensor,
-    local_seq_lens: torch.Tensor,
-    masked_lse: torch.Tensor,
-    out: torch.Tensor,
-    state: torch.Tensor,
-    handle: int,
+    partial, lse, local_seq_lens, masked_lse, out, state, handle
 ) -> None:
     pass
 
@@ -181,7 +164,6 @@ class PCIeDCPAttention:
         self.threads = int(threads)
         self.block_limit = int(block_limit)
         self._closed = False
-        self._session = None
         self._pool = PCIeDCPA2APool.from_process_group(
             process_group=process_group,
             device=self.device,
@@ -192,48 +174,12 @@ class PCIeDCPAttention:
         )
         try:
             self._pool.prepare_channels((channel_id,))
+            # Preparation compiles geometry without assigning an execution
+            # stream. The model-loading stream need not own the captured graph.
             runtime = self._pool._logical_channels[channel_id]
-            local_query = torch.zeros(
-                (max_rows, local_heads, query_dim),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            partial = torch.zeros(
-                (max_rows, local_heads * 4, output_dim),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            lse = torch.zeros(
-                (max_rows, local_heads * 4), dtype=torch.float32, device=self.device
-            )
-            self._session, self._plans = _prepare_transport_calls(
-                runtime,
-                {
-                    "all_gather_heads": {
-                        "local_input": local_query,
-                        "out": torch.empty(
-                            (max_rows, local_heads * 4, query_dim),
-                            dtype=torch.bfloat16,
-                            device=self.device,
-                        ),
-                        "threads": self.threads,
-                        "block_limit": self.block_limit,
-                    },
-                    "lse_reduce_scatter": {
-                        "partial_output": partial,
-                        "partial_lse": lse,
-                        "out": torch.empty(
-                            (max_rows, local_heads, output_dim),
-                            dtype=torch.bfloat16,
-                            device=self.device,
-                        ),
-                        "is_lse_base_on_e": True,
-                        "threads": self.threads,
-                        "block_limit": self.block_limit,
-                    },
-                },
-                channel_id=channel_id,
-                ranks=dist.get_process_group_ranks(process_group),
+            runtime.prepare_graph_all_gather_heads(threads=self.threads)
+            runtime.prepare_graph_lse_reduce_scatter(
+                dtype=torch.bfloat16, threads=self.threads
             )
             precompile_local_lse_mask(local_heads * 4, self.device.index)
             self.allocated_bytes = (
@@ -248,8 +194,6 @@ class PCIeDCPAttention:
                 device=self.device,
             )
         except Exception:
-            if self._session is not None:
-                self._session.close()
             self._pool.close()
             raise
         self._handle = next(_HANDLES)
@@ -299,8 +243,6 @@ class PCIeDCPAttention:
         """Collectively release IPC mappings after all graph work completes."""
         if self._closed:
             return
-        if self._session is not None:
-            self._session.close()
         self._pool.close()
         self._closed = True
         self.allocated_bytes = 0

@@ -7,20 +7,22 @@ attention sinks, sliding window, and an MSA block-sparse variant driven by
 supply tensors, shape metadata, and capacity caps (``Budget``). Decode
 supports CUDA-graph replay with all metadata rebuilt on-device.
 
-Planned lifecycle: ``plan(Caps(...))`` declares a configuration without device
-work.  ``PreparationSession`` materializes it, then ``bind(plan, ...)``
-maps caller-owned scratch and ``run(binding=..., plan=...)`` launches.
-Decode replay metadata is owned by the prepared plan.
+Planned lifecycle: ``plan(Caps(...))`` sizes the caller-owned scratch;
+``bind`` maps allocation-free views; ``compile`` resolves the selected entries
+without launching; ``run`` launches (capture safe).
+``Workspace`` is the preplanned arena alternative for workspace-style
+serving.
 
 Example:
     from b12x.attention import paged
 
-    declaration = paged.plan(paged.Caps(mode="decode", dtype=torch.bfloat16, ...))
-    session.prepare((declaration.request(...),))
-    binding = paged.bind(declaration, scratch=scratch, q=q, k_cache=k, v_cache=v,
+    plan    = paged.plan(paged.Caps(mode="decode", dtype=torch.bfloat16, ...))
+    spec    = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = paged.bind(plan, scratch=scratch, q=q, k_cache=k, v_cache=v,
                          output=out, page_table=pt, cache_seqlens=lens,
                          cu_seqlens_q=cu_q)
-    out, lse = paged.run(binding=binding, plan=declaration)
+    out, lse = paged.run(binding=binding)
 """
 
 from __future__ import annotations
@@ -51,8 +53,7 @@ META = OpMeta(
         "decode_graph_scratch_envelope",
         "plan",
         "bind",
-        "invocation_from_descriptors",
-        "invocation_from_tensors",
+        "compile",
         "run",
         "infer_mode",
         "is_supported",
@@ -93,13 +94,12 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         Workspace,
         bind,
         clear_caches,
+        compile,
         decode_graph_capacity,
         extend_graph_capacity,
         verify_graph_capacity,
         decode_graph_scratch_envelope,
         infer_mode,
-        invocation_from_descriptors,
-        invocation_from_tensors,
         is_supported,
         plan,
         run,

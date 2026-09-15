@@ -41,7 +41,8 @@ def _live_rows(capacity: int) -> tuple[int, ...]:
 
 def _check_channel_pair(group, device, rank, capacity, rows):
     from b12x._lib.runtime_control import (
-        kernel_resolution_guard,
+        freeze_kernel_resolution,
+        unfreeze_kernel_resolution,
     )
     from b12x.comm.pcie.pcie_dcp_attention import PCIeDCPAttention
     from b12x.comm.pcie.pcie_dcp_topk_pull import PAYLOAD_OFFSET, PCIeDCPTopKPull
@@ -100,13 +101,18 @@ def _check_channel_pair(group, device, rank, capacity, rows):
             run()
             torch.cuda.synchronize(device)
             dist.barrier(group)
-            with kernel_resolution_guard(
+            freeze_kernel_resolution(
                 f"DCP channels at capacity {capacity} reuse the geometry "
                 "compiled at construction"
-            ), torch.cuda.graph(graph):
-                run()
+            )
+            try:
+                with torch.cuda.graph(graph):
+                    run()
+            finally:
+                unfreeze_kernel_resolution()
         dist.barrier(group)
-        with kernel_resolution_guard("DCP channel replays resolve no kernels"):
+        freeze_kernel_resolution("DCP channel replays resolve no kernels")
+        try:
             pointers = (gathered.data_ptr(), combined.data_ptr(), selected.data_ptr())
             for seed, expected in ((1931, expected), (3911, None)):
                 if expected is None:
@@ -139,6 +145,8 @@ def _check_channel_pair(group, device, rank, capacity, rows):
                     selected.data_ptr(),
                 ) == pointers
                 dist.barrier(group)
+        finally:
+            unfreeze_kernel_resolution()
         del graph
         torch.cuda.synchronize(device)
         dist.barrier(group)

@@ -17,8 +17,6 @@ from __future__ import annotations
 import math
 
 import pytest
-from b12x._lib.runtime_control import kernel_resolution_guard
-
 import torch
 
 cuda_required = pytest.mark.skipif(
@@ -267,6 +265,7 @@ def test_rows_independent_of_batch():
 def test_all_row_counts_under_frozen_resolution():
     """After ``precompile`` every row count 1..16 runs under frozen kernel
     resolution (no compile, no cache lookup by M)."""
+    import b12x
 
     api = _api()
     device = _supported_device()
@@ -274,12 +273,15 @@ def test_all_row_counts_under_frozen_resolution():
     proj = api.WeightFirstProjection(weights)  # precompiles
     assert proj.compiled
     cat = proj.weight.clone()
-    with kernel_resolution_guard("weight-first projection row-count test"):
+    b12x.freeze_kernel_resolution("weight-first projection row-count test")
+    try:
         for m in range(1, 17):
             x = _random_x(m, 6144, device, seed=100 + m)
             y0, y1 = proj(x)
             _assert_within_bf16_rounding(y0, x, cat[:256])
             _assert_within_bf16_rounding(y1, x, cat[256:])
+    finally:
+        b12x.unfreeze_kernel_resolution()
 
 
 @cuda_required
@@ -301,6 +303,7 @@ def test_rows_beyond_max_fall_back_to_cublas():
 def test_graph_capture_replay_without_allocation():
     """The op captures into a CUDA graph; replays reproduce the eager result
     bitwise on new inputs and neither allocate nor compile."""
+    import b12x
 
     api = _api()
     device = _supported_device()
@@ -310,7 +313,8 @@ def test_graph_capture_replay_without_allocation():
     eager = [y.clone() for y in proj(static_x)]
     stream = torch.cuda.Stream(device)
     graph = torch.cuda.CUDAGraph()
-    with kernel_resolution_guard("weight-first projection capture test"):
+    b12x.freeze_kernel_resolution("weight-first projection capture test")
+    try:
         with torch.cuda.stream(stream):
             proj(static_x)  # warm the allocator on the side stream
             torch.cuda.synchronize(device)
@@ -332,6 +336,8 @@ def test_graph_capture_replay_without_allocation():
         assert torch.cuda.memory_allocated(device) == allocated
         for y, ref in zip(out, expected, strict=True):
             assert torch.equal(y, ref)
+    finally:
+        b12x.unfreeze_kernel_resolution()
 
 
 @cuda_required

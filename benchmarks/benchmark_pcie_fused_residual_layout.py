@@ -38,19 +38,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from b12x._lib.runtime_control import kernel_resolution_guard
-
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from cuda.bindings import runtime as cudart
 
+import b12x
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from benchmarks.common import (  # noqa: E402
     benchmark_provenance,
-    prepare_oneshot_benchmark,
     nvidia_smi_gpu_mode_snapshot,
 )
 
@@ -204,7 +202,6 @@ def _capture_case(
     rank: int,
     device: torch.device,
     epsilon: float,
-    sessions: list,
 ) -> tuple[dict[str, torch.cuda.CUDAGraph], dict[str, Any], dict[str, Any]]:
     source_input, residual_values, weight = _input_values(
         rows, hidden_size, rank, device
@@ -227,12 +224,7 @@ def _capture_case(
         channel_id = f"graph:layout:{rows}:{name}"
         channel = pool.for_stream(streams[name], channel_id=channel_id)
         with torch.cuda.stream(streams[name]):
-            session, declaration = prepare_oneshot_benchmark(
-                channel, inputs[name], outputs[name], name=channel_id,
-                residual=residuals[name], residual_out=residuals[name],
-                weight=weight, epsilon=epsilon,
-            )
-            sessions.append(session)
+            channel.prepare_graph_fused_add_rms_norm(inputs[name])
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         with (
             pool.capture(stream=streams[name], channel_id=channel_id),
@@ -245,7 +237,6 @@ def _capture_case(
                 residuals[name],
                 weight,
                 epsilon,
-                plan=declaration,
                 out=outputs[name],
                 residual_out=residuals[name],
                 stream=streams[name],
@@ -437,7 +428,6 @@ def _worker(
             max_concurrent_channels=len(channel_ids),
         )
         pool.prepare_channels(channel_ids)
-        sessions = []
         try:
             graphs, metadata, case = _capture_case(
                 pool,
@@ -446,7 +436,6 @@ def _worker(
                 rank,
                 device,
                 1e-6,
-                sessions,
             )
             # Correctness precedes timing: every rank's arms must pass the
             # checked replay, or all ranks abort before any timed replay.
@@ -466,9 +455,12 @@ def _worker(
                         for failed_rank, name, checks in all_failures
                     )
                 )
-            # Every collective is prepared before capture. Timed graph
-            # replays must reuse those launchers without further resolution.
-            with kernel_resolution_guard("fused residual layout benchmark"):
+            # The transport plan, and with it the compiled kernel, depends
+            # on the row count, so every case compiles during its capture;
+            # resolution is frozen only around the timed replays, which
+            # must not compile.
+            b12x.freeze_kernel_resolution("fused residual layout benchmark")
+            try:
                 raw = _measure(
                     graphs,
                     metadata["streams"],
@@ -478,6 +470,8 @@ def _worker(
                     warmups,
                     metadata["reset"],
                 )
+            finally:
+                b12x.unfreeze_kernel_resolution()
             # Repeated-replay state: from the restored inputs every arm must
             # reproduce its validated outputs bitwise after the timed replays.
             metadata["reset"]()
@@ -523,8 +517,6 @@ def _worker(
                 }
                 cases.append(case)
         finally:
-            for session in sessions:
-                session.close()
             pool.close()
 
     gathered_correctness: list[Any] = [None] * world_size

@@ -6,11 +6,15 @@ quantization, multi-stream residual mixing, recurrent/sequence features, and
 PCIe collectives. One grammar everywhere:
 
 - ops live at ``b12x.<group>.<op>`` and declare themselves via ``META``;
-- operations declare ``Plan`` values without allocating or compiling;
-- ``PreparationSession`` selects, compiles and primes each ``Plan``, which then
-  carries its own prepared state and a stable integer ``handle``;
-- binding and custom ops consume the prepared ``Plan``; run and graph replay
-  never resolve kernels.
+- planned ops share the lifecycle ``Caps -> plan() -> bind() ->
+  run*()`` (``plan`` may allocate; ``bind`` builds views only and never
+  allocates; ``run*`` is CUDA-graph-capture safe);
+- one-shot ops are plain functions; comm collectives are classes.
+
+Serving controls (`freeze_kernel_resolution` & friends) live here at the
+arch root because they guard the shared compiler: warm every kernel shape,
+then freeze so a cache miss raises instead of compiling inside a live
+request or graph capture.
 
 Importing this module is cheap and side-effect free; kernels, cutlass, and
 torch custom ops load on first op use.
@@ -25,7 +29,12 @@ from typing import Any
 from ._lib.meta import OpMeta
 from ._lib.runtime_control import (
     KernelResolutionFrozenError,
+    compilation_frozen,
+    freeze_compilation,
+    freeze_kernel_resolution,
     kernel_resolution_frozen,
+    unfreeze_compilation,
+    unfreeze_kernel_resolution,
 )
 
 # Static logical-op registry, kept in lockstep with public op directories and
@@ -35,7 +44,6 @@ _OPS: tuple[str, ...] = (
     "attention.dense_mla",
     "attention.sparse_mla",
     "attention.compressed_sparse_mla",
-    "attention.mla_compress",
     "attention.dsa_indexer",
     "attention.mla_compress",
     "attention.topk_sort",
@@ -70,7 +78,6 @@ _OPS: tuple[str, ...] = (
     "sequence.kda_prefill",
     "sequence.gdn_prefill",
     "sequence.mtp_feedback",
-    "sequence.engram",
 )
 
 # A group-level function cannot share its name with an imported child module.
@@ -95,9 +102,6 @@ _GROUPS = (
 _LAZY_ROOT_ATTRS: dict[str, tuple[str, str]] = {
     # public name -> (module, attribute)
     "ScratchBufferSpec": ("._lib.scratch", "ScratchBufferSpec"),
-    "Plan": (".preparation", "Plan"),
-    "PreparationRequest": (".preparation", "PreparationRequest"),
-    "PreparationSession": (".preparation", "PreparationSession"),
 }
 
 
@@ -157,11 +161,13 @@ __all__ = [
     "KernelResolutionFrozenError",
     "OpMeta",
     "ScratchBufferSpec",
-    "Plan",
-    "PreparationRequest",
-    "PreparationSession",
     "clear_all_caches",
+    "compilation_frozen",
     "find_op",
+    "freeze_compilation",
+    "freeze_kernel_resolution",
     "kernel_resolution_frozen",
     "list_ops",
+    "unfreeze_compilation",
+    "unfreeze_kernel_resolution",
 ]

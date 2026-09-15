@@ -6,7 +6,8 @@ import pytest
 import torch
 
 from b12x._lib.runtime_control import (
-    kernel_resolution_guard,
+    freeze_kernel_resolution,
+    unfreeze_kernel_resolution,
 )
 from b12x.comm.pcie.dcp_candidate_topk import (
     pack_dcp_candidates,
@@ -27,7 +28,8 @@ def test_rank_major_selection_matches_reference_with_frozen_resolution(
     generator = torch.Generator().manual_seed(731)
     storage = torch.empty((world_size, 19, topk, 2), device=device)
     output_storage = torch.empty((16, topk + 8), dtype=torch.int32, device=device)
-    with kernel_resolution_guard("rank-major top-k row-count reuse"):
+    freeze_kernel_resolution("rank-major top-k row-count reuse")
+    try:
         for rows in (1, 2, 4, 8, 16):
             # Slice keeps a padded rank stride and a padded output row stride.
             gathered = storage[:, :rows]
@@ -58,6 +60,8 @@ def test_rank_major_selection_matches_reference_with_frozen_resolution(
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == allocated
             torch.testing.assert_close(out.cpu().sort().values, expected.sort().values)
+    finally:
+        unfreeze_kernel_resolution()
 
 
 def test_rank_major_selection_handles_prefill_chunk():

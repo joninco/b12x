@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from b12x.moe import ep_moe as public_ep_moe
-from b12x.preparation import PreparedCall, PreparationSession
 
 import b12x.moe.ep_moe._impl as ep_moe
+from b12x._lib.intrinsics import swizzle_block_scale
 from b12x.moe.ep_moe._impl import (
     EPMoEScratchCaps,
-    _materialize_layout,
+    plan_ep_moe_scratch,
     prepare_ep_expert_map,
+    b12x_ep_moe_fp4,
 )
 from b12x.moe.fused_moe._impl import plan_b12x_fp4_moe_weights
 from b12x.moe._shared.kernels.w4a16.host import (
@@ -93,7 +93,7 @@ def test_ep_scratch_sizes_global_route_state_separately_from_local_weights(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(ep_moe, "get_num_sm", lambda _device: 120)
-    plan = _materialize_layout(
+    plan = plan_ep_moe_scratch(
         EPMoEScratchCaps(
             max_tokens=24,
             num_topk=2,
@@ -114,7 +114,7 @@ def test_ep_scratch_reserves_route_pack_power_of_two_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(ep_moe, "get_num_sm", lambda _device: 120)
-    plan = _materialize_layout(
+    plan = plan_ep_moe_scratch(
         EPMoEScratchCaps(
             max_tokens=3,
             num_topk=2,
@@ -229,43 +229,31 @@ def _run_ep_rank(
         global_num_experts=int(expert_map.numel()),
         device=a.device,
     )
-    output = torch.empty_like(a)
-    caps = EPMoEScratchCaps(
-        max_tokens=int(a.shape[0]), num_topk=int(topk_ids.shape[1]),
-        global_num_experts=int(expert_map.numel()), device=a.device,
-        weight_plan=experts.plan,
-    )
-    declaration = public_ep_moe.plan(
-        caps, expert_map=prepared_map,
-        invocation=public_ep_moe.invocation_from_tensors(
-            a=a, topk_ids=topk_ids, topk_weights=topk_weights, output=output,
-            expert_map=prepared_map,
-        ),
-    )
-    scratch = {}
-
-    def prepare_call(state):
-        spec = state.layout.scratch_specs()[0]
-        scratch["value"] = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        binding = state.bind(
-            scratch=scratch["value"], a=a, experts=experts,
-            topk_weights=topk_weights, topk_ids=topk_ids, output=output,
+    plan = plan_ep_moe_scratch(
+        EPMoEScratchCaps(
+            max_tokens=int(a.shape[0]),
+            num_topk=int(topk_ids.shape[1]),
+            global_num_experts=int(expert_map.numel()),
+            device=a.device,
+            weight_plan=experts.plan,
         )
-        return PreparedCall(run=lambda: state.run(binding))
-
-    session = PreparationSession(device=a.device, autotune=False, compile_workers=2)
-    session.prepare((
-        declaration.request(
-            name=f"ep-{prepared_map.tensor.data_ptr()}",
-            prepare_call=prepare_call,
-        ),
-    ))
-    plan = declaration
-    binding = public_ep_moe.bind(
-        plan, scratch=scratch["value"], a=a, experts=experts,
-        topk_weights=topk_weights, topk_ids=topk_ids, output=output,
     )
-    return public_ep_moe.run(binding=binding), binding
+    scratch = torch.empty(
+        plan.scratch_specs()[0].shape,
+        dtype=torch.uint8,
+        device=a.device,
+    )
+    output = torch.empty_like(a)
+    binding = plan.bind(
+        scratch=scratch,
+        a=a,
+        experts=experts,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        expert_map=prepared_map,
+        output=output,
+    )
+    return b12x_ep_moe_fp4(binding=binding), binding
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

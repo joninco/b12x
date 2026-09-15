@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from contextlib import contextmanager
 from threading import Lock
 
 
@@ -11,26 +10,32 @@ class KernelResolutionFrozenError(RuntimeError):
 
 
 _STATE_LOCK = Lock()
-_GUARDS: dict[object, str | None] = {}
+_FROZEN = False
+_FREEZE_REASON: str | None = None
 
 
-@contextmanager
-def kernel_resolution_guard(reason: str | None = None):
-    """Each capture/session owns its guard; leaving one cannot unfreeze another."""
-    token = object()
+def freeze_kernel_resolution(reason: str | None = None) -> None:
+    global _FROZEN, _FREEZE_REASON
     with _STATE_LOCK:
-        _GUARDS[token] = reason
-    try:
-        yield
-    finally:
-        with _STATE_LOCK:
-            del _GUARDS[token]
+        _FROZEN = True
+        _FREEZE_REASON = reason
+
+
+def unfreeze_kernel_resolution() -> None:
+    global _FROZEN, _FREEZE_REASON
+    with _STATE_LOCK:
+        _FROZEN = False
+        _FREEZE_REASON = None
 
 
 def kernel_resolution_frozen() -> bool:
     with _STATE_LOCK:
-        return bool(_GUARDS)
+        return _FROZEN
 
+
+freeze_compilation = freeze_kernel_resolution
+unfreeze_compilation = unfreeze_kernel_resolution
+compilation_frozen = kernel_resolution_frozen
 
 
 def raise_if_kernel_resolution_frozen(
@@ -40,8 +45,8 @@ def raise_if_kernel_resolution_frozen(
     cache_key: object | None = None,
 ) -> None:
     with _STATE_LOCK:
-        frozen = bool(_GUARDS)
-        reason = next(reversed(_GUARDS.values()), None)
+        frozen = _FROZEN
+        reason = _FREEZE_REASON
     if not frozen:
         return
 
@@ -54,7 +59,7 @@ def raise_if_kernel_resolution_frozen(
     if reason is not None:
         details.append(f"reason={reason}")
     details.append(
-        "prepare this execution before entering capture or freezing its session"
+        "warm up this kernel shape before calling b12x.freeze_kernel_resolution()"
     )
     raise KernelResolutionFrozenError("; ".join(details))
 

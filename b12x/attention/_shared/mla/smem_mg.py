@@ -8,12 +8,14 @@ math path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+
 import cutlass
 import cutlass.cute as cute
 
 from .smem import SM120_SMEM_CARVEOUT_BYTES
-from .traits import ComputeMode, ModelType, UnifiedMLATraits
+from .traits import ComputeMode, UnifiedMLATraits
+
 
 _MG_N_HG = 2
 _KV_BUF_COUNT = 2
@@ -63,12 +65,6 @@ class SmemLayoutMG:
     kv_sc_buf_bytes: int
     kv_sc_stride: int
 
-    # DSV4.1 FP8-PV only: producer-precomputed FP16 native-to-canonical
-    # conversion ratios. Kept out of the 544B raw QK stage rows so BF16 QK
-    # consumes the native record unchanged before PV rewrites it in place.
-    kv_ratio_off: int
-    kv_ratio_buf_bytes: int
-    kv_ratio_stride: int
     # kv_rope: GLM-only V/K rope bf16 staging (linear entry*D_ROPE + d),
     # double-buffered. DSV4 MG reads rope from global/L2, so kv_rope_buf_bytes==0
     # and the field is never indexed for DSV4 (const_expr-elided).
@@ -139,9 +135,6 @@ def make_smem_layout_mg(
     # that small scratch cooperatively between tiles instead of keeping the
     # ldmatrix fragments live (and spilled) across the full kernel.
     alias_qrope = bf16_qk or is_glm
-    dsv41_fp8_pv = (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
-    )
     # Keep the model-native padded KV row in both compute modes.  DSV4's 464-B
     # stride (448-B payload + 16-B pad) is part of the shared-memory bank layout,
     # not merely copy padding; FlashInfer retains it for BF16 QK as well.  The
@@ -207,13 +200,7 @@ def make_smem_layout_mg(
 
     kv_sc_off = off
     if is_glm:
-        if dsv41_fp8_pv:
-            # V4.1 becomes canonical E4M3 only after BF16 QK. Its FP8 PV then
-            # uses the ordinary DSV4 eight-UE8M0-byte scale interface.
-            kv_sc_stride = 8
-            kv_sc_buf_bytes = bi * kv_sc_stride
-            off = kv_sc_off + kv_sc_buf_bytes * bufs
-        elif traits.latent_scale_per_token:
+        if traits.latent_scale_per_token:
             # NVFP4 per-token mode: one fp32 second-level latent scale per
             # candidate ([292, 296) of the 368B record), scalar-gathered like
             # the DSV4 footer into a double-buffered BI x 4 region.
@@ -228,16 +215,6 @@ def make_smem_layout_mg(
         kv_sc_stride = 8
         kv_sc_buf_bytes = bi * kv_sc_stride
         off = kv_sc_off + kv_sc_buf_bytes * bufs
-
-    kv_ratio_off = off
-    if dsv41_fp8_pv:
-        # 32 FP16 ratios per candidate (64B), double-buffered with KV.
-        kv_ratio_stride = 64
-        kv_ratio_buf_bytes = bi * kv_ratio_stride
-        off = kv_ratio_off + kv_ratio_buf_bytes * bufs
-    else:
-        kv_ratio_stride = 0
-        kv_ratio_buf_bytes = 0
 
     # MG reads KV-rope from global/L2 for BOTH models (no smem staging), so the
     # kv_rope buffer is always empty. Kept as zeroed fields for layout symmetry.
@@ -326,9 +303,6 @@ def make_smem_layout_mg(
         kv_sc_off=kv_sc_off,
         kv_sc_buf_bytes=kv_sc_buf_bytes,
         kv_sc_stride=kv_sc_stride,
-        kv_ratio_off=kv_ratio_off,
-        kv_ratio_buf_bytes=kv_ratio_buf_bytes,
-        kv_ratio_stride=kv_ratio_stride,
         kv_rope_off=kv_rope_off,
         kv_rope_buf_bytes=kv_rope_buf_bytes,
         kv_rope_stride=kv_rope_stride,
@@ -373,9 +347,7 @@ def get_prefill_mg_shared_storage_cls(
     # reads rope from global/L2, so it allocates NEITHER kv_sc nor kv_rope. Each
     # model is its own compiled specialization, so the GLM struct cannot perturb
     # the DSV4 struct.
-    if is_glm and not traits.latent_scale_per_token and not (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
-    ):
+    if is_glm and not traits.latent_scale_per_token:
         kv_scale_field = {}
     else:
         kv_scale_field = {
@@ -383,15 +355,6 @@ def get_prefill_mg_shared_storage_cls(
                 cutlass.Uint8, int(layout.kv_sc_buf_bytes * layout.kv_bufs)
             ],
         }
-    kv_ratio_field = (
-        {
-            "kv_ratio": cute.struct.MemRange[
-                cutlass.Uint8, int(layout.kv_ratio_buf_bytes * layout.kv_bufs)
-            ],
-        }
-        if layout.kv_ratio_buf_bytes
-        else {}
-    )
 
     # Only the Q prologue differs across compute modes: DSV4 FP8 stages {q_rope,
     # q_fp8, q_sc}; BF16 + GLM FP8 stage Q-rope into a scratch aliased onto the
@@ -404,7 +367,6 @@ def get_prefill_mg_shared_storage_cls(
             128,
         ],
         **kv_scale_field,
-        **kv_ratio_field,
         "mbar": cute.struct.Align[
             cute.struct.MemRange[cutlass.Uint64, int(layout.mbar_bytes // 8)],
             16,
@@ -463,12 +425,8 @@ def get_prefill_mg_shared_storage_cls(
             "q_sc": layout.q_sc_off,
         }
     expected_offsets["kv_fp8"] = layout.kv_fp8_off
-    if not is_glm or traits.latent_scale_per_token or (
-        traits.model_type == ModelType.DSV41 and traits.fp8_internal
-    ):
+    if not is_glm or traits.latent_scale_per_token:
         expected_offsets["kv_sc"] = layout.kv_sc_off
-    if layout.kv_ratio_buf_bytes:
-        expected_offsets["kv_ratio"] = layout.kv_ratio_off
     expected_offsets.update(
         {
             "mbar": layout.mbar_off,
@@ -520,22 +478,6 @@ def _run_module_asserts() -> None:
         f"BF16 MG prefill smem {bl.total_bytes}B exceeds SM120 carveout "
         f"{SM120_SMEM_CARVEOUT_BYTES}B"
     )
-    v41_fp8 = replace(
-        make_unified_traits(
-            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3
-        ),
-        fp8_internal=True,
-    )
-    v41_layout = make_smem_layout_mg(v41_fp8, mg_n_hg=1)
-    assert v41_layout.kv_smem_stride == 544
-    assert v41_layout.kv_sc_buf_bytes == 64 * 8
-    assert v41_layout.kv_ratio_stride == 64
-    assert v41_layout.kv_ratio_buf_bytes == 64 * 64
-    assert v41_layout.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
-        f"V4.1 FP8-PV MG prefill smem {v41_layout.total_bytes}B exceeds "
-        f"SM120 carveout {SM120_SMEM_CARVEOUT_BYTES}B"
-    )
-    get_prefill_mg_shared_storage_cls(v41_fp8, mg_n_hg=1)
 
     # mg_n_hg==1 (heads==16): one head group. Every group buffer is exactly half
     # the mg_n_hg==2 size; the per-group *_group_bytes (and so the group-0 byte

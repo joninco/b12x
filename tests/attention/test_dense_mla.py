@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
+import ast
+from pathlib import Path
 
 import pytest
 import torch
@@ -18,107 +18,27 @@ QK_DIM = 576
 VALUE_DIM = 512
 
 
-_PREPARED: ContextVar[
-    list[tuple[object, object]] | None
-] = ContextVar("dense_mla_prepared", default=None)
-
-
-@contextmanager
-def _prepared_scope():
-    """Scope prepared owners to the current numerical test."""
-    prepared: list[tuple[object, object]] = []
-    token = _PREPARED.set(prepared)
-    try:
-        yield
-    finally:
-        _PREPARED.reset(token)
-        error = None
-        for result, session in reversed(prepared):
-            for close in (result.close, session.close):
-                try:
-                    close()
-                except BaseException as caught:
-                    if error is None:
-                        error = caught
-        if error is not None:
-            raise error
-
-
-@pytest.fixture(autouse=True)
-def _prepared_dense_mla():
-    with _prepared_scope():
-        yield
-
-def _scratch(spec: object) -> torch.Tensor:
-    """Allocate caller-owned scratch from session-provided metadata."""
-    return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-
-
-def _prepare(
-    declaration: dense_mla.Plan,
-    *,
-    name: str,
-    **binding_kwargs,
-):
-    """Admit and prime a declaration through the public preparation lifecycle."""
-    from b12x.preparation import PreparationSession, PreparedCall
-
-    scratch_spec = None
-
-    def prepare_call(state):
-        nonlocal scratch_spec
-        (scratch_spec,) = state.scratch_specs()
-        scratch = _scratch(scratch_spec)
-        binding = state.bind(scratch=scratch, **binding_kwargs)
-        state.prime(binding)
-        return PreparedCall(
-            run=lambda: state.run(binding),
-            output=binding_kwargs["output"],
-            owners=(scratch, binding),
-        )
-
-    session = PreparationSession(
-        device=binding_kwargs["q"].device,
-        autotune=False,
+def _scratch(plan: dense_mla.Plan) -> torch.Tensor:
+    (spec,) = plan.scratch_specs()
+    return torch.empty(
+        spec.shape,
+        dtype=spec.dtype,
+        device=spec.device,
     )
-    try:
-        result = session.prepare((
-            declaration.request(
-                name=name,
-                prepare_call=prepare_call,
-            ),
-        ))
-    except BaseException:
-        session.close()
-        raise
-    prepared = _PREPARED.get()
-    if prepared is None:
-        result.close()
-        session.close()
-        raise RuntimeError("dense MLA test preparation requires _prepared_scope")
-    prepared.append((result, session))
-    assert scratch_spec is not None
-    return declaration, scratch_spec
 
 
-def _bind(declaration: dense_mla.Plan, **binding_kwargs) -> dense_mla.Binding:
-    """Prepare an independent owner, then bind the serving invocation to it."""
-    plan, scratch_spec = _prepare(
-        declaration,
-        name=f"dense-mla-{binding_kwargs['q'].data_ptr():x}",
-        **binding_kwargs,
-    )
-    return dense_mla.bind(
-        plan, scratch=_scratch(scratch_spec), **binding_kwargs
-    )
+def test_is_supported_accepts_implicit_current_device() -> None:
+    require_b12x()
+    assert dense_mla.is_supported()
 
 
 def _guarded_scratch(
-    spec: object,
+    plan: dense_mla.Plan,
     *,
     guard_bytes: int = 16 * 1024 * 1024,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return exact session-planned scratch surrounded by initialized canaries."""
+    """Return exact planned scratch surrounded by initialized canaries."""
+    (spec,) = plan.scratch_specs()
     assert spec.dtype == torch.uint8
     storage = torch.full(
         (spec.nbytes + 2 * guard_bytes,),
@@ -155,8 +75,33 @@ def _assert_matches(
     torch.testing.assert_close(lse, reference_lse, rtol=2e-5, atol=2e-5)
 
 
+def test_source_is_standalone_cute() -> None:
+    root = Path(dense_mla.__file__).resolve().parent
+    forbidden = (
+        "triton",
+        "b12x.attention.paged",
+        "b12x.attention.sparse_mla",
+        "b12x.attention.dsa_indexer",
+        "b12x.attention._shared.mla",
+    )
+    for path in root.glob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        imports: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imports.append(node.module or "")
+        for name in imports:
+            assert not name.startswith(forbidden), (path.name, name)
 
 
+def test_public_types_are_module_scoped_names() -> None:
+    assert dense_mla.Caps.__name__ == "Caps"
+    assert dense_mla.Plan.__name__ == "Plan"
+    assert dense_mla.Binding.__name__ == "Binding"
+    assert dense_mla.Scratch.__name__ == "Scratch"
+    assert dense_mla.Budget.__name__ == "Budget"
 
 
 @torch.inference_mode()
@@ -205,14 +150,18 @@ def test_fp8_physical_record_stride_ignores_padding() -> None:
     cache_seqlens = torch.tensor([64, 65], dtype=torch.int32, device=device)
     cu_seqlens_q = torch.arange(rows + 1, dtype=torch.int32, device=device)
     output = torch.empty(rows, heads, VALUE_DIM, dtype=torch.bfloat16, device=device)
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    kv_scale=kv_scale,
-    q_scale=q_scale,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        kv_scale=kv_scale,
+        q_scale=q_scale,
+    )
     actual, actual_lse = dense_mla.run(binding=binding)
     expected, expected_lse = dense_mla.reference(
         q,
@@ -226,6 +175,25 @@ def test_fp8_physical_record_stride_ignores_padding() -> None:
     _assert_matches(actual, actual_lse, expected, expected_lse)
 
 
+def test_partial_row_budget_changes_native_split_policy() -> None:
+    device = require_b12x()
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=torch.bfloat16,
+            num_q_heads=HEADS,
+            page_size=16,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=128,
+            max_page_table_width=8,
+            num_cache_pages=8,
+            budget=dense_mla.Budget(max_partial_rows=0),
+        )
+    )
+    assert plan.num_splits == 1
+    assert plan.chunks_per_split == 2
 
 
 @pytest.mark.parametrize("heads", [8, 12])
@@ -280,6 +248,7 @@ def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    scratch = _scratch(plan)
 
     # Compile first through a smaller live batch. The same capacity-planned
     # specialization must then accept the full batch without recompilation or
@@ -291,16 +260,20 @@ def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    small_binding = _bind(plan, q=q[:1],
-    kv_cache=cache,
-    output=small_output,
-    page_table=page_table[:1],
-    cache_seqlens=cache_seqlens[:1],
-    cu_seqlens_q=torch.tensor(
-        [0, 1],
-        dtype=torch.int32,
-        device=device,
-    ),)
+    small_binding = dense_mla.bind(
+        plan,
+        scratch=scratch,
+        q=q[:1],
+        kv_cache=cache,
+        output=small_output,
+        page_table=page_table[:1],
+        cache_seqlens=cache_seqlens[:1],
+        cu_seqlens_q=torch.tensor(
+            [0, 1],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
     small_actual, small_lse = dense_mla.run(binding=small_binding)
     small_expected, small_expected_lse = dense_mla.reference(
         small_binding.q,
@@ -316,13 +289,21 @@ def test_bf16_multi_request_decode_matches_reference(heads: int) -> None:
         small_expected_lse,
     )
 
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=scratch,
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
 
+    # Compilation must not launch or mutate graph-visible destinations.
+    dense_mla.compile(binding=binding)
+    torch.cuda.synchronize()
+    assert bool(torch.isnan(output).all().item())
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -361,6 +342,7 @@ def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
             num_cache_pages=pages,
         )
     )
+    assert plan.query_tile == 4
     q_float = torch.randn(query_rows, heads, QK_DIM, device=device) * 0.14
     cache_float = torch.randn(pages, page_size, QK_DIM, device=device) * 0.1
     q_scale = (q_float.abs().max() / 400).reshape(1).float()
@@ -385,14 +367,18 @@ def test_fp8_query_tiled_causal_extend_matches_reference(heads: int) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    q_scale=q_scale,
-    kv_scale=kv_scale,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -432,6 +418,7 @@ def test_bf16_query_tiled_causal_extend_matches_reference() -> None:
             num_cache_pages=pages,
         )
     )
+    assert plan.query_tile == 2
     q = (torch.randn(query_rows, HEADS, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     cache = (torch.randn(pages, page_size, QK_DIM, device=device) * 0.1).to(
         torch.bfloat16
@@ -454,12 +441,16 @@ def test_bf16_query_tiled_causal_extend_matches_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -495,17 +486,19 @@ def test_padded_page_stride_matches_reference() -> None:
         stride=(page_stride, QK_DIM, 1),
     )
     cache.normal_().mul_(0.1)
-    caps = dense_mla.Caps(
-        device=device,
-        mode="decode",
-        kv_dtype=torch.bfloat16,
-        num_q_heads=HEADS,
-        page_size=page_size,
-        max_total_q=1,
-        max_batch=1,
-        max_cache_tokens=64,
-        max_page_table_width=4,
-        num_cache_pages=pages,
+    plan = dense_mla.plan(
+        dense_mla.Caps(
+            device=device,
+            mode="decode",
+            kv_dtype=torch.bfloat16,
+            num_q_heads=HEADS,
+            page_size=page_size,
+            max_total_q=1,
+            max_batch=1,
+            max_cache_tokens=64,
+            max_page_table_width=4,
+            num_cache_pages=pages,
+        )
     )
     q = (torch.randn(1, HEADS, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     page_table = torch.tensor(
@@ -522,24 +515,16 @@ def test_padded_page_stride_matches_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    plan = dense_mla.plan(
-        caps,
-        invocation=dense_mla.invocation_from_tensors(
-            caps,
-            q=q,
-            kv_cache=cache,
-            output=output,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-        ),
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
     q_before = q.clone()
     cache_before = cache.clone()
     page_table_before = page_table.clone()
@@ -583,6 +568,7 @@ def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
             use_cuda_graph=True,
         )
     )
+    assert plan.num_splits > 1
     q = (torch.randn(1, HEADS, QK_DIM, device=device) * 0.1).to(torch.bfloat16)
     cache = (torch.randn(pages, page_size, QK_DIM, device=device) * 0.1).to(
         torch.bfloat16
@@ -601,13 +587,17 @@ def test_cuda_graph_replay_is_allocation_stable_and_reads_live_inputs() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
-
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    dense_mla.compile(binding=binding)
     dense_mla.run(binding=binding)
     torch.cuda.synchronize()
 
@@ -661,6 +651,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
             use_cuda_graph=True,
         )
     )
+    assert plan.num_splits == 94
 
     q_float = torch.randn(1, 48, QK_DIM, device=device) * 0.1
     cache_float = torch.randn(1, page_size, QK_DIM, device=device) * 0.1
@@ -678,20 +669,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    plan, scratch_spec = _prepare(
-        plan,
-        name="dense-mla-split",
-        q=q,
-        kv_cache=cache,
-        output=output,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
-        active_splits=1,
-    )
-    guarded_storage, scratch = _guarded_scratch(scratch_spec)
+    guarded_storage, scratch = _guarded_scratch(plan)
     binding = dense_mla.bind(
         plan,
         scratch=scratch,
@@ -706,6 +684,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         active_splits=1,
     )
     assert binding.active_splits == 1
+    dense_mla.compile(binding=binding)
     actual_output, actual_lse = dense_mla.run(binding=binding)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -744,7 +723,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
     full_output = torch.empty_like(output)
     full_binding = dense_mla.bind(
         plan,
-        scratch=_scratch(scratch_spec),
+        scratch=_scratch(plan),
         q=q,
         kv_cache=cache,
         output=full_output,
@@ -754,7 +733,7 @@ def test_fp8_production_split_plan_handles_short_live_sequence() -> None:
         q_scale=q_scale,
         kv_scale=kv_scale,
     )
-    assert full_binding.active_splits > binding.active_splits
+    assert full_binding.active_splits == plan.num_splits
     full_actual, full_lse = dense_mla.run(binding=full_binding)
     torch.cuda.synchronize()
     torch.testing.assert_close(full_actual, captured_output, rtol=0, atol=0)
@@ -828,12 +807,16 @@ def test_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,
@@ -921,14 +904,18 @@ def test_fp8_page_ids_past_int32_scaled_offset_match_reference() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    binding = _bind(plan, q=q,
-    kv_cache=cache,
-    output=output,
-    page_table=page_table,
-    cache_seqlens=cache_seqlens,
-    cu_seqlens_q=cu_seqlens_q,
-    q_scale=q_scale,
-    kv_scale=kv_scale,)
+    binding = dense_mla.bind(
+        plan,
+        scratch=_scratch(plan),
+        q=q,
+        kv_cache=cache,
+        output=output,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
     actual_output, actual_lse = dense_mla.run(binding=binding)
     expected_output, expected_lse = dense_mla.reference(
         q,

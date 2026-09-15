@@ -53,21 +53,13 @@ def sqg_fp16_d3l_descriptors_cpu() -> torch.Tensor:
     return torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone().contiguous()
 
 
-_SQG_FP16_D3L_DESCRIPTORS_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
-
-
+@functools.cache
 def _sqg_fp16_d3l_descriptors_device(
-    device_type: str,
-    device_index: int | None,
+    device_type: str, device_index: int | None
 ) -> torch.Tensor:
-    key = (device_type, device_index)
-    cached = _SQG_FP16_D3L_DESCRIPTORS_DEVICE.get(key)
-    if cached is None:
-        cached = sqg_fp16_d3l_descriptors_cpu().to(
-            device=torch.device(device_type, device_index)
-        ).contiguous()
-        _SQG_FP16_D3L_DESCRIPTORS_DEVICE[key] = cached
-    return cached
+    return sqg_fp16_d3l_descriptors_cpu().to(
+        device=torch.device(device_type, device_index)
+    ).contiguous()
 
 
 def sqg_fp16_d3l_descriptors(device: torch.device | str) -> torch.Tensor:
@@ -78,17 +70,6 @@ def sqg_fp16_d3l_descriptors(device: torch.device | str) -> torch.Tensor:
     if resolved.type == "cuda" and index is None:
         index = torch.cuda.current_device()
     return _sqg_fp16_d3l_descriptors_device(resolved.type, index)
-
-
-def sqg_fp16_d3l_descriptors_resident(
-    device: torch.device | str,
-) -> torch.Tensor | None:
-    """Return the resident device descriptors without allocating them."""
-    resolved = torch.device(device)
-    index = resolved.index
-    if resolved.type == "cuda" and index is None:
-        index = torch.cuda.current_device()
-    return _SQG_FP16_D3L_DESCRIPTORS_DEVICE.get((resolved.type, index))
 
 
 def sqg_xor_high_rate_rank_for_codewords(
@@ -164,7 +145,6 @@ __all__ = [
     "decode_sqg_fp16_d3l_ranks_torch",
     "sqg_fp16_d3l_descriptors",
     "sqg_fp16_d3l_descriptors_cpu",
-    "sqg_fp16_d3l_descriptors_resident",
     "sqg_fp16_d3l_direct_lut_cpu",
     "sqg_xor_high_rate_rank_for_codewords",
 ]

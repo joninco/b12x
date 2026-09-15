@@ -26,7 +26,14 @@ from b12x.attention.dsa_indexer._impl import (
 from b12x.attention.dsa_indexer.msa_reference import (
     MSA_BLOCK_TOKENS,
 )
-from ._tuning import FUSED_MERGE_AUTO, FUSED_MERGE_CHOICES
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import (
+    DSA_INDEXER_POLICY,
+    FUSED_MERGE_AUTO,
+    FUSED_MERGE_CHOICES,
+    DsaIndexerQuery,
+)
 
 _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
@@ -140,14 +147,6 @@ class B12XIndexerScratchCaps:
                 f"indexer scratch score_mode must be dsa or msa, got {score_mode!r}"
             )
         object.__setattr__(self, "score_mode", score_mode)
-        cache_format = str(self.cache_format)
-        if cache_format not in ("fp8", "mxfp4"):
-            raise ValueError("indexer cache_format must be fp8 or mxfp4")
-        object.__setattr__(self, "cache_format", cache_format)
-        object.__setattr__(self, "max_candidates", max(int(self.max_candidates), 0))
-        object.__setattr__(
-            self, "candidate_topk_blocks", max(int(self.candidate_topk_blocks), 0)
-        )
 
         object.__setattr__(self, "num_q_heads", max(int(self.num_q_heads), 1))
         object.__setattr__(self, "num_idx_heads", max(int(self.num_idx_heads), 1))
@@ -524,8 +523,8 @@ class B12XIndexerPagedScratch:
                 f"{int(self.indexer_contiguous_topk_indices.shape[0])}"
             )
         return (
-            self.indexer_contiguous_topk_values.narrow(0, 0, row_count),
-            self.indexer_contiguous_topk_indices.narrow(0, 0, row_count),
+            self.indexer_contiguous_topk_values[:row_count],
+            self.indexer_contiguous_topk_indices[:row_count],
         )
 
     def get_indexer_contiguous_candidate_buffers(
@@ -557,7 +556,7 @@ class B12XIndexerPagedScratch:
                 f"{row_count} exceeds paged indexer scratch position capacity "
                 f"{int(self.indexer_contiguous_topk_positions.shape[0])}"
             )
-        return self.indexer_contiguous_topk_positions.narrow(0, 0, row_count)
+        return self.indexer_contiguous_topk_positions[:row_count]
 
     def get_paged_indexer_active_width_cap(self) -> torch.Tensor:
         if self.paged_indexer_active_width_cap is None:
@@ -604,8 +603,8 @@ class B12XIndexerPagedScratch:
                 f"{int(self.indexer_k_quant_bytes.shape[0])}"
             )
         return (
-            self.indexer_k_quant_bytes.narrow(0, 0, row_count),
-            self.indexer_k_scales_bytes.narrow(0, 0, row_count),
+            self.indexer_k_quant_bytes[:row_count],
+            self.indexer_k_scales_bytes[:row_count],
         )
 
     def get_indexer_contiguous_lengths(self, *, row_count: int) -> torch.Tensor:
@@ -621,7 +620,7 @@ class B12XIndexerPagedScratch:
                 f"row_count {row_count} exceeds paged indexer metadata capacity "
                 f"{int(self.indexer_contiguous_lengths.shape[0])}"
             )
-        return self.indexer_contiguous_lengths.narrow(0, 0, row_count)
+        return self.indexer_contiguous_lengths[:row_count]
 
     def get_paged_indexer_runtime_lengths(self, *, row_count: int) -> torch.Tensor:
         if self.paged_indexer_runtime_lengths is None:
@@ -636,7 +635,7 @@ class B12XIndexerPagedScratch:
                 f"row_count {row_count} exceeds paged indexer metadata capacity "
                 f"{int(self.paged_indexer_runtime_lengths.shape[0])}"
             )
-        return self.paged_indexer_runtime_lengths.narrow(0, 0, row_count)
+        return self.paged_indexer_runtime_lengths[:row_count]
 
 
 @dataclass(kw_only=True)
@@ -2393,6 +2392,7 @@ def plan_indexer_contiguous_scratch(
 class B12XIndexerScratchPlan:
     caps: B12XIndexerScratchCaps
     inner: B12XIndexerPagedScratchPlan | B12XIndexerContiguousScratchPlan
+    policy_resolution: object | None = None
 
     @property
     def layout(self):
@@ -2418,20 +2418,53 @@ class B12XIndexerScratchPlan:
 def plan_indexer_scratch(
     caps: B12XIndexerScratchCaps,
     *,
-    fused_merge: str = FUSED_MERGE_AUTO,
+    policy: PolicyContext | None = None,
 ) -> B12XIndexerScratchPlan:
-    """Build a private layout after preparation selected its immutable config."""
     if not isinstance(caps, B12XIndexerScratchCaps):
         raise TypeError("caps must be B12XIndexerScratchCaps")
-    if fused_merge not in FUSED_MERGE_CHOICES:
-        raise ValueError(f"unsupported fused_merge {fused_merge!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        DSA_INDEXER_POLICY,
+        DsaIndexerQuery(
+            source_layout=caps.source_layout,
+            mode=caps.mode,
+            dtype=str(caps.dtype).removeprefix("torch."),
+            kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+            num_q_heads=caps.num_q_heads,
+            num_idx_heads=caps.num_idx_heads,
+            max_q_rows=caps.max_q_rows,
+            max_k_rows=0 if caps.max_k_rows is None else caps.max_k_rows,
+            top_k=caps.topk,
+            page_size=caps.page_size,
+            score_mode=caps.score_mode,
+            cache_format=caps.cache_format,
+            max_candidates=caps.max_candidates,
+            candidate_topk_blocks=caps.candidate_topk_blocks,
+            shared_page_table=caps.shared_page_table,
+        ),
+    )
     if caps.cache_format == "mxfp4":
         from .mxfp4 import plan_mxfp4
 
         if caps.source_layout != INDEXER_SOURCE_LAYOUT_PAGED or caps.score_mode != "dsa":
             raise ValueError("MXFP4 requires the paged DSA source layout")
-        inner = plan_mxfp4(caps)
-    elif caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
+        if caps.output_physical_slots or caps.topk != 512:
+            raise ValueError("MXFP4 requires logical top-512 output")
+        if caps.max_candidates < 0 or caps.max_candidates > 16384:
+            raise ValueError("MXFP4 candidate capacity must be in [0,16384]")
+        if caps.candidate_topk_blocks not in (0, 2048):
+            raise ValueError("MXFP4 source selects exactly 2048 blocks")
+        if caps.max_candidates and caps.candidate_topk_blocks:
+            raise ValueError("MXFP4 source and reindex recipes are mutually exclusive")
+        return B12XIndexerScratchPlan(
+            caps=caps, inner=plan_mxfp4(caps), policy_resolution=resolution,
+        )
+    if caps.cache_format != "fp8":
+        raise ValueError("cache_format must be 'fp8' or 'mxfp4'")
+    if caps.source_layout == INDEXER_SOURCE_LAYOUT_PAGED:
         assert caps.max_page_table_width is not None
         inner = plan_indexer_paged_scratch(
             B12XIndexerPagedScratchCaps(
@@ -2453,7 +2486,9 @@ def plan_indexer_scratch(
                 route=caps.route,
                 score_mode=caps.score_mode,
                 num_idx_heads=caps.num_idx_heads,
-                fused_merge=fused_merge,
+                fused_merge=str(
+                    getattr(resolution.config, "fused_merge", FUSED_MERGE_AUTO)
+                ),
             )
         )
     elif caps.source_layout == INDEXER_SOURCE_LAYOUT_CONTIGUOUS:
@@ -2476,8 +2511,17 @@ def plan_indexer_scratch(
         )
     else:
         raise ValueError(f"unsupported indexer source_layout {caps.source_layout!r}")
-    return B12XIndexerScratchPlan(caps=caps, inner=inner)
+    return B12XIndexerScratchPlan(
+        caps=caps,
+        inner=inner,
+        policy_resolution=resolution,
+    )
+
+
 __all__ = [
+    "ScratchBufferSpec",
+    "B12XIndexerScratchCaps",
+    "B12XIndexerScratchPlan",
     "B12XIndexerPagedBinding",
     "B12XIndexerPagedScratch",
     "B12XIndexerPagedScratchCaps",

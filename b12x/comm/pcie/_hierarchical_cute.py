@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from b12x._lib.program_cache import program_cache
+import functools
 from collections.abc import Callable, Sequence
 
 import cuda.bindings.driver as cuda
@@ -785,7 +785,7 @@ class _HierarchicalLaunch:
                         )
 
 
-@program_cache
+@functools.cache
 def get_hierarchical_launcher(
     world_size: int,
     rank: int,

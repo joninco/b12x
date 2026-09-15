@@ -4,11 +4,19 @@ Each rank sees the replicated input and computes partial outputs for its
 local experts; cross-rank reduction is the caller's job (typically
 ``comm.pcie.OneshotAllReduce``) — composed in user code, never imported here.
 
-Lifecycle: ``prepare_expert_map`` -> declarative ``plan`` ->
-``PreparationSession.prepare`` -> ``bind(plan, ...)`` -> ``run``.
+Lifecycle: ``prepare_expert_map`` (host-side, one-time) -> ``plan(Caps)`` ->
+``bind`` (views only) -> ``run`` (capture safe).
 
-The rank-local result remains a partial: callers compose it with their actual
-EP reduction group; this package never creates or approximates a collective.
+Example:
+    from b12x.moe import ep_moe
+
+    emap    = ep_moe.prepare_expert_map(expert_map,        # int32 [global_E]
+                                        local_num_experts=local_E)
+    plan    = ep_moe.plan(ep_moe.Caps(...))
+    spec    = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = ep_moe.bind(plan, scratch=scratch, ...)
+    partial = ep_moe.run(binding=binding)   # then all-reduce across ranks
 """
 
 from __future__ import annotations
@@ -32,7 +40,6 @@ META = OpMeta(
         "bind",
         "run",
         "prepare_expert_map",
-        "invocation_from_tensors",
         "is_supported",
     ),
     dtypes=("bf16",),
@@ -59,7 +66,6 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         is_supported,
         plan,
         prepare_expert_map,
-        invocation_from_tensors,
         run,
     )
 

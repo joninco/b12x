@@ -21,12 +21,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from b12x._lib.runtime_control import kernel_resolution_guard
-
 import torch
 
+import b12x
 from b12x.moe import fused_moe
-from b12x.preparation import PreparationSession, PreparedCall
 from b12x.moe._shared.kernels.w4a16 import kernel
 from benchmarks.benchmark_moe import (
     MODEL_PROFILES,
@@ -212,22 +210,7 @@ def main():
                             max_tokens=m, top_k=8, warmup_token_counts=(m,)
                         ),
                     )
-                    def prepare_call(state):
-                        specs = state.scratch.scratch_specs()
-                        storage = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=x.device) for spec in specs)
-                        prepared_output = torch.empty_like(x)
-                        prepared_binding = state.bind(
-                            scratch=storage, a=x, topk_ids=ids, topk_weights=route_weights,
-                            output=prepared_output, input_scales_static=True,
-                        )
-                        return PreparedCall(
-                            run=lambda: state.run(prepared_binding), output=prepared_output,
-                            owners=(storage, prepared_binding),
-                        )
-
-                    # Variant overrides are process-local; compile in this process.
-                    session = PreparationSession(device=x.device, autotune=False, compile_workers=0)
-                    session.prepare((plan.request(name=f"{name}-rows-{m}", prepare_call=prepare_call),))
+                    fused_moe.prewarm(plan)
                     (scratch_spec,) = plan.scratch_specs()
                     scratch = torch.empty(
                         scratch_spec.shape, dtype=scratch_spec.dtype, device="cuda"
@@ -278,10 +261,14 @@ def main():
                         )
                     arm["compiled_cache"] = compiled
                     graph = torch.cuda.CUDAGraph()
-                    with kernel_resolution_guard(
+                    b12x.freeze_kernel_resolution(
                         "expert decode schedule qualification"
-                    ), torch.cuda.graph(graph):
-                        fused_moe.run(binding=binding)
+                    )
+                    try:
+                        with torch.cuda.graph(graph):
+                            fused_moe.run(binding=binding)
+                    finally:
+                        b12x.unfreeze_kernel_resolution()
                     output.fill_(float("nan"))
                     graph.replay()
                     torch.cuda.synchronize()
@@ -290,7 +277,7 @@ def main():
                     )
                 case["arms"][name] = arm
                 graphs[name] = (graph, output)
-                retained.append((session, plan, scratch, binding))
+                retained.append((plan, scratch, binding))
                 save()
             for graph, _output in graphs.values():
                 for _ in range(20):
@@ -328,8 +315,6 @@ def main():
                     mode: statistics.median([v for batch in samples for v in batch])
                     for mode, samples in case["arms"][name]["samples_us"].items()
                 }
-            for session, *_ in retained:
-                session.close()
             print(
                 "RESULT",
                 m,

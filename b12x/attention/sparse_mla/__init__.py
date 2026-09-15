@@ -6,10 +6,22 @@ or BF16 compute, split-KV decode with on-device merge; a single-pass decode
 path is selected automatically on SM121. Selection indices typically come
 from ``attention.dsa_indexer``.
 
-Planned lifecycle: declare with ``plan(Caps(...))``, prepare it through a
-``PreparationSession``, then bind and run the prepared ``Plan``.
-Dynamic sequence lengths, page IDs and selected token indices remain binding
-inputs; no runtime route selection or compilation is permitted.
+Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) -> ``run``
+(capture safe). The plan's ``mode`` selects decode or extend; execution does not
+accept a second route selector.
+
+Example:
+    from b12x.attention import sparse_mla
+
+    plan    = sparse_mla.plan(sparse_mla.Caps(device="cuda", num_q_heads=16,
+                                              max_q_rows=64, max_width=2048,
+                                              softmax_scale=512**-0.5))
+    spec    = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = sparse_mla.bind(plan, scratch=scratch, q=q, kv_cache=kv,
+                              selected_indices=topk_idx, cache_lengths=lens,
+                              selected_lengths=active)
+    out = sparse_mla.run(binding)
 
 GLM Next uses an explicit recipe identity because its absorbed 512-wide query
 collides with DSV4 by shape. Plan with ``model_type=ModelType.GLM_NEXT`` and
@@ -31,6 +43,7 @@ META = OpMeta(
     entry_points=(
         "Caps",
         "ModelType",
+        "Plan",
         "SparseMlaConfig",
         "SparseMlaQuery",
         "Binding",
@@ -40,11 +53,11 @@ META = OpMeta(
         "plan",
         "bind",
         "run",
-        "plan_cache_writer",
-        "concat_and_cache_nvfp4_mla_fp8_rope",
+        "compile_glm_next_mla_cache_writer",
         "concat_and_cache_glm_next_mla",
         "concat_and_cache_glm_next_mla_fp8",
         "concat_and_cache_glm_next_mla_nvfp4",
+        "concat_and_cache_nvfp4_mla_fp8_rope",
         "expand_pooled_topk_to_physical_slots",
         "is_supported",
         "clear_caches",
@@ -71,11 +84,13 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         DecodeMetadata,
         ExtendMetadata,
         ModelType,
+        Plan,
         Scratch,
         SparseMlaConfig,
         SparseMlaQuery,
         bind,
         clear_caches,
+        compile_glm_next_mla_cache_writer,
         concat_and_cache_glm_next_mla,
         concat_and_cache_glm_next_mla_fp8,
         concat_and_cache_glm_next_mla_nvfp4,
@@ -83,7 +98,6 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         expand_pooled_topk_to_physical_slots,
         is_supported,
         plan,
-        plan_cache_writer,
         run,
     )
 

@@ -9,17 +9,15 @@ from ._contract import (
     DraftSelectionPlan,
     DraftSelectionReuse,
     DraftSelectionState,
+    Plan,
     bind,
     cache_requirements,
-    draft_selection_plan,
-    invocation_from_descriptors,
-    invocation_from_tensors,
     is_supported,
     plan,
+    prewarm,
     run,
 )
-from ._tuning import QsaConfig, QsaQuery
-from b12x.preparation import Plan
+from ._policy import QsaConfig, QsaQuery
 
 __all__ = [
     "CacheRequirements",
@@ -32,11 +30,9 @@ __all__ = [
     "QsaConfig",
     "QsaQuery",
     "cache_requirements",
-    "draft_selection_plan",
-    "invocation_from_descriptors",
-    "invocation_from_tensors",
     "plan",
     "bind",
+    "prewarm",
     "run",
     "is_supported",
 ]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -13,18 +12,16 @@ from .api import (
     _use_sm120_sparse_mla,
     _validate_tensor_storage_bounds,
 )
-from .compressed_config import (
-    compressed_sparse_mla_split_chunks_for_contract,
-)
 from .compressed_reference import (
     COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN,
     COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
     COMPRESSED_SPARSE_MLA_HEAD_DIM,
-    compressed_sparse_mla_page_nbytes,
 )
 
 
 _LN2 = math.log(2.0)
+
+
 
 
 def _should_use_sm121_single_pass_decode(
@@ -74,38 +71,90 @@ def compressed_sparse_mla_decode_forward(
     backend: str | None = None,
     out: torch.Tensor | None = None,
     cache_format: Literal["deepseek_v4", "deepseek_v41"] | None = None,
-    mapper_launcher: object | None = None,
-    prepared=None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run compressed sparse MLA decode directly from compressed KV pages.
 
     ``out``, when given, is the final O destination: the kernel/merge writes it
     directly (no workspace-to-caller copy). Must be a contiguous BF16
     [rows, heads, 512] tensor on q's device; anything else raises.
+    Without ``binding``, plan and allocate temporary scratch outside CUDA graph
+    capture. Bound calls use the plan's cache recipe; an explicit contradiction
+    is rejected. Warm bound calls before capture, including mapped indices.
     """
 
     if lse_scale not in ("base2", "natural"):
         raise ValueError(f"lse_scale must be 'base2' or 'natural', got {lse_scale!r}")
 
     if binding is None:
-        raise TypeError("compressed_sparse_mla_decode_forward requires binding")
-    extras = [
-        name
-        for name, value in (
-            ("q_all", q_all),
-            ("swa_indices", swa_indices),
-            ("swa_topk_lengths", swa_topk_lengths),
-            ("indexed_indices", indexed_indices),
-            ("indexed_topk_lengths", indexed_topk_lengths),
-            ("indexed_page_table", indexed_page_table),
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "compressed MLA convenience allocation is not capture safe; plan and bind first"
+            )
+        if q_all is None or swa_indices is None or swa_topk_lengths is None:
+            raise TypeError(
+                "unbound compressed MLA requires q_all, swa_indices, and swa_topk_lengths"
+            )
+        from ...compressed_sparse_mla.api import Caps, plan
+
+        q3 = _normalize_compressed_q(q_all)
+        swa_width = int(
+            _normalize_index_matrix(swa_indices, name="swa_indices").shape[1]
         )
-        if value is not None
-    ]
-    if extras:
-        raise ValueError(
-            "compressed MLA binding owns q and index tensors; "
-            f"do not also pass {', '.join(extras)}"
+        indexed_width = (
+            int(
+                _normalize_index_matrix(indexed_indices, name="indexed_indices").shape[
+                    1
+                ]
+            )
+            if indexed_indices is not None
+            else 0
         )
+        temporary_plan = plan(
+            Caps(
+                device=q3.device,
+                num_q_heads=int(q3.shape[1]),
+                max_q_rows=max(1, int(q3.shape[0])),
+                max_width=max(1, swa_width + indexed_width),
+                swa_width=swa_width,
+                indexed_width=indexed_width,
+                swa_page_size=swa_page_size,
+                indexed_page_size=indexed_page_size,
+                max_page_table_width=(
+                    int(indexed_page_table.shape[-1])
+                    if indexed_page_table is not None
+                    else None
+                ),
+                cache_format=cache_format or "deepseek_v4",
+            )
+        )
+        (spec,) = temporary_plan.scratch_specs()
+        binding = temporary_plan.bind(
+            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=spec.device),
+            q=q3,
+            swa_indices=swa_indices,
+            swa_lengths=swa_topk_lengths,
+            indexed_indices=indexed_indices,
+            indexed_lengths=indexed_topk_lengths,
+            indexed_page_table=indexed_page_table,
+        )
+    else:
+        extras = [
+            name
+            for name, value in (
+                ("q_all", q_all),
+                ("swa_indices", swa_indices),
+                ("swa_topk_lengths", swa_topk_lengths),
+                ("indexed_indices", indexed_indices),
+                ("indexed_topk_lengths", indexed_topk_lengths),
+                ("indexed_page_table", indexed_page_table),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "compressed MLA binding owns q and index tensors; "
+                f"do not also pass {', '.join(extras)}"
+            )
     scratch = getattr(binding, "scratch", None)
     if scratch is None:
         raise TypeError("compressed MLA binding is missing scratch")
@@ -113,9 +162,9 @@ def compressed_sparse_mla_decode_forward(
     if cache_format is not None and cache_format != planned_cache_format:
         raise ValueError("cache_format contradicts the bound compressed MLA recipe")
     cache_format = planned_cache_format
-    q_all = getattr(binding, "q")
-    swa_indices = getattr(binding, "swa_indices")
-    swa_topk_lengths = getattr(binding, "swa_lengths")
+    q_all = binding.q
+    swa_indices = binding.swa_indices
+    swa_topk_lengths = binding.swa_lengths
     indexed_indices = getattr(binding, "indexed_indices", None)
     indexed_topk_lengths = getattr(binding, "indexed_lengths", None)
     indexed_page_table = getattr(binding, "indexed_page_table", None)
@@ -150,7 +199,6 @@ def compressed_sparse_mla_decode_forward(
         allow_empty=swa_indices_2d.shape[1] == 0,
     )
 
-    swa_indices_2d = _normalize_index_matrix(swa_indices, name="swa_indices")
     if swa_indices_2d.device != q3.device:
         raise ValueError("swa_indices must be on the same device as q_all")
     if swa_indices_2d.shape[0] != rows:
@@ -181,11 +229,11 @@ def compressed_sparse_mla_decode_forward(
             raise ValueError(
                 "indexed_page_size is required when indexed_k_cache is provided"
             )
-        indexed_k_cache = _compressed_sparse_mla_cache_byte_view(
-            indexed_k_cache, name="indexed_k_cache"
-        )
         indexed_indices_2d = _normalize_index_matrix(
             indexed_indices, name="indexed_indices"
+        )
+        indexed_k_cache = _compressed_sparse_mla_cache_byte_view(
+            indexed_k_cache, name="indexed_k_cache"
         )
         _validate_compressed_cache_layout(
             indexed_k_cache,
@@ -194,9 +242,6 @@ def compressed_sparse_mla_decode_forward(
             cache_format=cache_format,
             cache_kind="indexed",
             allow_empty=indexed_indices_2d.shape[1] == 0,
-        )
-        indexed_indices_2d = _normalize_index_matrix(
-            indexed_indices, name="indexed_indices"
         )
         if indexed_indices_2d.device != q3.device:
             raise ValueError("indexed_indices must be on the same device as q_all")
@@ -215,14 +260,11 @@ def compressed_sparse_mla_decode_forward(
                     "mapped indexed_page_table is only supported for deepseek_v41"
                 )
             from ...compressed_sparse_mla._metadata import map_indexed_pages
+
             mapped = getattr(scratch, "mapped_indices", None)
             if mapped is None:
                 raise ValueError(
                     "mapped indexed pages require component-planned scratch"
-                )
-            if mapper_launcher is None:
-                raise RuntimeError(
-                    "mapped indexed pages require a prepared native mapper"
                 )
             indexed_indices_2d = map_indexed_pages(
                 indexed_indices_2d,
@@ -231,7 +273,6 @@ def compressed_sparse_mla_decode_forward(
                 mapped,
                 page_size=int(indexed_page_size),
                 num_pages=int(indexed_k_cache.shape[0]),
-                launcher=mapper_launcher,
             )
     else:
         indexed_indices_2d = None
@@ -271,12 +312,17 @@ def compressed_sparse_mla_decode_forward(
         output = out if out is not None else scratch.output_buffer[:0]
         return (output, scratch.final_lse[:0]) if return_lse else output
 
-    # A prepared compressed execution owns one exact route.  In particular,
-    # live row counts must not rerun the SM121 split-vs-single-pass heuristic:
-    # the prefill tuple and unified decode launch are distinct executable owners.
-    if scratch.mode in ("extend", "verify", "draft_extend") or isinstance(prepared, tuple):
-        if prepared is None:
-            raise RuntimeError("compressed MLA prefill requires prepared native launchers")
+    if scratch.mode in ("extend", "verify", "draft_extend") or (
+        cache_format == "deepseek_v4"
+        and _should_use_sm121_single_pass_decode(
+            rows=rows,
+            heads=heads,
+            swa_width=int(swa_indices_2d.shape[1]),
+            indexed_width=int(indexed_indices_2d.shape[1]) if has_indexed else 0,
+            swa_page_size=int(swa_page_size),
+            indexed_page_size=int(indexed_page_size) if has_indexed else None,
+        )
+    ):
         return _run_sm120_compressed_prefill(
             q3=q3,
             swa_k_cache=swa_k_cache,
@@ -293,16 +339,21 @@ def compressed_sparse_mla_decode_forward(
             return_lse=return_lse,
             lse_scale=lse_scale,
             out=out,
-            prepared=prepared,
         )
 
-    if prepared is None:
-        raise RuntimeError("compressed MLA decode requires a prepared native launch")
 
-    from .kernel import run_prepared_unified_decode
+    from .kernel import run_unified_decode
+    from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
-    return run_prepared_unified_decode(
-        prepared=prepared,
+    traits = (
+        make_unified_traits(
+            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
+        )
+        if cache_format == "deepseek_v41"
+        else None
+    )
+
+    return run_unified_decode(
         q_all=q3,
         swa_k_cache=swa_k_cache,
         swa_indices=swa_indices_2d,
@@ -318,14 +369,7 @@ def compressed_sparse_mla_decode_forward(
         return_lse=return_lse,
         lse_scale=lse_scale,
         out=out,
-        **(
-            {
-                "v41_compute_mode": scratch.execution_config.v41_compute_mode,
-                "v41_heads_per_block": scratch.execution_config.v41_heads_per_block,
-            }
-            if cache_format == "deepseek_v41"
-            else {}
-        ),
+        traits_override=traits,
     )
 
 
@@ -363,7 +407,6 @@ def _run_sm120_compressed_prefill(
     return_lse: bool,
     lse_scale: Literal["base2", "natural"],
     out: torch.Tensor | None = None,
-    prepared: object | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Route a DSV4 prefill-like (extend/verify/draft_extend) compressed call to the
     active SM120 single-pass prefill.
@@ -378,18 +421,9 @@ def _run_sm120_compressed_prefill(
     from .kernel import run_unified_prefill
     from .traits import ComputeMode, ModelType, ScaleFormat, make_unified_traits
 
-    execution_config = getattr(workspace, "execution_config", None)
-    if execution_config is None:
-        raise RuntimeError("compressed MLA scratch is missing execution_config")
     traits = (
-        replace(
-            make_unified_traits(
-                ModelType.DSV41,
-                ComputeMode.BF16,
-                ScaleFormat.NVFP4_E4M3,
-                fp8_rope=False,
-            ),
-            fp8_internal=execution_config.v41_compute_mode == "fp8",
+        make_unified_traits(
+            ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3, fp8_rope=False
         )
         if getattr(workspace, "cache_format", "deepseek_v4") == "deepseek_v41"
         else None
@@ -416,7 +450,7 @@ def _run_sm120_compressed_prefill(
             extra_page_block_size=int(indexed_page_size),
         )
 
-    result = run_unified_prefill(
+    _, lse_base2 = run_unified_prefill(
         q=q3,
         kv_cache=swa_k_cache,
         topk_indices=swa_indices_2d,
@@ -427,18 +461,11 @@ def _run_sm120_compressed_prefill(
         output=output,
         lse_out=workspace.final_lse[: int(q3.shape[0])],
         traits_override=traits,
-        prepared=prepared,
-        # Compressed DSV4's single-pass route is always the selected MG route.
-        # Runtime must not reread the legacy environment control.
-        mg_enabled=True,
         **extra_kwargs,
     )
-    if isinstance(result, tuple) and result and not isinstance(result[0], torch.Tensor):
-        return result
-    _, lse_base2 = result
     if not return_lse:
         return output
-    lse = lse_base2 if lse_scale == "base2" else (lse_base2.mul_(_LN2))
+    lse = lse_base2 if lse_scale == "base2" else lse_base2.mul_(_LN2)
     return output, lse
 
 
@@ -618,6 +645,8 @@ def _validate_compressed_cache_layout(
             f"{payload_nbytes} or padded width {padded_page_nbytes} for "
             f"page_size {page_size}, got {page_nbytes}"
         )
+
+
 def _compressed_sparse_mla_cache_byte_view(
     cache: torch.Tensor, *, name: str
 ) -> torch.Tensor:

@@ -94,15 +94,7 @@ def _merge_op(
 
 
 @_merge_op.register_fake
-def _merge_fake(
-    packed: torch.Tensor,
-    out: torch.Tensor,
-    state: torch.Tensor,
-    peer_slabs: list[int],
-    rank: int,
-    topk: int,
-    max_rows: int,
-) -> None:
+def _merge_fake(packed, out, state, peer_slabs, rank, topk, max_rows) -> None:
     pass
 
 

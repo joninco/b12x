@@ -6,7 +6,6 @@ from functools import partial as bind_arguments
 from typing import Callable
 
 import torch
-import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -16,9 +15,6 @@ from b12x.comm.pcie.dcp_candidate_topk import (
     rank_major_topk,
 )
 from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
-from b12x.comm.pcie._dcp_preparation import _prepare_transport_calls
-from b12x.comm.pcie import _owner_preparation
-from b12x.preparation import PreparationSession
 from b12x.comm.pcie.pcie_dcp_topk import PCIeDCPTopKOwnerExchange
 from benchmarks.dcp_transport.fixtures import rank_inputs, references
 from benchmarks.dcp_transport.selectors import precompile, select_owner
@@ -65,6 +61,8 @@ def _pool(group, device, *, heads=32, dim=512, query_dim=576):
         query_head_dim=query_dim,
     )
     pool.prepare_channels(("benchmark",))
+    pool.prepare_graph_all_gather_heads(channel_id="benchmark")
+    pool.prepare_graph_lse_reduce_scatter(dtype=torch.bfloat16, channel_id="benchmark")
     return pool
 
 
@@ -106,26 +104,11 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
             }
         active_channel = "query"
         gathered = torch.empty((rows, 32, 576), dtype=torch.bfloat16, device=device)
-        sessions = []
-        plans = {}
-        if kind == "b12x":
-            for name, pool in pools.items():
-                session, declarations = _prepare_transport_calls(
-                    pool._logical_channels["benchmark"],
-                    {
-                        "all_gather_heads": {"local_input": query, "out": gathered},
-                        "lse_reduce_scatter": {"partial_output": partial, "partial_lse": lse, "out": output},
-                    },
-                    channel_id=f"benchmark:{name}", ranks=dist.get_process_group_ranks(group),
-                )
-                sessions.append(session)
-                plans[name] = declarations
-
 
         def gather():
             if kind == "b12x":
                 pools[active_channel].all_gather_heads(
-                    query, gathered, plan=plans[active_channel]["all_gather_heads"], channel_id="benchmark"
+                    query, gathered, channel_id="benchmark"
                 )
             else:
                 pools[active_channel].query(query, gathered)
@@ -133,7 +116,7 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
         def combine():
             if kind == "b12x":
                 pools[active_channel].lse_reduce_scatter(
-                    partial, lse, output, plan=plans[active_channel]["lse_reduce_scatter"], channel_id="benchmark"
+                    partial, lse, output, channel_id="benchmark"
                 )
             else:
                 pools[active_channel].combine_masked(
@@ -143,7 +126,7 @@ def attention_cases(kind, group, gpu_group, device, rows, rank):
         def capture():
             return pools[active_channel].capture(channel_id="benchmark")
 
-        resources = [*pools.values(), *sessions]
+        resources = list(pools.values())
     elif kind == "native":
         from vllm.v1.attention.ops.dcp import (
             DirectDCPA2AWorkspace,
@@ -376,6 +359,7 @@ def candidate_case(kind, group, device, rows, rank):
         max_rows=16,
         topk=2048,
     )
+    exchange.prepare_graph()
     precompile(2048, 4, "owner_planes", device.index)
     # One head per rank redistributes selected rows. The live owner-row count
     # is a runtime batch extent; it never becomes a compile-key head count.
@@ -389,30 +373,14 @@ def candidate_case(kind, group, device, rows, rank):
     gathered_heads = gathered.view(torch.bfloat16)
     global_ids = local.packed[..., 1].int().to(device)
 
-    redistribution_session, redistribution_plans = _prepare_transport_calls(
-        redistribution._logical_channels["benchmark"],
-        {"all_gather_heads": {"local_input": selected_heads, "out": gathered_heads}},
-        channel_id="owner-redistribution", ranks=dist.get_process_group_ranks(group),
-    )
-    owner_call = {"local_indices": global_ids, "local_scores": scores}
-    owner_plan = _owner_preparation.plan(
-        _owner_preparation.query_from_runtime(exchange, call=owner_call), runtime=exchange,
-    )
-    owner_collective = _owner_preparation.collective(exchange, key="owner-candidates")
-    owner_session = PreparationSession(device=device, autotune=False, compile_workers=0)
-    owner_session.prepare((owner_plan.request(
-        name="owner-candidates", collective=owner_collective,
-        prepare_call=lambda state: _owner_preparation.prepared_call(state, **owner_call),
-    ),), coordinator=lambda progress: owner_collective.key if progress.ready_collectives else None)
-
     def run():
         # Index conversion is included, just as in the all-gather path. The
         # owner's transport takes separate planes, so no packed buffer is read.
         _global_ids[(padded_rows,)](ids, global_ids, rank, 2048)
-        owner_ids, owner_scores = exchange.stage_candidates(global_ids, scores, plan=owner_plan)
+        owner_ids, owner_scores = exchange.stage_candidates(global_ids, scores)
         select_owner(owner_ids, owner_scores, selected, 4)
         redistribution.all_gather_heads(
-            selected_heads, gathered_heads, plan=redistribution_plans["all_gather_heads"], channel_id="benchmark"
+            selected_heads, gathered_heads, channel_id="benchmark"
         )
         _restore_owner_rows[(triton.cdiv(padded_rows * 2048, 512),)](
             gathered,
@@ -426,7 +394,7 @@ def candidate_case(kind, group, device, rows, rank):
     @contextmanager
     def capture():
         with ExitStack() as stack:
-            stack.enter_context(exchange.capture(plan=owner_plan))
+            stack.enter_context(exchange.capture())
             stack.enter_context(redistribution.capture(channel_id="benchmark"))
             yield
 
@@ -437,7 +405,7 @@ def candidate_case(kind, group, device, rows, rank):
         (output[:rows],),
         (expected,),
         capture,
-        [exchange, redistribution, owner_session, redistribution_session],
+        [exchange, redistribution],
         {
             "padded_rows": padded_rows,
             "candidate_transport": "peer stores in owner staging",

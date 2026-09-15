@@ -20,7 +20,7 @@ class ScratchBufferSpec:
         numel = 1
         for dim in self.shape:
             numel *= int(dim)
-        return numel * self.dtype.itemsize
+        return numel * torch.empty((), dtype=self.dtype).element_size()
 
 
 def scratch_buffer_spec(

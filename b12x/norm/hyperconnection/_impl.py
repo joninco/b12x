@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
 from b12x._lib.scratch import ScratchBufferSpec
-from b12x.preparation import Plan
-from ._tuning import HyperConnectionConfig, HyperConnectionQuery
+from b12x.policy import PolicyContext, get_auto_policy
+
+from ._policy import (
+    HYPERCONNECTION_POLICY,
+    HyperConnectionQuery,
+)
 
 _MAX_TRITON_REDUCTION_WIDTH = 65_536
 
@@ -66,12 +69,11 @@ class HyperConnectionBinding:
     expose only the live token prefix to downstream operators.
     """
 
-    state: "_HyperConnectionState"
+    plan: "HyperConnectionPlan"
     tokens: int
     normalized_capacity: torch.Tensor
     bottleneck_capacity: torch.Tensor
     block_input_capacity: torch.Tensor
-    plan: Plan | None = None
 
     @property
     def normalized(self) -> torch.Tensor:
@@ -87,19 +89,14 @@ class HyperConnectionBinding:
 
 
 @dataclass(frozen=True)
-class _HyperConnectionState:
-    """One immutable, already-lowered native operation and its launchers."""
+class HyperConnectionPlan:
+    """HyperConnection launch policy with no anonymous scratch requirement."""
 
     caps: HyperConnectionCaps
-    query: HyperConnectionQuery
-    config: HyperConnectionConfig
-    launch: Callable
-
-    def require_operation(self, operation, *, eps=None):
-        if self.query.operation != operation:
-            raise ValueError(f"execution prepares {self.query.operation}, not {operation}")
-        if eps is not None and float(eps) != self.query.eps:
-            raise ValueError("normalization epsilon differs from prepared invocation")
+    reduction_block_h: int
+    pointwise_block: int
+    reduction_num_warps: int
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         """HyperConnection primitives use no anonymous scratch allocation."""
@@ -130,7 +127,6 @@ class _HyperConnectionState:
         bottleneck: torch.Tensor,
         block_input: torch.Tensor,
         tokens: int | None = None,
-        plan: Plan | None = None,
     ) -> HyperConnectionBinding:
         live_tokens = self._live_tokens(tokens)
         caps = self.caps
@@ -164,8 +160,7 @@ class _HyperConnectionState:
                         f"normalized and {other_name} outputs must not overlap"
                     )
         return HyperConnectionBinding(
-            state=self,
-            plan=plan,
+            plan=self,
             tokens=live_tokens,
             normalized_capacity=normalized,
             bottleneck_capacity=bottleneck,
@@ -173,6 +168,37 @@ class _HyperConnectionState:
         )
 
 
+def plan_hyperconnection(
+    caps: HyperConnectionCaps,
+    *,
+    policy: PolicyContext | None = None,
+) -> HyperConnectionPlan:
+    """Plan fixed launch geometry for the supplied serving capacity."""
+
+    if not isinstance(caps, HyperConnectionCaps):
+        raise TypeError(f"caps must be HyperConnectionCaps, got {type(caps)!r}")
+    policy = policy or get_auto_policy(caps.device)
+    if not isinstance(policy, PolicyContext):
+        raise TypeError("policy must be a PolicyContext")
+    policy.require_device(caps.device)
+    resolution = policy.resolve(
+        HYPERCONNECTION_POLICY,
+        HyperConnectionQuery(
+            dtype=str(caps.dtype).removeprefix("torch."),
+            max_tokens=caps.max_tokens,
+            hidden_size=caps.hidden_size,
+            streams=caps.streams,
+            lowrank=caps.lowrank,
+        ),
+    )
+    config = resolution.config
+    return HyperConnectionPlan(
+        caps=caps,
+        reduction_block_h=config.reduction_block_h,
+        pointwise_block=config.pointwise_block,
+        reduction_num_warps=config.reduction_num_warps,
+        policy_resolution=resolution,
+    )
 
 
 def _validate_capacity(
@@ -260,7 +286,7 @@ def _validate_output_disjoint(
             raise ValueError(f"{output_name} must not overlap {input_name}")
 
 
-def _require_cuda(plan: _HyperConnectionState) -> None:
+def _require_cuda(plan: HyperConnectionPlan) -> None:
     if plan.caps.device.type != "cuda":
         raise ValueError(
             "HyperConnection GPU entry points require CUDA; use the "
@@ -275,55 +301,110 @@ def _require_eps(eps: float) -> float:
     return value
 
 
-def run_grouped_rmsnorm_impl(state, weight, *, eps, plan: _HyperConnectionState, out, zero_centered=True):
-    _require_cuda(plan)
-    plan.require_operation("grouped_rmsnorm", eps=eps)
-    if bool(zero_centered) != plan.query.zero_centered:
-        raise ValueError("normalization recipe differs from preparation")
-    caps = plan.caps
-    tokens = plan._live_tokens(state.shape[0])
+def run_grouped_rmsnorm_impl(
+    state: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    binding: HyperConnectionBinding,
+    zero_centered: bool = True,
+) -> torch.Tensor:
+    """Grouped BF16 RMSNorm; ordinary mode preserves BF16 or FP32 affine weights."""
+    _require_cuda(binding.plan)
+    caps = binding.plan.caps
     width = caps.streams * caps.hidden_size
-    _validate_input(state, shape=(tokens, width), caps=caps, name="state")
-    if weight.dtype != getattr(torch, plan.query.weight_dtype):
-        raise ValueError("affine weight dtype differs from preparation")
-    if weight.shape != (width,) or weight.device != caps.device or not weight.is_contiguous():
-        raise ValueError("affine weight must retain the declared contiguous geometry and device")
-    _validate_capacity(out, tokens=tokens, tail=(width,), dtype=caps.dtype, device=caps.device, name="out")
-    _validate_output_disjoint("normalized", out, (("state", state), ("weight", weight)))
-    if tokens:
-        plan.launch(state, weight, out, eps=eps)
-    return out[:tokens]
+    shape = (binding.tokens, width)
+    _validate_input(state, shape=shape, caps=caps, name="state")
+    if not zero_centered and weight.dtype == torch.float32:
+        if (
+            tuple(weight.shape) != (width,) or weight.device != caps.device
+            or not weight.is_contiguous()
+        ):
+            raise ValueError(f"weight must be contiguous FP32 [{width}] on {caps.device}")
+    else:
+        _validate_input(weight, shape=(width,), caps=caps, name="weight")
+    _validate_output_disjoint(
+        "normalized",
+        binding.normalized_capacity,
+        (("state", state), ("weight", weight)),
+    )
+    eps = _require_eps(eps)
+    if binding.tokens:
+        from ._kernels import run_grouped_rmsnorm
+
+        run_grouped_rmsnorm(
+            state,
+            weight,
+            binding.normalized_capacity,
+            eps=eps,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+            block_h=binding.plan.reduction_block_h,
+            num_warps=binding.plan.reduction_num_warps,
+            zero_centered=zero_centered,
+        )
+    return binding.normalized
 
 
-def run_scaled_silu_impl(projected_down, *, plan: _HyperConnectionState, out):
-    _require_cuda(plan)
-    plan.require_operation("scaled_silu")
-    caps = plan.caps
-    tokens = plan._live_tokens(projected_down.shape[0])
-    _validate_input(projected_down, shape=(tokens, caps.lowrank), caps=caps,
-                    name="projected_down", row_strided=True)
-    _validate_capacity(out, tokens=tokens, tail=(caps.lowrank,), dtype=caps.dtype,
-                       device=caps.device, name="out")
-    _validate_output_disjoint("bottleneck", out, (("projected_down", projected_down),))
-    if tokens:
-        plan.launch(projected_down, out)
-    return out[:tokens]
+def run_scaled_silu_impl(
+    projected_down: torch.Tensor,
+    *,
+    binding: HyperConnectionBinding,
+) -> torch.Tensor:
+    _require_cuda(binding.plan)
+    caps = binding.plan.caps
+    _validate_input(
+        projected_down,
+        shape=(binding.tokens, caps.lowrank),
+        caps=caps,
+        name="projected_down",
+        row_strided=True,
+    )
+    _validate_output_disjoint(
+        "bottleneck",
+        binding.bottleneck_capacity,
+        (("projected_down", projected_down),),
+    )
+    if binding.tokens:
+        from ._kernels import run_scaled_silu
+
+        run_scaled_silu(
+            projected_down,
+            binding.bottleneck_capacity,
+            streams=caps.streams,
+            block=binding.plan.pointwise_block,
+        )
+    return binding.bottleneck
 
 
-def run_gate_mean_impl(normalized, gate_logits, *, plan: _HyperConnectionState, out):
-    _require_cuda(plan)
-    plan.require_operation("gate_mean")
-    caps = plan.caps
-    tokens = plan._live_tokens(normalized.shape[0])
-    shape = (tokens, caps.streams * caps.hidden_size)
+def run_gate_mean_impl(
+    normalized: torch.Tensor,
+    gate_logits: torch.Tensor,
+    *,
+    binding: HyperConnectionBinding,
+) -> torch.Tensor:
+    _require_cuda(binding.plan)
+    caps = binding.plan.caps
+    shape = (binding.tokens, caps.streams * caps.hidden_size)
     _validate_input(normalized, shape=shape, caps=caps, name="normalized")
     _validate_input(gate_logits, shape=shape, caps=caps, name="gate_logits")
-    _validate_capacity(out, tokens=tokens, tail=(caps.hidden_size,), dtype=caps.dtype,
-                       device=caps.device, name="out")
-    _validate_output_disjoint("block_input", out, (("normalized", normalized), ("gate_logits", gate_logits)))
-    if tokens:
-        plan.launch(normalized, gate_logits, out)
-    return out[:tokens]
+    _validate_output_disjoint(
+        "block_input",
+        binding.block_input_capacity,
+        (("normalized", normalized), ("gate_logits", gate_logits)),
+    )
+    if binding.tokens:
+        from ._kernels import run_gate_mean
+
+        run_gate_mean(
+            normalized,
+            gate_logits,
+            binding.block_input_capacity,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+            block_h=binding.plan.pointwise_block,
+        )
+    return binding.block_input
 
 
 def _validate_combine_inputs(
@@ -331,7 +412,7 @@ def _validate_combine_inputs(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     *,
-    plan: _HyperConnectionState,
+    plan: HyperConnectionPlan,
     tokens: int,
 ) -> None:
     caps = plan.caps
@@ -361,10 +442,9 @@ def run_combine_impl(
     block_output: torch.Tensor,
     injection_logits: torch.Tensor,
     *,
-    plan: _HyperConnectionState,
+    plan: HyperConnectionPlan,
 ) -> torch.Tensor:
     _require_cuda(plan)
-    plan.require_operation("combine")
     tokens = plan._live_tokens(state.shape[0])
     _validate_combine_inputs(
         state,
@@ -373,10 +453,18 @@ def run_combine_impl(
         plan=plan,
         tokens=tokens,
     )
-    combined = torch.empty_like(state)
-    if tokens:
-        plan.launch(state, block_output, injection_logits, combined)
-    return combined
+    from ._kernels import run_combine
+
+    caps = plan.caps
+    return run_combine(
+        state,
+        block_output,
+        injection_logits,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
+        block_h=plan.reduction_block_h,
+        num_warps=plan.reduction_num_warps,
+    )
 
 
 def run_combine_norm_impl(
@@ -386,10 +474,9 @@ def run_combine_norm_impl(
     next_norm_weight: torch.Tensor,
     *,
     eps: float,
-    plan: _HyperConnectionState,
+    plan: HyperConnectionPlan,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _require_cuda(plan)
-    plan.require_operation("combine_norm", eps=eps)
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     _validate_combine_inputs(
@@ -406,16 +493,19 @@ def run_combine_norm_impl(
         name="next_norm_weight",
     )
     eps = _require_eps(eps)
-    from ._cute_config import require_cute_combine_norm
-    combined, normalized = torch.empty_like(state), torch.empty_like(state)
-    require_cute_combine_norm(
-        state=state, block_output=block_output, injection_logits=injection_logits,
-        next_norm_weight=next_norm_weight, combined=combined, normalized=normalized,
-        streams=caps.streams, hidden_size=caps.hidden_size,
+    from ._kernels import run_combine_norm
+
+    return run_combine_norm(
+        state,
+        block_output,
+        injection_logits,
+        next_norm_weight,
+        eps=eps,
+        streams=caps.streams,
+        hidden_size=caps.hidden_size,
+        block_h=plan.reduction_block_h,
+        num_warps=plan.reduction_num_warps,
     )
-    if tokens:
-        plan.launch(state, block_output, injection_logits, next_norm_weight, combined, normalized, eps=eps)
-    return combined, normalized
 
 
 def run_engram_mix_impl(
@@ -424,7 +514,7 @@ def run_engram_mix_impl(
     norm_weights: torch.Tensor,
     *,
     eps: float,
-    plan: _HyperConnectionState,
+    plan: HyperConnectionPlan,
     out: torch.Tensor,
     token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -435,9 +525,6 @@ def run_engram_mix_impl(
     unlike Gemma normalization, these weights are not zero-centered.
     """
     _require_cuda(plan)
-    plan.require_operation("engram_mix", eps=eps)
-    if (token_mask is not None) != plan.query.token_mask:
-        raise ValueError("mask presence differs from prepared Engram invocation")
     caps = plan.caps
     tokens = plan._live_tokens(state.shape[0])
     width = caps.streams * caps.hidden_size
@@ -474,8 +561,18 @@ def run_engram_mix_impl(
     )
     eps = _require_eps(eps)
     if tokens:
-        plan.launch(state, projected_kv, norm_weights,
-                    state if token_mask is None else token_mask, out, eps=eps)
+        from ._kernels import run_engram_mix
+
+        run_engram_mix(
+            state,
+            projected_kv,
+            norm_weights,
+            token_mask,
+            out,
+            eps=eps,
+            streams=caps.streams,
+            hidden_size=caps.hidden_size,
+        )
     return out
 
 
@@ -494,7 +591,6 @@ def _validate_pointwise_tensor(
 def run_swiglu_impl(
     gate_up: torch.Tensor, *, limit: float, out: torch.Tensor,
     round_silu: bool = False,
-    plan: _HyperConnectionState,
 ) -> torch.Tensor:
     """Clamp gate above only and up symmetrically, then compute FP32 SiLU*up.
 
@@ -503,13 +599,6 @@ def run_swiglu_impl(
     ``limit=inf`` disables clamping. No activation scaling is applied.
     Warm once before capture; ``out`` is disjoint caller-owned BF16 storage.
     """
-    _require_cuda(plan)
-    plan.require_operation("swiglu")
-    plan._live_tokens(gate_up.shape[0])
-    if limit != plan.query.limit or bool(round_silu) != plan.query.round_silu:
-        raise ValueError("activation recipe differs from prepared invocation")
-    if out.shape[-1] != plan.query.hidden_size:
-        raise ValueError("activation width differs from prepared invocation")
     if gate_up.ndim != 2 or gate_up.shape[1] <= 0 or gate_up.shape[1] % 2:
         raise ValueError("gate_up must have shape [T, 2I] with I positive")
     if gate_up.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
@@ -524,52 +613,43 @@ def run_swiglu_impl(
     limit = float(limit)
     if math.isnan(limit) or limit <= 0:
         raise ValueError("limit must be positive (or infinity to disable clamping)")
-    _validate_output_disjoint("out", out, (("gate_up", gate_up),))
-    if out.numel():
-        plan.launch(gate_up, gate_up, out)
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_swiglu(gate_up, out, limit, bool(round_silu))
     return out
 
 
 def run_add_impl(
-    left: torch.Tensor, right: torch.Tensor, *, out: torch.Tensor, plan: _HyperConnectionState,
+    left: torch.Tensor, right: torch.Tensor, *, out: torch.Tensor,
 ) -> torch.Tensor:
     """Add BF16/FP32 operands in FP32, casting once to disjoint BF16/FP32 out."""
-    _require_cuda(plan)
-    plan.require_operation("add")
-    if (str(left.dtype).removeprefix("torch.") != plan.query.left_dtype
-            or str(right.dtype).removeprefix("torch.") != plan.query.right_dtype
-            or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype):
-        raise ValueError("operand dtype differs from prepared add invocation")
     for name, tensor in (("left", left), ("right", right), ("out", out)):
         _validate_pointwise_tensor(
             tensor, name=name, shape=tuple(left.shape), device=left.device,
         )
-    _validate_output_disjoint("out", out, (("left", left), ("right", right)))
-    if out.numel():
-        plan.launch(left, right, out)
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_add(left, right, out)
     return out
 
 
-
-def run_sigmoid_impl(source, *, out, plan: _HyperConnectionState):
-    _require_cuda(plan)
-    plan.require_operation("sigmoid")
-    if (str(source.dtype).removeprefix("torch.") != plan.query.left_dtype
-            or str(out.dtype).removeprefix("torch.") != plan.query.output_dtype):
-        raise ValueError("operand dtype differs from prepared sigmoid invocation")
-    for name, tensor in (("source", source), ("out", out)):
+def run_sigmoid_impl(input: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
+    """Compute FP32 sigmoid and cast once to disjoint caller-owned BF16/FP32 out."""
+    for name, tensor in (("input", input), ("out", out)):
         _validate_pointwise_tensor(
-            tensor, name=name, shape=tuple(source.shape), device=source.device,
+            tensor, name=name, shape=tuple(input.shape), device=input.device,
         )
-    _validate_output_disjoint("out", out, (("source", source),))
-    if out.numel():
-        plan.launch(source, source, out)
+    from . import _kernels  # noqa: F401
+
+    torch.ops.b12x.hyperconnection_sigmoid(input, out)
     return out
 
 
 __all__ = [
     "HyperConnectionCaps",
+    "HyperConnectionPlan",
     "HyperConnectionBinding",
+    "plan_hyperconnection",
     "run_grouped_rmsnorm_impl",
     "run_scaled_silu_impl",
     "run_gate_mean_impl",

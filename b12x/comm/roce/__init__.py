@@ -29,9 +29,6 @@ META = OpMeta(
         "DEFAULT_MAX_SIZE",
         "SUPPORTED_DTYPES",
         "SUPPORTED_WORLD_SIZES",
-        "RoceQuery",
-        "plan",
-        "query_from_runtime",
         "default_gid_index",
         "discover_hcas",
         "is_supported",
@@ -60,12 +57,9 @@ if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
         SUPPORTED_DTYPES,
         SUPPORTED_WORLD_SIZES,
         AllReduce,
-        RoceQuery,
         default_gid_index,
         discover_hcas,
         is_supported,
-        plan,
-        query_from_runtime,
     )
 
 install_lazy_api(globals(), META)

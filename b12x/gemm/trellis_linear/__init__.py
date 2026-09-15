@@ -21,11 +21,8 @@ META = OpMeta(
     api_style="oneshot",
     entry_points=(
         "PreparedWeight",
-        "TrellisQuery",
         "prepare_weight",
         "prepare_pair_weight",
-        "query_from_weight",
-        "plan",
         "run",
         "is_supported",
         "clear_caches",
@@ -52,13 +49,10 @@ META = OpMeta(
 if TYPE_CHECKING:
     from .api import (  # noqa: F401
         PreparedWeight,
-        TrellisQuery,
         clear_caches,
         is_supported,
-        plan,
         prepare_weight,
         prepare_pair_weight,
-        query_from_weight,
         run,
     )
 

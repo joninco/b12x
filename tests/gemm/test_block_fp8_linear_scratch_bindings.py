@@ -1,22 +1,147 @@
 from __future__ import annotations
 
+import math
+
+import pytest
 import torch
 
-from b12x.gemm import block_fp8_linear as bfl
-from b12x.gemm._shared.block_fp8 import _scratch_plan
+import b12x.gemm._shared.block_fp8 as block_impl
+from b12x.gemm._shared.block_fp8 import BlockFP8LinearBinding, BlockFP8LinearScratchCaps, BlockFP8LinearWeight, plan_block_fp8_linear_scratch
+from b12x.gemm._shared.wo_mxfp8 import MXFP8Rows
 
 
-def test_block_fp8_declaration_has_no_scratch_or_runtime_owner() -> None:
-    caps = bfl.Caps(device="cpu", max_tokens=4, in_features=128, out_features=256)
-    declaration = bfl.plan(caps)
-    assert declaration.query.max_tokens == 4
-    assert declaration.component_id == "gemm.block_fp8_linear"
+def _packed_weight(*, in_features: int = 128, out_features: int = 256) -> BlockFP8LinearWeight:
+    scale_rows = torch.empty(
+        (1, out_features, in_features // 32),
+        dtype=torch.float8_e8m0fnu,
+    )
+    scale_mma = torch.empty(
+        (32, 4, math.ceil(out_features / 128), 4, math.ceil((in_features // 32) / 4), 1),
+        dtype=torch.float8_e8m0fnu,
+    )
+    weight = MXFP8Rows(
+        values=torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn),
+        scale_rows=scale_rows,
+        scale_mma=scale_mma,
+    )
+    return BlockFP8LinearWeight(
+        weight=weight,
+        in_features=in_features,
+        out_features=out_features,
+        block_size=(128, 128),
+    )
 
 
-def test_block_fp8_private_scratch_layout_models_quantizer_views() -> None:
-    caps = bfl.Caps(device="cpu", max_tokens=4, in_features=128, out_features=256)
-    scratch = _scratch_plan(caps, (16, 64))
-    spec = scratch.scratch_specs()[0]
-    assert spec.name == "block_fp8_linear.scratch"
-    assert spec.dtype == torch.uint8
-    assert spec.nbytes == spec.shape[0]
+def test_block_fp8_linear_scratch_plan_exposes_one_opaque_scratch_spec() -> None:
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
+    )
+
+    specs = plan.scratch_specs()
+    assert len(specs) == 1
+    assert specs[0].name == "block_fp8_linear.scratch"
+    assert specs[0].dtype == torch.uint8
+    assert specs[0].shape == plan.shapes_and_dtypes()[0][0]
+    assert specs[0].nbytes == specs[0].shape[0]
+
+
+@pytest.mark.parametrize("expected_m", (None, 3, 4))
+def test_block_fp8_linear_scratch_plan_binds_live_shape(monkeypatch, expected_m) -> None:
+    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
+    packed = _packed_weight()
+
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+        expected_m=expected_m,
+    )
+
+    assert isinstance(binding, BlockFP8LinearBinding)
+    assert binding.expected_m == (4 if expected_m is None else expected_m)
+    assert binding.source is source
+    assert binding.packed_weight is packed
+    assert not hasattr(binding, "workspace")
+    assert binding.x_q.values.shape == (3, 128)
+    assert binding.output is output
+
+
+def test_block_fp8_linear_plan_binding_maps_scratch_views(monkeypatch) -> None:
+    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
+    packed = _packed_weight()
+
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+    )
+
+    assert isinstance(binding, BlockFP8LinearBinding)
+    assert not hasattr(binding, "workspace")
+    assert binding.x_q.values.data_ptr() == scratch.data_ptr()
+    assert binding.output is output
+    assert binding.source is source
+    assert binding.packed_weight is packed
+
+
+
+
+def test_block_fp8_linear_binding_owns_runtime_tensors(monkeypatch) -> None:
+    monkeypatch.setattr(block_impl, "_check_mxfp8_rows_storage", lambda *args, **kwargs: None)
+    plan = plan_block_fp8_linear_scratch(
+        BlockFP8LinearScratchCaps(
+            device="cpu",
+            max_tokens=4,
+            in_features=128,
+            out_features=256,
+        )
+    )
+    spec = plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    source = torch.empty((3, 128), dtype=torch.bfloat16)
+    output = torch.empty((3, 256, 1), dtype=torch.bfloat16)
+    packed = _packed_weight()
+    binding = plan.bind(
+        scratch=scratch,
+        source=source,
+        packed_weight=packed,
+        output=output,
+    )
+
+    with pytest.raises(ValueError, match="binding owns source"):
+        block_impl.block_fp8_linear_mxfp8(
+            source,
+            packed,
+            binding=binding,
+        )

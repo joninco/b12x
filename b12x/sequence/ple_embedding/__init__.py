@@ -1,10 +1,9 @@
 """Prime-hashed PLE embedding lookup.
 
-``compute_geometry`` and ``storage_layout`` calculate host-only table metadata;
-``allocate_geometry`` and ``allocate_storage`` create checkpoint-owned buffers.
-``plan`` declares the table plan without loading kernels or allocating device memory.
-A ``PreparationSession`` admits the declaration and returns the prepared plan
-required by ``bind``. Geometry tensors are borrowed, not replaced.
+``plan`` owns the hash geometry, tensor-parallel table partition, and fixed
+serving capacity. ``Plan.allocate_storage`` materializes device-resident or
+CUDA-mapped host table storage. ``bind`` maps the resulting model tensors,
+packed request metadata, output, and scratch without allocation.
 ``run`` hashes tokens, gathers selected rows from the local table shard, applies
 inline dequantization for FP8 or NVFP4, and writes a BF16 embedding contribution.
 ``io_uring`` uses ``DiskTable`` with O_DIRECT to stage only the current batch.
@@ -12,9 +11,9 @@ Its host-I/O ``run`` produces fixed GPU outputs outside capture; graphs may
 then consume those outputs without performing disk reads.
 
 The expressed operation is one hash, gather, and dequantization call. Its
-binding exposes only caller-owned inputs and the output; intermediate
-embedding IDs remain private so implementations may fuse the operation
-without changing the integration API.
+binding exposes only caller-owned inputs, the output, and a device error code;
+intermediate embedding IDs remain private so implementations may fuse the
+operation without changing the integration API.
 """
 
 from __future__ import annotations
@@ -34,13 +33,6 @@ META = OpMeta(
         "DiskTable",
         "Caps",
         "Plan",
-        "TableLayout",
-        "storage_layout",
-        "Geometry",
-        "GeometryTensors",
-        "compute_geometry",
-        "allocate_geometry",
-        "invocation_from_tensors",
         "Binding",
         "PleEmbeddingConfig",
         "PleEmbeddingQuery",
@@ -80,13 +72,6 @@ if TYPE_CHECKING:
         Caps,
         DiskTable,
         Plan,
-        TableLayout,
-        storage_layout,
-        Geometry,
-        GeometryTensors,
-        compute_geometry,
-        allocate_geometry,
-        invocation_from_tensors,
         PleEmbeddingConfig,
         PleEmbeddingQuery,
         QuantMode,

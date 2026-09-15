@@ -22,8 +22,6 @@ from cutlass.cutlass_dsl import Int32, Int64, Uint32
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 
-from b12x._lib.compiler import KernelCompileSpec
-from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import (
     fp8_e4m3_to_f32,
     get_ptr_as_int64,
@@ -701,16 +699,7 @@ def _compile_materializer(
         _cute_tensor(output.view(output.shape[0], output.shape[1], 1), cutlass.BFloat16),
         current_cuda_stream(),
     )
-    return b12x_compile(
-        materializer,
-        *args,
-        compile_spec=KernelCompileSpec.from_key(
-            "moe.trellis.coupled_materialize",
-            1,
-            materializer.__cache_key__,
-            labels=("experts", "k", "n", "bits", "hidden_axis", "joined_upstream"),
-        ),
-    )
+    return cute.compile(materializer, *args)
 
 
 def prepare_coupled_uniform_materializer_inputs(

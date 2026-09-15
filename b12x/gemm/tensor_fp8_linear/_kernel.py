@@ -8,6 +8,7 @@ from ..blockscaled._linear import (
     _use_block_fp8_recipe,
     is_tensor_fp8_linear_supported,
     pack_tensor_fp8_linear_weight,
+    prewarm_tensor_fp8_linear,
     tensor_fp8_linear,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "_use_block_fp8_recipe",
     "is_tensor_fp8_linear_supported",
     "pack_tensor_fp8_linear_weight",
+    "prewarm_tensor_fp8_linear",
     "tensor_fp8_linear",
 ]

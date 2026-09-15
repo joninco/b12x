@@ -38,7 +38,8 @@ import torch
 import torch.distributed as dist
 
 from b12x._lib.runtime_control import (
-    kernel_resolution_guard,
+    freeze_kernel_resolution,
+    unfreeze_kernel_resolution,
 )
 from benchmarks.dcp_transport.cases import attention_cases, candidate_case
 from benchmarks.dcp_transport.prototype_cases import (
@@ -88,8 +89,11 @@ def validate(case, repetitions):
     for _ in range(3):
         case.run()
     torch.cuda.synchronize()
-    with kernel_resolution_guard("DCP transport graph capture"):
+    freeze_kernel_resolution("DCP transport graph capture")
+    try:
         graph = capture(case, repetitions)
+    finally:
+        unfreeze_kernel_resolution()
     if case.refresh:
         case.refresh(1931)
     graph.replay()

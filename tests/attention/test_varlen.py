@@ -18,7 +18,7 @@ def _require_contiguous_backend() -> torch.device:
 
 
 def _run_attention_with_plan(
-    declaration,
+    plan,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -26,43 +26,27 @@ def _run_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from b12x.attention import varlen
-    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+    from b12x.attention._shared.contiguous import (
+        b12x_attention_forward,
+        plan_attention_scratch,
+    )
 
-    def prepare_call(state):
-        (spec,) = state.scratch_plan.scratch_specs()
-        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        binding = state.bind(
-            scratch=scratch, q=q, k=k, v=v,
-            softmax_scale=softmax_scale, attention_sink_bias=attention_sink_bias,
-        )
-        return PreparedCall(run=lambda: state.run(binding))
-
-    with PreparationSession(device=q.device, autotune=False, compile_workers=2) as session:
-        session.prepare((declaration.request(
-            name="batched", prepare_call=prepare_call,
-        ),))
-        plan = declaration
-        state = require_prepared(plan, "attention.varlen", q.device)
-        binding = varlen.bind_batched(
-            plan, scratch=torch.empty(
-                state.scratch_plan.scratch_specs()[0].shape,
-                dtype=state.scratch_plan.scratch_specs()[0].dtype, device=q.device,
-            ), q=q, k=k, v=v, softmax_scale=softmax_scale,
-            attention_sink_bias=attention_sink_bias,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with session.capture(), torch.cuda.graph(graph):
-            output, lse = varlen.run_batched(binding)
-        output.fill_(float("nan"))
-        lse.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize(q.device)
-        return output, lse
+    scratch_plan = plan_attention_scratch(plan)
+    spec = scratch_plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return b12x_attention_forward(binding=binding)
 
 
 def _run_varlen_attention_with_plan(
-    declaration,
+    plan,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -75,42 +59,28 @@ def _run_varlen_attention_with_plan(
     softmax_scale: Optional[float] = None,
     attention_sink_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from b12x.attention import varlen
-    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+    from b12x.attention._shared.contiguous import (
+        b12x_varlen_attention_forward,
+        plan_varlen_attention_scratch,
+    )
 
-    def prepare_call(state):
-        (spec,) = state.scratch_plan.scratch_specs()
-        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-        binding = state.bind(
-            scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu_seqlens,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, causal=causal,
-            window_size=window_size, softmax_scale=softmax_scale,
-            attention_sink_bias=attention_sink_bias,
-        )
-        return PreparedCall(run=lambda: state.run(binding))
-
-    with PreparationSession(device=q.device, autotune=False, compile_workers=2) as session:
-        session.prepare((declaration.request(
-            name="varlen", prepare_call=prepare_call,
-        ),))
-        plan = declaration
-        state = require_prepared(plan, "attention.varlen", q.device)
-        (spec,) = state.scratch_plan.scratch_specs()
-        binding = varlen.bind(
-            plan,
-            scratch=torch.empty(spec.shape, dtype=spec.dtype, device=spec.device),
-            q=q, k=k, v=v, cu_seqlens_q=cu_seqlens, max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k, causal=causal, window_size=window_size,
-            softmax_scale=softmax_scale, attention_sink_bias=attention_sink_bias,
-        )
-        graph = torch.cuda.CUDAGraph()
-        with session.capture(), torch.cuda.graph(graph):
-            output, lse = varlen.run(binding)
-        output.fill_(float("nan"))
-        lse.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize(q.device)
-        return output, lse
+    scratch_plan = plan_varlen_attention_scratch(plan)
+    spec = scratch_plan.scratch_specs()[0]
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        window_size=window_size,
+        softmax_scale=softmax_scale,
+        attention_sink_bias=attention_sink_bias,
+    )
+    return b12x_varlen_attention_forward(binding=binding)
 
 
 def _vision_reference_attention_segment(
@@ -378,8 +348,12 @@ def test_contiguous_attention_matches_sglang_torch_ref(
     window_size: Tuple[int, int],
 ) -> None:
     device = _require_contiguous_backend()
-    from b12x.attention import varlen
+    from b12x.attention._shared.contiguous import (
+        clear_attention_caches,
+        create_attention_plan,
+    )
 
+    clear_attention_caches()
     q, k, v = _make_gqa_inputs(
         (1, 48, 4, 64),
         kv_heads=2,
@@ -388,9 +362,9 @@ def test_contiguous_attention_matches_sglang_torch_ref(
         seed=23 if causal else 29,
     )
 
-    declaration = varlen.plan_batched(q, k, v, causal=causal, window_size=window_size)
+    plan = create_attention_plan(q, k, v, causal=causal, window_size=window_size)
     out, _lse = _run_attention_with_plan(
-        declaration,
+        plan,
         q,
         k,
         v,
@@ -413,7 +387,12 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
     None
 ):
     device = _require_contiguous_backend()
-    from b12x.attention import varlen
+    from b12x.attention._shared.contiguous import (
+        clear_attention_caches,
+        create_varlen_attention_plan,
+    )
+
+    clear_attention_caches()
     lengths = (5, 17, 9)
     q, k, v, cu_seqlens = _make_varlen_gqa_inputs(
         lengths,
@@ -434,13 +413,19 @@ def test_varlen_contiguous_attention_matches_sglang_torch_ref_swa_gqa_and_sinks(
         device=device,
     )
 
-    declaration = varlen.plan(
-        q, k, v, cu_seqlens, max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen, causal=False, window_size=window_size,
+    plan = create_varlen_attention_plan(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        causal=False,
+        window_size=window_size,
         attention_sink_bias=sinks,
     )
     out, _lse = _run_varlen_attention_with_plan(
-        declaration,
+        plan,
         q,
         k,
         v,
@@ -485,15 +470,32 @@ def test_unequal_value_prefill_qk256_v128_causal_window_ragged() -> None:
         torch.bfloat16
     )
     cu = torch.tensor([0, 65, total], dtype=torch.int32, device=device)
-    declaration = varlen.plan(
-        q, k, v, cu, max_seqlen_q=max(lengths), max_seqlen_k=max(lengths),
-        causal=True, window_size=(512, 0),
+    kernel_plan = varlen.create_plan(
+        q,
+        k,
+        v,
+        cu,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        window_size=(512, 0),
     )
-    actual, actual_lse = _run_varlen_attention_with_plan(
-        declaration, q, k, v, cu, max_seqlen_q=max(lengths),
-        max_seqlen_k=max(lengths), softmax_scale=1.0 / 16.0,
-        causal=True, window_size=(512, 0),
+    scratch_plan = varlen.plan(kernel_plan)
+    (spec,) = scratch_plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
+    binding = scratch_plan.bind(
+        scratch=scratch,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        softmax_scale=1.0 / 16.0,
+        causal=True,
+        window_size=(512, 0),
     )
+    actual, actual_lse = varlen.run(binding=binding)
 
     expected = torch.empty_like(actual)
     begin = 0

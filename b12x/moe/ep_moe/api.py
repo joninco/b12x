@@ -1,37 +1,57 @@
-"""Public surface for session-prepared replicated-input EP MoE."""
+"""Public surface for moe.ep_moe (docs in the op ``__init__``)."""
+
 from __future__ import annotations
 
-from b12x._lib.gating import default_is_supported
-from b12x.preparation.types import Plan, require_prepared
-
+from ..._lib.gating import default_is_supported
+from ._impl import (
+    EPExpertMap as ExpertMap,
+)
+from ._policy import EpMoeConfig, EpMoeQuery
+from ._impl import (
+    EPMoEFP4Binding as Binding,
+)
+from ._impl import (
+    EPMoEScratchCaps as Caps,
+)
+from ._impl import (
+    EPMoEScratchPlan as Plan,
+)
+from ._impl import (
+    plan_ep_moe_scratch as plan,
+)
+from ._impl import (
+    prepare_ep_expert_map as prepare_expert_map,
+)
+from ._impl import (
+    b12x_ep_moe_fp4 as run,
+)
 from . import META
-from ._impl import EPExpertMap as ExpertMap
-from ._impl import EPMoEFP4Binding as Binding
-from ._impl import EPMoEScratchCaps as Caps
-from ._impl import prepare_ep_expert_map as prepare_expert_map
-from ._preparation import invocation_from_tensors, plan
-from ._tuning import EpMoeConfig, EpMoeQuery
-
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
-    """Bind caller tensors to one session-prepared EP plan."""
-    return require_prepared(plan, "moe.ep_moe").bind(
-        _plan=plan, **kwargs
-    )
+    """Bind runtime tensors and caller-owned scratch to a plan.
 
-def run(*, binding: Binding):
-    """Run a bound EP partial; no compiler or selection path is available here."""
-    if not isinstance(binding, Binding):
-        raise TypeError("binding must be an EPMoEFP4Binding")
-    return binding.run()
+    Views only — never allocates — so it is CUDA-graph-capture safe.
+    Delegates to ``plan.bind(**kwargs)``.
+    """
+    return plan.bind(**kwargs)
 
 
 def is_supported(device=None) -> bool:
+    """True on SM120/SM121 with nvidia-cutlass-dsl >= 4.6.0 and triton."""
     return default_is_supported(device, requires=META.requires)
 
 
 __all__ = [
-    "Caps", "Plan", "Binding", "ExpertMap", "EpMoeConfig", "EpMoeQuery", "plan",
-    "bind", "run", "prepare_expert_map", "invocation_from_tensors", "is_supported",
+    "Caps",
+    "Plan",
+    "Binding",
+    "ExpertMap",
+    "EpMoeConfig",
+    "EpMoeQuery",
+    "plan",
+    "bind",
+    "run",
+    "prepare_expert_map",
+    "is_supported",
 ]

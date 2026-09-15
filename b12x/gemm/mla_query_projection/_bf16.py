@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from collections.abc import Iterable
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
-from b12x.preparation import Plan
-from b12x.preparation.types import plan_from_handle, require_prepared
 
 from .._shared.mxfp8_bmm import _overlaps, _torch_stream
 
@@ -22,6 +19,7 @@ _MAX_M = 32
 _QUALIFIED_HEADS = frozenset((8, 11, 16))
 _BLOCK_N = 32
 _BLOCK_K = 64
+_COMPILED_SIGNATURES: set[tuple[int, int, bool]] = set()
 
 
 @triton.jit
@@ -183,38 +181,59 @@ def _validate(
     return heads, m, output_fp8
 
 
-
-
-def _run_prepared(
+def _launch(
     q_nope: torch.Tensor,
     weight: torch.Tensor,
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
-    *,
-    launcher: object,
-    block_m: int,
-    output_fp8: bool,
-    stream: Optional[object] = None,
-) -> torch.Tensor:
-    heads, m, actual_output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
-    if actual_output_fp8 != output_fp8 or block_m != (16 if m <= 16 else 32):
-        raise ValueError("MLA query plan differs from its prepared specialization")
-    target = _torch_stream(stream, q_nope.device) if stream is not None else None
-    context = torch.cuda.stream(target) if target is not None else nullcontext()
-    with context:
-        launcher[(_LATENT_DIM // _BLOCK_N, heads, 1)](
-            q_nope, weight, q_pe, q_scale if q_scale is not None else out, out, m,
-            q_nope.stride(0), q_nope.stride(1), weight.stride(0), weight.stride(1),
-            q_pe.stride(0), q_pe.stride(1), out.stride(0), out.stride(1),
-            output_fp8, _NOPE_DIM, _LATENT_DIM, _ROPE_DIM, block_m, _BLOCK_N, _BLOCK_K,
+) -> None:
+    heads, m, output_fp8 = _validate(q_nope, weight, q_pe, q_scale, out)
+    block_m = 16 if m <= 16 else 32
+    device_index = int(
+        q_nope.device.index
+        if q_nope.device.index is not None
+        else torch.cuda.current_device()
+    )
+    signature = (device_index, block_m, output_fp8)
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and signature not in _COMPILED_SIGNATURES
+    ):
+        raise RuntimeError(
+            "BF16 MLA query compile miss during CUDA-graph capture for "
+            f"M={m}, output_fp8={output_fp8}; "
+            "call mla_query_projection.prewarm first"
         )
-        if target is not None:
-            for tensor in (q_nope, weight, q_pe, out):
-                tensor.record_stream(target)
-            if q_scale is not None:
-                q_scale.record_stream(target)
-    return out
+    # This geometry wins across the complete qualified envelope (M=1..32 and
+    # H=8/11/16). Keeping one shape also bounds prewarm to two M regimes.
+    grid = (triton.cdiv(_LATENT_DIM, _BLOCK_N), heads)
+    _mla_query_projection_bf16_kernel[grid](
+        q_nope,
+        weight,
+        q_pe,
+        q_scale if q_scale is not None else out,
+        out,
+        m,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        out.stride(0),
+        out.stride(1),
+        OUTPUT_FP8=output_fp8,
+        NOPE_DIM=_NOPE_DIM,
+        LATENT_DIM=_LATENT_DIM,
+        ROPE_DIM=_ROPE_DIM,
+        BLOCK_M=block_m,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_K=_BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+    )
+    _COMPILED_SIGNATURES.add(signature)
 
 
 @torch.library.custom_op("b12x::mla_query_projection_bf16", mutates_args=("out",))
@@ -224,10 +243,8 @@ def _op(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
-    plan_handle: int,
 ) -> None:
-    state = require_prepared(plan_from_handle(plan_handle), "gemm.mla_query_projection", q_nope.device)
-    state.run(q_nope, weight, q_pe, out, q_scale=q_scale)
+    _launch(q_nope, weight, q_pe, q_scale, out)
 
 
 @_op.register_fake
@@ -237,9 +254,8 @@ def _fake(
     q_pe: torch.Tensor,
     q_scale: Optional[torch.Tensor],
     out: torch.Tensor,
-    plan_handle: int,
 ) -> None:
-    del q_nope, weight, q_pe, q_scale, out, plan_handle
+    del q_nope, weight, q_pe, q_scale, out
 
 
 def run(
@@ -248,20 +264,19 @@ def run(
     q_pe: torch.Tensor,
     out: torch.Tensor,
     *,
-    plan: Plan,
     q_scale: Optional[torch.Tensor] = None,
     stream: Optional[object] = None,
 ) -> torch.Tensor:
     """Run the BF16 absorbed projection and query-assembly epilogue."""
     if stream is None:
         torch.ops.b12x.mla_query_projection_bf16(
-            q_nope, weight, q_pe, q_scale, out, plan.handle
+            q_nope, weight, q_pe, q_scale, out
         )
         return out
     target = _torch_stream(stream, q_nope.device)
     with torch.cuda.stream(target):
         torch.ops.b12x.mla_query_projection_bf16(
-            q_nope, weight, q_pe, q_scale, out, plan.handle
+            q_nope, weight, q_pe, q_scale, out
         )
         tensors = [q_nope, weight, q_pe, out]
         if q_scale is not None:
@@ -269,6 +284,71 @@ def run(
         for tensor in tensors:
             tensor.record_stream(target)
     return out
+
+
+def prewarm(
+    weight: torch.Tensor,
+    m_values: Iterable[int],
+    *,
+    output_dtype: torch.dtype,
+    stream: Optional[object] = None,
+    synchronize: bool = True,
+) -> int:
+    """Compile and first-launch every required BF16 fused-query regime."""
+    if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(
+            f"output_dtype must be bfloat16 or float8_e4m3fn, got {output_dtype}"
+        )
+    if weight.ndim != 3:
+        raise ValueError(f"weight must have shape [H,192,512], got {weight.shape}")
+    heads = int(weight.shape[0])
+    values = tuple(dict.fromkeys(int(value) for value in m_values if int(value) > 0))
+    for m in values:
+        if not can_implement(
+            num_heads=heads,
+            max_m=m,
+            nope_dim=int(weight.shape[1]),
+            latent_dim=int(weight.shape[2]),
+            output_dtype=output_dtype,
+            device=weight.device,
+        ):
+            raise NotImplementedError(
+                "the BF16 fused MLA query specialization cannot prewarm "
+                f"H={heads}, M={m}, weight={tuple(weight.shape)}, "
+                f"output_dtype={output_dtype}"
+            )
+    target = _torch_stream(stream, weight.device)
+    q_scale = (
+        torch.ones(1, dtype=torch.float32, device=weight.device)
+        if output_dtype == torch.float8_e4m3fn
+        else None
+    )
+    warmed_regimes: set[int] = set()
+    with torch.cuda.stream(target):
+        for m in values:
+            block_m = 16 if m <= 16 else 32
+            if block_m in warmed_regimes:
+                continue
+            warmed_regimes.add(block_m)
+            q_nope = torch.zeros(
+                (heads, m, _NOPE_DIM), dtype=torch.bfloat16, device=weight.device
+            )
+            q_pe = torch.zeros(
+                (m, heads, _ROPE_DIM), dtype=torch.bfloat16, device=weight.device
+            )
+            out = torch.empty(
+                (m, heads, _QUERY_DIM), dtype=output_dtype, device=weight.device
+            )
+            torch.ops.b12x.mla_query_projection_bf16(
+                q_nope, weight, q_pe, q_scale, out
+            )
+            for tensor in (q_nope, q_pe, out):
+                tensor.record_stream(target)
+        if q_scale is not None:
+            q_scale.record_stream(target)
+    if synchronize:
+        target.synchronize()
+    return len(warmed_regimes)
 
 
 def can_implement(
@@ -291,6 +371,8 @@ def can_implement(
     )
 
 
+def clear_caches() -> None:
+    _COMPILED_SIGNATURES.clear()
 
 
-__all__ = ["can_implement", "run"]
+__all__ = ["can_implement", "clear_caches", "prewarm", "run"]

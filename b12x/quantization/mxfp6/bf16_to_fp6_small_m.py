@@ -47,7 +47,6 @@ from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64, Uint32
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
-from b12x._lib.compile_plan import attach_programs
 from b12x._lib.intrinsics import (
     block_reduce,
     cvt_f32_to_bf16_bits,
@@ -412,6 +411,5 @@ def compile_bf16_to_fp6_small_m(m: int, k: int, fmt: str = "e3m2", per_row: bool
             current_cuda_stream(),
         )
 
-    launch = attach_programs(launch, raw)
     _KERNEL_CACHE[cache_key] = launch
     return launch

@@ -14,7 +14,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import b12x
-from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReducePool
 
 
@@ -82,9 +81,12 @@ def _worker(rank: int, port: int) -> None:
                     pool.all_reduce(inp, out=output)
                 stream.synchronize()
                 dist.barrier(group=group, device_ids=[rank])
-                with kernel_resolution_guard('PCIe teardown graph preparation'):
+                b12x.freeze_kernel_resolution("PCIe teardown graph preparation")
+                try:
                     with torch.cuda.graph(graph, stream=stream):
                         pool.all_reduce(inp, out=output)
+                finally:
+                    b12x.unfreeze_kernel_resolution()
             torch.cuda.synchronize(device)
             addresses = (inp.data_ptr(), output.data_ptr())
             for step in range(3):

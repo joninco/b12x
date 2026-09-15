@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from b12x.preparation import Plan
-from b12x.preparation.types import require_prepared
 from ..._lib.gating import default_is_supported
 from ._impl import (
     MHC_DEFAULT_BLOCK_H as DEFAULT_BLOCK_H,
 )
-from ._tuning import MhcConfig, MhcQuery
+from ._policy import MhcConfig, MhcQuery
 from ._impl import (
     MHC_DEFAULT_BLOCK_K as DEFAULT_BLOCK_K,
 )
@@ -30,8 +28,12 @@ from ._impl import (
 from ._impl import (
     B12XMHCScratchCaps as Caps,
 )
-from ._preparation import plan_mhc as plan
-from ._impl import run_collapse
+from ._impl import (
+    B12XMHCScratchPlan as Plan,
+)
+from ._impl import (
+    plan_mhc_scratch as plan,
+)
 from ._impl import (
     b12x_mhc_post as run_post,
 )
@@ -46,9 +48,12 @@ from . import META
 
 
 def bind(plan: Plan, **kwargs) -> Binding:
-    """Bind caller-owned scratch to a prepared plan."""
-    state = require_prepared(plan, "norm.mhc")
-    return state.bind(plan=plan, **kwargs)
+    """Bind runtime tensors and caller-owned scratch to a plan.
+
+    Views only — never allocates — so it is CUDA-graph-capture safe.
+    Delegates to ``plan.bind(**kwargs)``.
+    """
+    return plan.bind(**kwargs)
 
 
 def is_supported(device=None) -> bool:

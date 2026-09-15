@@ -30,7 +30,6 @@ import time
 from collections.abc import Callable
 
 import torch
-from b12x.comm.pcie._dcp_preparation import _prepare_transport_calls
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -317,6 +316,17 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             for operation in ("reduce", "gather", "pair")
         )
         pool.prepare_channels(channel_ids)
+        preparation_channel_id = channel_ids[0]
+        for threads in sorted({threads for threads, _ in launches}):
+            pool.prepare_graph_lse_reduce_scatter(
+                dtype=dtype,
+                threads=threads,
+                channel_id=preparation_channel_id,
+            )
+            pool.prepare_graph_all_gather_heads(
+                threads=threads,
+                channel_id=preparation_channel_id,
+            )
         if rank == 0:
             print(f"# metadata={json.dumps(_metadata(world_size, query_dtype_name))}")
             print(
@@ -347,35 +357,11 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
             for threads, block_limit in launches:
                 channel_prefix = f"benchmark:{batch}:{threads}:{block_limit}"
-                sessions = []
-                plans = {}
-                gather_call = {
-                    "local_input": gather_in, "out": gather_out,
-                    "threads": threads, "block_limit": block_limit,
-                }
-                reduce_call = {
-                    "partial_output": reduce_out, "partial_lse": reduce_lse,
-                    "out": reduce_result, "is_lse_base_on_e": True,
-                    "threads": threads, "block_limit": block_limit,
-                }
-                for label, calls in (
-                    ("reduce", {"lse_reduce_scatter": reduce_call}),
-                    ("gather", {"all_gather_heads": gather_call}),
-                    ("pair", {"all_gather_heads": gather_call, "lse_reduce_scatter": reduce_call}),
-                ):
-                    channel_id = f"{channel_prefix}:{label}"
-                    session, declarations = _prepare_transport_calls(
-                        pool._logical_channels[channel_id], calls,
-                        channel_id=channel_id, ranks=tuple(range(world_size)),
-                    )
-                    sessions.append(session)
-                    plans[label] = declarations
                 reduce_graph = _capture(
                     lambda: pool.lse_reduce_scatter(
                         reduce_out,
                         reduce_lse,
                         reduce_result,
-                        plan=plans["reduce"]["lse_reduce_scatter"],
                         threads=threads,
                         block_limit=block_limit,
                     ),
@@ -386,7 +372,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     lambda: pool.all_gather_heads(
                         gather_in,
                         gather_out,
-                        plan=plans["gather"]["all_gather_heads"],
                         threads=threads,
                         block_limit=block_limit,
                     ),
@@ -398,7 +383,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     pool.all_gather_heads(
                         gather_in,
                         gather_out,
-                        plan=plans["pair"]["all_gather_heads"],
                         threads=threads,
                         block_limit=block_limit,
                     )
@@ -406,7 +390,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                         reduce_out,
                         reduce_lse,
                         reduce_result,
-                        plan=plans["pair"]["lse_reduce_scatter"],
                         threads=threads,
                         block_limit=block_limit,
                     )
@@ -446,8 +429,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     )
                 del reduce_graph, gather_graph, pair_graph
                 torch.cuda.synchronize(device)
-                for session in sessions:
-                    session.close()
     finally:
         if pool is not None:
             pool.close()

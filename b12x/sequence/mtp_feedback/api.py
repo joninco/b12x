@@ -6,8 +6,7 @@ from ..._lib.gating import has_cutlass_dsl, has_triton
 
 from . import reference
 from ._impl import Binding, Caps, Plan, bind, plan, run
-from ._preparation import invocation_from_tensors
-from ._tuning import MtpFeedbackConfig, MtpFeedbackQuery
+from ._policy import MtpFeedbackConfig, MtpFeedbackQuery
 
 
 def is_supported(device=None) -> bool:
@@ -23,7 +22,6 @@ __all__ = [
     "MtpFeedbackConfig",
     "MtpFeedbackQuery",
     "plan",
-    "invocation_from_tensors",
     "bind",
     "run",
     "reference",

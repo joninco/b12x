@@ -4,12 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
-
-if TYPE_CHECKING:
-    from b12x.preparation import Plan
 
 from b12x.attention._shared.mla.compressed_config import (
     compressed_sparse_mla_split_config_for_contract,
@@ -54,13 +51,13 @@ class B12XCompressedSparseMLAScratchCaps:
     page_size: int = 64
     layout: str = "compressed_dsv4"
     cache_format: Literal["deepseek_v4", "deepseek_v41"] = "deepseek_v4"
-    mode: Literal["decode", "extend", "verify", "draft_extend"] = "decode"
+    mode: Literal["decode", "extend"] = "decode"
     swa_width: int | None = None
     indexed_width: int | None = None
     swa_page_size: int | None = None
     indexed_page_size: int | None = None
-    shared_width_capacity: bool | None = field(default=None, repr=False)
     use_cuda_graph: bool = False
+    shared_width_capacity: bool | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         device = torch.device(self.device)
@@ -74,7 +71,7 @@ class B12XCompressedSparseMLAScratchCaps:
             raise ValueError(f"unsupported compressed sparse MLA layout {self.layout!r}")
         if self.cache_format not in ("deepseek_v4", "deepseek_v41"):
             raise ValueError(f"unsupported compressed MLA cache_format {self.cache_format!r}")
-        if self.mode not in ("decode", "extend", "verify", "draft_extend"):
+        if self.mode not in ("decode", "extend"):
             raise ValueError(f"unsupported compressed sparse MLA mode {self.mode!r}")
         legacy_shared_width = (
             self.swa_width is None and self.indexed_width is None
@@ -189,17 +186,16 @@ class B12XCompressedSparseMLAScratch:
     layout: str
     mode: str = "decode"
     cache_format: str = "deepseek_v4"
-    execution_config: object | None = None
     fixed_capacity: bool = True
     use_cuda_graph: bool = False
     tmp_output: torch.Tensor | None = None
     tmp_lse: torch.Tensor | None = None
     output_buffer: torch.Tensor | None = None
     final_lse: torch.Tensor | None = None
+    mapped_indices: torch.Tensor | None = None
     kv_chunk_size_ptr: torch.Tensor | None = None
     num_chunks_ptr: torch.Tensor | None = None
     sm_scale_tensor: torch.Tensor | None = None
-    mapped_indices: torch.Tensor | None = None
     kv_chunk_size_value: int | None = None
     num_chunks_value: int | None = None
     sm_scale_value: float | None = None
@@ -251,8 +247,6 @@ class B12XCompressedSparseMLAScratch:
 
 @dataclass(frozen=True, kw_only=True)
 class B12XCompressedSparseMLABinding:
-    """Caller-owned dynamic inputs bound to one prepared compressed MLA state."""
-
     scratch: object
     q: torch.Tensor
     swa_indices: torch.Tensor
@@ -260,7 +254,7 @@ class B12XCompressedSparseMLABinding:
     indexed_indices: torch.Tensor | None = None
     indexed_lengths: torch.Tensor | None = None
     indexed_page_table: torch.Tensor | None = None
-    plan: Plan | None = None
+
 
 def _compressed_sparse_mla_scratch_layout(
     caps: B12XCompressedSparseMLAScratchCaps,
@@ -304,10 +298,10 @@ def _compressed_sparse_mla_scratch_layout(
     sm_scale_offset_bytes = cursor
     cursor += dtype_nbytes(torch.float32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
-
     mapped_indices_offset_bytes = cursor
     cursor += max_total_q * int(caps.indexed_width) * dtype_nbytes(torch.int32)
     cursor = align_up(cursor, SCRATCH_ALIGN_BYTES)
+
 
     return _B12XCompressedSparseMLAScratchLayout(
         nbytes=max(int(cursor), SCRATCH_ALIGN_BYTES),
@@ -389,7 +383,6 @@ def _materialize_compressed_sparse_mla_scratch(
     caps: B12XCompressedSparseMLAScratchCaps,
     scratch_storage: torch.Tensor,
     layout: _B12XCompressedSparseMLAScratchLayout,
-    execution_config: object | None,
 ) -> B12XCompressedSparseMLAScratch:
     max_total_q = max(int(caps.max_q_rows), 1)
     tmp_output, _ = materialize_scratch_strided_view(
@@ -433,17 +426,17 @@ def _materialize_compressed_sparse_mla_scratch(
         shape=(1,),
         dtype=torch.int32,
     )
-    mapped_indices, _ = materialize_scratch_view(
-        scratch_storage,
-        offset_bytes=layout.mapped_indices_offset_bytes,
-        shape=(max_total_q, int(caps.indexed_width)),
-        dtype=torch.int32,
-    )
     sm_scale_tensor, _ = materialize_scratch_view(
         scratch_storage,
         offset_bytes=layout.sm_scale_offset_bytes,
         shape=(1,),
         dtype=torch.float32,
+    )
+    mapped_indices, _ = materialize_scratch_view(
+        scratch_storage,
+        offset_bytes=layout.mapped_indices_offset_bytes,
+        shape=(max_total_q, int(caps.indexed_width)),
+        dtype=torch.int32,
     )
     scratch = B12XCompressedSparseMLAScratch(
         shared_scratch=scratch_storage,
@@ -462,17 +455,16 @@ def _materialize_compressed_sparse_mla_scratch(
         page_size=caps.page_size,
         max_swa_width=caps.swa_width,
         max_indexed_width=caps.indexed_width,
-        cache_format=caps.cache_format,
-        execution_config=execution_config,
-        mapped_indices=mapped_indices,
         indexed_page_size=caps.indexed_page_size,
         layout=caps.layout,
+        cache_format=caps.cache_format,
         mode=caps.mode,
         use_cuda_graph=caps.use_cuda_graph,
         tmp_output=tmp_output,
         tmp_lse=tmp_lse,
         output_buffer=_split_output_buffer_from_tmp(tmp_output),
         final_lse=final_lse,
+        mapped_indices=mapped_indices,
         kv_chunk_size_ptr=kv_chunk_size_ptr,
         num_chunks_ptr=num_chunks_ptr,
         sm_scale_tensor=sm_scale_tensor,
@@ -484,10 +476,8 @@ def _materialize_compressed_sparse_mla_scratch(
         max_chunks=caps.max_chunks_per_row,
         decode_row_capacity=caps.decode_row_capacity,
     )
-    scratch.set_split_chunk_config(
-        kv_chunk_size=split_cfg.chunk_size,
-        num_chunks=split_cfg.num_chunks,
-    )
+    scratch.kv_chunk_size_value = split_cfg.chunk_size
+    scratch.num_chunks_value = split_cfg.num_chunks
     return scratch
 
 
@@ -689,8 +679,8 @@ def _validate_i32_contiguous(
 class B12XCompressedSparseMLAScratchPlan:
     caps: B12XCompressedSparseMLAScratchCaps
     layout: _B12XCompressedSparseMLAScratchLayout
-    execution_config: object | None
     _scratch_specs: tuple[ScratchBufferSpec, ...]
+    policy_resolution: object | None = None
 
     def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
         return self._scratch_specs
@@ -718,7 +708,6 @@ class B12XCompressedSparseMLAScratchPlan:
             self.caps,
             scratch_storage,
             self.layout,
-            self.execution_config,
         )
         return build_compressed_sparse_mla_binding(
             scratch=scratch_views,
@@ -733,24 +722,13 @@ class B12XCompressedSparseMLAScratchPlan:
 
 def plan_compressed_sparse_mla_scratch(
     caps: B12XCompressedSparseMLAScratchCaps,
-    *,
-    execution_config: object | None = None,
 ) -> B12XCompressedSparseMLAScratchPlan:
     if caps.max_chunks_per_row is None:
-        caps = replace(
-            caps,
-            max_chunks_per_row=getattr(execution_config, "max_chunks_per_row", 64),
-        )
-    elif (
-        execution_config is not None
-        and caps.max_chunks_per_row != getattr(execution_config, "max_chunks_per_row", None)
-    ):
-        raise ValueError("caps.max_chunks_per_row must match execution_config")
+        caps = replace(caps, max_chunks_per_row=64)
     layout = _compressed_sparse_mla_scratch_layout(caps)
     return B12XCompressedSparseMLAScratchPlan(
         caps=caps,
         layout=layout,
-        execution_config=execution_config,
         _scratch_specs=(
             scratch_buffer_spec(
                 "compressed_sparse_mla.scratch",

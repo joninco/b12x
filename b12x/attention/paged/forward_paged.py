@@ -62,7 +62,6 @@ from b12x._lib.intrinsics import (
 )
 
 from .traits import PagedForwardTraits
-from ._controls import paged_control
 
 
 def _assume_strides_aligned(t: cute.Tensor):
@@ -204,7 +203,9 @@ def _get_memrange_tensor(memrange, layout):
 
 
 def _paged_kv_tma_plane_layout(stage_tile_rows: int, kv_tma_plane_head_dim: int):
-    plane_swizzle = paged_control("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+    plane_swizzle = os.environ.get(
+        "B12X_PAGED_KV_TMA_PLANE_SWIZZLE", ""
+    )
     if plane_swizzle == "none":
         return cute.make_layout(
             (stage_tile_rows, kv_tma_plane_head_dim),
@@ -252,7 +253,7 @@ def _issue_paged_kv_tma_copy_planes_tma(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -278,7 +279,7 @@ def _issue_paged_kv_tma_copy_2planes_tma(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -334,7 +335,7 @@ def _issue_paged_kv_tma_copy_2planes_tma_manual(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -374,7 +375,7 @@ def _issue_paged_kv_tma_copy_1plane_tma_manual(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -414,7 +415,7 @@ def _issue_paged_kv_tma_copy_4planes_tma_manual(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -1115,7 +1116,7 @@ def _issue_paged_kv_cp_async_64x128(
     page_id = (
         Int32(0)
         if const_expr(
-            paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
+            os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0") == "1"
         )
         else mPageTable[request_idx, page_idx]
     )
@@ -3252,7 +3253,9 @@ class PagedForwardKernel:
             decode_only
             and not self.has_relative_attention_bias
             and self.page_size == 64
-            and paged_control("B12X_PAGED_BF16_MINIMAX_ROLE_SPECIALIZED", "0")
+            and os.environ.get(
+                "B12X_PAGED_BF16_MINIMAX_ROLE_SPECIALIZED", "0"
+            )
             == "1"
             and dtype_q == cutlass.BFloat16
             and dtype_kv == cutlass.BFloat16
@@ -3271,7 +3274,9 @@ class PagedForwardKernel:
         laguna_decode_n128 = (
             traits.cta_tile_kv == 128
             and self.gqa_group_size == 6
-            and paged_control("B12X_PAGED_LAGUNA_DECODE_N128", "0")
+            and os.environ.get(
+                "B12X_PAGED_LAGUNA_DECODE_N128", "0"
+            )
             == "1"
         )
         laguna_fp8_role_specialized_decode = bool(
@@ -3298,17 +3303,23 @@ class PagedForwardKernel:
             and traits.num_warps_kv == 4
             and traits.head_dim_qk == 128
             and traits.head_dim_vo == 128
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_DECODE", "0")
+            and os.environ.get(
+                "B12X_PAGED_LAGUNA_HEAD_PAIR_DECODE", "0"
+            )
             == "1"
         )
         self.laguna_fp8_head_pair_wide_tma = bool(
             self.laguna_fp8_head_pair_decode
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_TMA", "0")
+            and os.environ.get(
+                "B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_TMA", "0"
+            )
             == "1"
         )
         self.laguna_fp8_head_pair_wide_headlocal = bool(
             self.laguna_fp8_head_pair_wide_tma
-            and paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_HEADLOCAL", "0")
+            and os.environ.get(
+                "B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_HEADLOCAL", "0"
+            )
             == "1"
         )
         self.laguna_fp8_head_pair_wide_math = bool(
@@ -3449,8 +3460,12 @@ class PagedForwardKernel:
                 "single-KV-warp PagedForwardKernel is only enabled for the "
                 "Laguna page-128 GQA6 verifier"
             )
-        tma_debug_dump = paged_control("B12X_PAGED_KV_TMA_DEBUG_DUMP", "")
-        paged_debug_dump = paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
+        tma_debug_dump = os.environ.get(
+            "B12X_PAGED_KV_TMA_DEBUG_DUMP", ""
+        )
+        paged_debug_dump = os.environ.get(
+            "B12X_PAGED_KV_DEBUG_DUMP", ""
+        )
         self.debug_dump_paged_kv_tma_k = self.use_paged_kv_tma and tma_debug_dump == "K"
         self.debug_dump_paged_kv_tma_q = self.use_paged_kv_tma and tma_debug_dump == "Q"
         self.debug_dump_paged_kv_tma_s = self.use_paged_kv_tma and tma_debug_dump == "S"
@@ -3533,7 +3548,7 @@ class PagedForwardKernel:
             and traits.num_mma_kv % 2 == 0
         )
         self.use_m16n16_b8_fp8_decode_pv = (
-            paged_control("B12X_PAGED_DECODE_FP8_PV_M16N16_B8", "1") == "1"
+            os.environ.get("B12X_PAGED_DECODE_FP8_PV_M16N16_B8", "1") == "1"
             and decode_only
             and self.kv_is_fp8
             and dtype_q == cutlass.BFloat16
@@ -3561,7 +3576,9 @@ class PagedForwardKernel:
         )
 
     def _get_paged_kv_tma_plane_layout(self):
-        plane_swizzle = paged_control("B12X_PAGED_KV_TMA_PLANE_SWIZZLE", "")
+        plane_swizzle = os.environ.get(
+            "B12X_PAGED_KV_TMA_PLANE_SWIZZLE", ""
+        )
         if plane_swizzle == "none":
             return cute.make_layout(
                 (self.stage_tile_rows, self.kv_tma_plane_head_dim),
@@ -3589,7 +3606,9 @@ class PagedForwardKernel:
         )
 
     def _get_paged_kv_tma_head_pair_layout(self):
-        if paged_control("B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_NOSWIZZLE", "0") == "1":
+        if os.environ.get(
+            "B12X_PAGED_LAGUNA_HEAD_PAIR_WIDE_NOSWIZZLE", "0"
+        ) == "1":
             return cute.make_layout(
                 (self.stage_tile_rows, 2 * self.kv_tma_plane_head_dim),
                 stride=(2 * self.kv_tma_plane_head_dim, 1),
@@ -3633,7 +3652,9 @@ class PagedForwardKernel:
             ),
             (0, 1, 2),
         )
-        if paged_control("B12X_PAGED_LAGUNA_DEBUG_PRINT_HEAD_PAIR_LAYOUT", "0") == "1":
+        if os.environ.get(
+            "B12X_PAGED_LAGUNA_DEBUG_PRINT_HEAD_PAIR_LAYOUT", "0"
+        ) == "1":
             print(f"paged head-pair TMA stage layout: {layout}")
         return layout
 
@@ -3844,7 +3865,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -3872,7 +3893,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -3898,7 +3919,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -3922,7 +3943,7 @@ class PagedForwardKernel:
         page_id = (
             Int32(0)
             if const_expr(
-                paged_control("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
+                os.environ.get("B12X_PAGED_KV_TMA_FORCE_PAGE0", "0")
                 == "1"
             )
             else mPageTable[request_idx, page_idx]
@@ -5122,7 +5143,7 @@ class PagedForwardKernel:
         )
         decode_qwen_single_row_fastpath = const_expr(
             self.decode_only
-            and paged_control("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
+            and os.environ.get("B12X_PAGED_GQA6_COMPACT_SYNC", "1") != "0"
             and not self.has_relative_attention_bias
             and (
                 self.single_request_decode_graph
@@ -8733,7 +8754,7 @@ class PagedFp8DecodeRawForwardKernel:
                 self.num_mma_d_vo,
             )
             if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
+                os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "")
                 == "SREGS"
             ):
                 if (
@@ -8749,7 +8770,7 @@ class PagedFp8DecodeRawForwardKernel:
                     )
                 _exit_thread()
             if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
+                os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "")
                 == "PREGS"
             ):
                 if (
@@ -8775,7 +8796,7 @@ class PagedFp8DecodeRawForwardKernel:
             d_frag[0, 0] = d0
             d_frag[0, 1] = d1
             if const_expr(
-                paged_control("B12X_PAGED_KV_DEBUG_DUMP", "")
+                os.environ.get("B12X_PAGED_KV_DEBUG_DUMP", "")
                 == "PVREGS"
             ):
                 if (
@@ -9840,7 +9861,10 @@ class PagedBf16ExtendRawForwardKernel:
                     if valid_row_store:
                         if const_expr(
                             self.split_kv
-                            and paged_control("B12X_DEBUG_BF16_EXTEND_DIRECT_STORE", "")
+                            and os.environ.get(
+                                "B12X_DEBUG_BF16_EXTEND_DIRECT_STORE",
+                                "",
+                            )
                             == "1"
                         ):
                             partial_row_idx = (
@@ -9886,7 +9910,9 @@ class PagedBf16ExtendRawForwardKernel:
         if const_expr(
             not (
                 self.split_kv
-                and paged_control("B12X_DEBUG_BF16_EXTEND_DIRECT_STORE", "")
+                and os.environ.get(
+                    "B12X_DEBUG_BF16_EXTEND_DIRECT_STORE", ""
+                )
                 == "1"
             )
         ):

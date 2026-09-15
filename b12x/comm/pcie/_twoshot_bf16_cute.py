@@ -20,7 +20,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
 
-from b12x._lib.compile_plan import attach_programs
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics import ld_global_nc_v4_u32, ld_global_v4_u32, st_global_v4_u32
@@ -49,6 +48,7 @@ from ._twoshot_cute import (
     _st_relaxed_sys_u32,
 )
 
+_PREPARED_BF16_LAUNCHERS: set[tuple[object, ...]] = set()
 _PACK_ELEMS = 8  # bf16 values per 16-byte pack
 _SUPPORTED_WORLD_SIZE = 4
 
@@ -467,6 +467,29 @@ def _bf16_process_key(
     )
 
 
+def is_twoshot_bf16_launcher_prepared(
+    operation: str,
+    world_size: int,
+    rank: int,
+    device_slot_selection: bool,
+    slot_bias: int,
+    threads: int,
+    row_elems: int,
+    device_index: int,
+) -> bool:
+    return (
+        _bf16_process_key(
+            operation,
+            world_size,
+            rank,
+            device_slot_selection,
+            slot_bias,
+            threads,
+            row_elems,
+            device_index,
+        )
+        in _PREPARED_BF16_LAUNCHERS
+    )
 
 
 @functools.cache
@@ -614,7 +637,8 @@ def get_twoshot_bf16_launcher(
         )
         raw(*raw_args)
 
-    return attach_programs(run, raw)
+    _PREPARED_BF16_LAUNCHERS.add(process_key)
+    return run
 
 
 class _TwoShotPullAllReduceLaunch(_TwoShotBf16Launch):
@@ -1005,8 +1029,38 @@ def get_twoshot_bf16_allreduce_launcher(
             current_cuda_stream(),
         )
         raw(*raw_args)
-    return attach_programs(run, raw)
+
+    _PREPARED_BF16_LAUNCHERS.add(process_key)
+    return run
 
 
+def is_twoshot_bf16_allreduce_launcher_prepared(
+    world_size: int,
+    rank: int,
+    device_slot_selection: bool,
+    slot_bias: int,
+    threads: int,
+    row_elems: int,
+    device_index: int,
+) -> bool:
+    return (
+        _bf16_process_key(
+            "all_reduce_pull",
+            world_size,
+            rank,
+            device_slot_selection,
+            slot_bias,
+            threads,
+            row_elems,
+            device_index,
+        )
+        in _PREPARED_BF16_LAUNCHERS
+    )
 
-__all__ = ["get_twoshot_bf16_launcher", "get_twoshot_bf16_allreduce_launcher"]
+
+__all__ = [
+    "get_twoshot_bf16_launcher",
+    "is_twoshot_bf16_launcher_prepared",
+    "get_twoshot_bf16_allreduce_launcher",
+    "is_twoshot_bf16_allreduce_launcher_prepared",
+]

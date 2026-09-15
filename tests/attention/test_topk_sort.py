@@ -15,8 +15,6 @@ device rather than the current device.
 from __future__ import annotations
 
 import pytest
-from b12x._lib.runtime_control import kernel_resolution_guard
-
 import torch
 
 cuda_required = pytest.mark.skipif(
@@ -243,6 +241,7 @@ def test_expanded_block_table_and_strided_rows():
 
 @cuda_required
 def test_precompile_then_capture_on_side_stream():
+    import b12x
 
     api = _api()
     device = torch.device("cuda")
@@ -255,7 +254,8 @@ def test_precompile_then_capture_on_side_stream():
     main = torch.cuda.Stream(device)
     side = torch.cuda.Stream(device)
     graph = torch.cuda.CUDAGraph()
-    with kernel_resolution_guard("topk sort capture test"):
+    b12x.freeze_kernel_resolution("topk sort capture test")
+    try:
         with torch.cuda.stream(main):
             torch.cuda.synchronize(device)
             with torch.cuda.graph(graph, stream=main):
@@ -271,6 +271,8 @@ def test_precompile_then_capture_on_side_stream():
             torch.cuda.synchronize(device)
             assert torch.equal(indices.cpu(), expected)
         assert torch.cuda.memory_allocated(device) == allocated
+    finally:
+        b12x.unfreeze_kernel_resolution()
 
 
 @cuda_required

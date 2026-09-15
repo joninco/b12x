@@ -1,4 +1,5 @@
-"""Internal contiguous-attention layouts and prepared execution primitives."""
+"""Public contiguous-attention API."""
+
 from .api import (
     AttentionBinding,
     AttentionPlan,
@@ -8,11 +9,29 @@ from .api import (
     VarlenAttentionPlan,
     VarlenAttentionPlanKey,
     VarlenAttentionScratchPlan,
+    b12x_attention_forward,
+    b12x_varlen_attention_forward,
     clear_attention_caches,
+    create_attention_plan,
+    create_varlen_attention_plan,
+    plan_attention_scratch,
+    plan_varlen_attention_scratch,
 )
 
 __all__ = [
-    "AttentionBinding", "AttentionPlan", "AttentionPlanKey", "AttentionScratchPlan",
-    "VarlenAttentionBinding", "VarlenAttentionPlan", "VarlenAttentionPlanKey",
-    "VarlenAttentionScratchPlan", "clear_attention_caches",
+    "AttentionBinding",
+    "AttentionPlan",
+    "AttentionPlanKey",
+    "AttentionScratchPlan",
+    "VarlenAttentionBinding",
+    "VarlenAttentionPlan",
+    "VarlenAttentionPlanKey",
+    "VarlenAttentionScratchPlan",
+    "b12x_attention_forward",
+    "b12x_varlen_attention_forward",
+    "clear_attention_caches",
+    "create_attention_plan",
+    "create_varlen_attention_plan",
+    "plan_attention_scratch",
+    "plan_varlen_attention_scratch",
 ]

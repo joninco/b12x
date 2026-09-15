@@ -368,7 +368,7 @@ def test_cute_migration_mxfp8_quant_gpu_oracle_and_graph(m: int, k: int) -> None
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypatch) -> None:
     import b12x._lib.quant.mxfp8_rows as quant_module
-    from b12x._lib.runtime_control import kernel_resolution_guard
+    from b12x import freeze_kernel_resolution, unfreeze_kernel_resolution
 
     require_b12x()
     source = torch.randn((capacity, 640), dtype=dtype, device="cuda")
@@ -393,7 +393,8 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
     warmed = calls[-1]
     scalar = resolve(640, dtype, 0, 256, "linear")
     pointers = tuple(t.data_ptr() for t in (source, actual.values, actual.scale_rows, actual.scale_mma))
-    with kernel_resolution_guard('MXFP8 quantization within one planned row capacity'):
+    freeze_kernel_resolution("MXFP8 quantization within one planned row capacity")
+    try:
         for rows in (1, 8, 9, 16):
             if rows > capacity:
                 continue
@@ -420,6 +421,8 @@ def test_mxfp8_quant_planned_capacity_reuses_callable(capacity, dtype, monkeypat
                     getattr(actual, name).view(torch.uint8),
                     getattr(expected, name).view(torch.uint8), rtol=0, atol=0,
                 )
+    finally:
+        unfreeze_kernel_resolution()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
